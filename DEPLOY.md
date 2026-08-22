@@ -106,11 +106,51 @@ be a free path. If your account does allow it:
 
 ---
 
-## Not viable
+## Option 4 — AWS (free credits, not free forever)
 
-Render, Railway and Fly.io free allowances are 256–512 MB of RAM. bge-m3 alone needs about
-2.3 GB, so the app cannot start. Vercel and Netlify are serverless with short timeouts and no
-persistent process — a 30-second deep-research turn does not fit.
+AWS changed its free tier: accounts opened after **15 July 2025** no longer get the 12-month
+free EC2 allowance. New accounts get **$200 in credits** ($100 on signup, $100 more for using
+services) which draw down against normal pricing.
+
+`t3.micro` (the old free instance) has **1 GB RAM** and cannot load bge-m3. You need
+`t3.medium` (4 GB, ~$30/mo) or `t3.small` (2 GB, ~$15/mo, tight). With $200 of credits a
+`t3.medium` runs for roughly **six months**, then starts billing — set a budget alert.
+
+```bash
+# Ubuntu 22.04, t3.medium, 20 GB gp3, security group open on 80/443
+sudo apt update && sudo apt install -y python3-pip git
+git clone https://github.com/<you>/KnowYourRightsAI.git && cd KnowYourRightsAI
+pip install --index-url https://download.pytorch.org/whl/cpu torch
+pip install -r requirements.txt
+# then identical to the Oracle steps below: .env, fetch_data, probe, calibrate, systemd
+```
+
+Use Lightsail ($5/mo, 1 GB — too small) only if you move the embedder off-box.
+
+---
+
+## Why Render (and Vercel, Railway, Fly) cannot host this
+
+Render's free web service is **512 MB RAM and 0.1 CPU**, and spins down after 15 minutes idle.
+`BAAI/bge-m3` needs about **2.3 GB** resident. Quantising to int8 lands near 600 MB of weights
+plus runtime overhead — still over the limit, and the corpus is embedded with the full-precision
+model, so a quantised encoder would drift from the indexed vectors anyway.
+
+There is no configuration in which this app starts on 512 MB. Render's **Standard** plan
+(2 GB, ~$25/mo) is the first tier that works, and Oracle gives you 12 GB for nothing.
+
+Vercel and Netlify are serverless with short execution limits and no persistent process, so a
+30-second deep-research turn with resident models does not fit at all.
+
+| Host | Free RAM | Runs this? |
+|---|---|---|
+| **Oracle Always Free** | 12 GB (2 OCPU ARM) | **Yes — free forever** |
+| **Colab / Kaggle** | 12–16 GB + T4 GPU | **Yes — but ephemeral** |
+| AWS (new account) | $200 credits, ~6 mo on t3.medium | Yes, then billed |
+| Hugging Face Spaces | 16 GB CPU basic | Docker may need PRO — verify |
+| Render free | 512 MB | No |
+| Railway / Fly.io free | 256–512 MB | No |
+| Vercel / Netlify | serverless | No |
 
 ---
 
