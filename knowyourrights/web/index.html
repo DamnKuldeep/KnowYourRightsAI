@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>KnowYourRights — Indian legal rights assistant</title>
+  <meta name="description" content="Plain-language answers about your rights under Indian law, with citations to the actual sections.">
+  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>⚖️</text></svg>">
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="brand">
+      <h1>⚖️ KnowYourRights</h1>
+      <span class="sub">Indian law, in plain language, with citations</span>
+    </div>
+    <div class="controls">
+      <div class="segmented" role="group" aria-label="Research depth">
+        <button data-depth="auto"     aria-pressed="true"  title="Let the assistant decide how much research the question needs">Auto</button>
+        <button data-depth="quick"    aria-pressed="false" title="One fast lookup">Quick</button>
+        <button data-depth="deep"     aria-pressed="false" title="Multi-round research, reads official sites">Deep</button>
+      </div>
+      <select id="state" aria-label="Your state">
+        <option value="">All India</option>
+      </select>
+      <button class="icon-btn" id="theme" aria-label="Toggle dark mode" title="Toggle dark mode">◐</button>
+      <button class="icon-btn" id="reset" aria-label="New conversation" title="New conversation">✚</button>
+    </div>
+  </header>
+
+  <main>
+    <div class="thread" id="thread" role="log" aria-live="polite" aria-label="Conversation">
+      <div class="thread-inner" id="threadInner">
+        <div class="msg">
+          <div class="answer">
+            <p><strong>Ask about your rights under Indian law.</strong> I search the Constitution,
+            about 1,000 central Acts, and the 2024 criminal codes (BNS, BNSS, BSA) that replaced
+            the IPC, CrPC and Evidence Act — then cite the exact section.</p>
+            <p>For procedures I can also read official government sites for the current fee,
+            deadline and portal. Ask in English, Hindi, or Hinglish.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <aside aria-label="Sources and citations">
+      <h2>Sources</h2>
+      <div id="sources"><p class="empty">Ask a question and the laws I cite will appear here — statute first, then official sources.</p></div>
+    </aside>
+  </main>
+
+  <div class="composer">
+    <div class="composer-inner">
+      <div class="examples" id="examples">
+        <button class="example">What are my rights if the police arrest me without a warrant?</button>
+        <button class="example">How do I file an RTI, and what does it cost?</button>
+        <button class="example">My landlord won't return my deposit</button>
+        <button class="example">Police ne bina warrant arrest kar liya, kya yeh legal hai?</button>
+      </div>
+      <div class="input-row">
+        <label class="sr-only" for="input">Your question</label>
+        <textarea id="input" rows="1" placeholder="Ask about your legal rights…" autocomplete="off"></textarea>
+        <button class="send" id="send" aria-label="Send" title="Send (Enter)">
+          <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M8 13V3M8 3L3.5 7.5M8 3l4.5 4.5" stroke="currentColor" stroke-width="1.8"
+                  stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+      </div>
+      <div class="footer">
+        <span class="disclaimer" id="disclaimer">General information about Indian law, not legal advice. For your situation, consult a lawyer — free legal aid is on 15100.</span>
+        <span class="stat" id="stat"></span>
+      </div>
+    </div>
+  </div>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

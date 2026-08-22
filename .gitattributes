@@ -1,0 +1,5 @@
+# Normalise line endings so the repo is identical on Windows, macOS and Linux.
+* text=auto eol=lf
+
+# Notebooks are JSON — keep them binary-ish in diffs to avoid noisy merges.
+*.ipynb -text diff=jupyternotebook

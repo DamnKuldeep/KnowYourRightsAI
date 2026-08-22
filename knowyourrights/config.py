@@ -1,0 +1,378 @@
+"""Every tuning knob lives here. Nothing in this module may import torch, lancedb or
+transformers — it is imported by scripts that must stay cheap.
+
+Values are overridable from the environment (and therefore from ``.env``); the defaults are
+tuned for the machine described in the plan: RTX 3050 4 GB / 16 GB RAM with ~3 GB free.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+
+try:  # optional, but this is how the API key normally arrives
+    from dotenv import load_dotenv
+
+    load_dotenv(override=True)
+except ImportError:  # pragma: no cover - dotenv is in requirements
+    pass
+
+
+# ── paths ─────────────────────────────────────────────────────────────────────────────
+ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = Path(os.environ.get("KYR_DATA_DIR", ROOT / "data"))
+RUNTIME_DIR = Path(os.environ.get("KYR_RUNTIME_DIR", ROOT / ".runtime"))
+CACHE_DIR = RUNTIME_DIR / "cache"
+
+DB_PATH = Path(os.environ.get("LEGAL_DB_PATH", DATA_DIR / "legal_db"))
+TABLE = "laws"
+PARQUET = Path(os.environ.get("LEGAL_PARQUET", DATA_DIR / "chunks_metadata.parquet"))
+ENRICH_CACHE = Path(os.environ.get("LEGAL_CACHE", DATA_DIR / "enrichment_cache.json"))
+
+WEB_DIR = Path(__file__).resolve().parent / "web"
+
+
+# ── env helpers ───────────────────────────────────────────────────────────────────────
+def env_str(key: str, default: str) -> str:
+    v = os.environ.get(key)
+    return default if v is None or v.strip() == "" else v.strip()
+
+
+def env_int(key: str, default: int) -> int:
+    try:
+        return int(os.environ[key])
+    except (KeyError, ValueError):
+        return default
+
+
+def env_float(key: str, default: float) -> float:
+    try:
+        return float(os.environ[key])
+    except (KeyError, ValueError):
+        return default
+
+
+def env_bool(key: str, default: bool) -> bool:
+    v = os.environ.get(key)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+# ── NVIDIA NIM ────────────────────────────────────────────────────────────────────────
+NIM_BASE_URL = env_str("NIM_BASE_URL", "https://integrate.api.nvidia.com/v1")
+NIM_RETRIEVAL_BASE = env_str("NIM_RETRIEVAL_BASE", "https://ai.api.nvidia.com/v1/retrieval")
+NVIDIA_API_KEY = env_str("NVIDIA_API_KEY", "")
+NIM_TIMEOUT_S = env_float("NIM_TIMEOUT_S", 90.0)
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    """One NIM model and the limits we hold ourselves to when calling it.
+
+    ``rpm`` is a *per-model* budget: NVIDIA's free tier caps around 40 requests/minute per
+    model, so distinct models get genuinely independent buckets. Staying a little under the
+    published ceiling leaves room for the retry traffic our own backoff generates.
+
+    ``thinking`` controls Nemotron 3's reasoning pass. Measured on nemotron-3-nano: disabling
+    it via ``chat_template_kwargs`` cut a small structured reply from 63 completion tokens to
+    11. Reasoning arrives in a separate ``reasoning_content`` field rather than mixed into the
+    answer, so this is purely a latency/credit decision — and for the writer also a UX one,
+    since a thinking pass delays the first visible token of a streamed answer.
+    """
+
+    id: str
+    rpm: int = 30
+    ctx: int = 128_000
+    max_out: int = 1024
+    temperature: float = 0.2
+    thinking: bool = False
+    # Tried in order if `id` is unavailable (renamed / retired on the catalog).
+    alternates: tuple[str, ...] = ()
+
+
+# Cheap, high-frequency structured-output stages. Own rate-limit bucket.
+FAST_MODEL = ModelSpec(
+    id=env_str("KYR_FAST_MODEL", "nvidia/nemotron-3-nano-30b-a3b"),
+    rpm=env_int("KYR_FAST_RPM", 30),
+    ctx=env_int("KYR_FAST_CTX", 128_000),
+    max_out=env_int("KYR_FAST_MAX_OUT", 1400),
+    temperature=0.1,
+    thinking=env_bool("KYR_FAST_THINKING", False),
+    alternates=("nvidia/nemotron-3.5-lightning-30b-a3b", "nvidia/nemotron-nano-3-30b-a3b",
+                "nvidia/llama-3.3-nemotron-super-49b-v1.5"),
+)
+
+# The user-facing writer. Quality matters; at most two calls per turn. Own bucket.
+WRITER_MODEL = ModelSpec(
+    id=env_str("KYR_WRITER_MODEL", "nvidia/nemotron-3-super-120b-a12b"),
+    rpm=env_int("KYR_WRITER_RPM", 25),
+    ctx=env_int("KYR_WRITER_CTX", 128_000),
+    max_out=env_int("KYR_WRITER_MAX_OUT", 1600),
+    temperature=0.3,
+    # Off by default: the pipeline has already done the reasoning across its stages, and a
+    # thinking pass would delay the first visible token of the streamed answer.
+    thinking=env_bool("KYR_WRITER_THINKING", False),
+    alternates=("nvidia/llama-3.3-nemotron-super-49b-v1.5", "nvidia/nemotron-3-nano-30b-a3b"),
+)
+
+# Optional remote reranker — used when the `lean` profile offloads reranking off-GPU.
+# Independent of the embedder (a cross-encoder reads text, not vectors), so it stays valid
+# even after `baai/bge-m3` leaves the hosted catalog.
+NIM_RERANK_MODEL = env_str("KYR_NIM_RERANK_MODEL", "nvidia/llama-3.2-nv-rerankqa-1b-v2")
+NIM_RERANK_ALTERNATES = (
+    "nvidia/llama-nemotron-rerank-1b-v2",
+    "nvidia/nv-rerankqa-mistral-4b-v3",
+)
+NIM_RERANK_RPM = env_int("KYR_NIM_RERANK_RPM", 30)
+
+# 429 / transient-failure policy. Deadlines, not retry counts, decide when to give up:
+# a rate limit must degrade the answer, never kill the turn.
+RETRY_INITIAL_DELAY = env_float("KYR_RETRY_INITIAL_DELAY", 2.0)
+RETRY_MAX_DELAY = env_float("KYR_RETRY_MAX_DELAY", 45.0)
+RETRY_MULTIPLIER = env_float("KYR_RETRY_MULTIPLIER", 2.0)
+RETRY_MAX_ATTEMPTS = env_int("KYR_RETRY_MAX_ATTEMPTS", 8)
+
+# AIMD self-tuning of the per-model buckets.
+AIMD_DECREASE = env_float("KYR_AIMD_DECREASE", 0.7)   # multiply rpm by this on a 429
+AIMD_INCREASE = env_float("KYR_AIMD_INCREASE", 2.0)   # add this per clean minute
+AIMD_FLOOR_RPM = env_int("KYR_AIMD_FLOOR_RPM", 5)
+
+# Rough credit accounting so the UI can warn before the free tier runs dry.
+SESSION_CREDIT_BUDGET = env_int("KYR_SESSION_CREDIT_BUDGET", 0)  # 0 = unlimited/unknown
+
+
+# ── local models (embedder is corpus-locked; reranker is swappable) ───────────────────
+# Changing EMBED_MODEL invalidates the whole database — see DB README §8.
+EMBED_MODEL = env_str("KYR_EMBED_MODEL", "BAAI/bge-m3")
+EMBED_DIM = 1024
+EMBED_MAX_SEQ = env_int("KYR_EMBED_MAX_SEQ", 1024)
+EMBED_QUERY_PREFIX = ""  # bge-m3 encodes queries and passages symmetrically
+
+RERANK_QUALITY = env_str("KYR_RERANK_QUALITY", "BAAI/bge-reranker-v2-m3")
+RERANK_BALANCED = env_str("KYR_RERANK_BALANCED", "BAAI/bge-reranker-base")
+RERANK_CPU = env_str("KYR_RERANK_CPU", "BAAI/bge-reranker-base")
+
+
+@dataclass(frozen=True)
+class Profile:
+    """A measured resource plan. ``model_vram_mb`` is what the *models* occupy (weights plus
+    working activations), measured on an RTX 3050 with fp16 weights:
+
+        bge-m3            +1090 MiB
+        bge-reranker-base  +760 MiB   -> balanced = 1850
+        bge-reranker-v2-m3 +1394 MiB  -> quality  = 2484
+
+    A profile is selectable when ``free_vram >= model_vram_mb + VRAM_RESERVE_MB``, so the
+    reserve is what stays available to the desktop and everything else on the machine.
+    """
+
+    name: str
+    rerank_backend: str            # "local" | "nim" | "none"
+    rerank_model: str | None
+    model_vram_mb: int
+    embed_batch: int
+    rerank_batch: int
+    note: str = ""
+
+
+# Ordered best-first; the first profile that fits the probed machine wins.
+PROFILES: tuple[Profile, ...] = (
+    Profile("quality",  "local", RERANK_QUALITY,  model_vram_mb=2484, embed_batch=8, rerank_batch=16,
+            note="strongest multilingual reranker; ~0.85s per rerank batch"),
+    Profile("balanced", "local", RERANK_BALANCED, model_vram_mb=1850, embed_batch=8, rerank_batch=25,
+            note="multilingual reranker, ~0.39s per batch, keeps ~1.4 GB VRAM free"),
+    Profile("lean",     "nim",   None,            model_vram_mb=1090, embed_batch=4, rerank_batch=25,
+            note="embedding stays local (corpus-locked); reranking offloaded to NIM"),
+    Profile("cpu",      "local", RERANK_CPU,      model_vram_mb=0,    embed_batch=2, rerank_batch=8,
+            note="no usable CUDA; expect multi-second retrieval"),
+)
+
+# For CPU-only hosting. Reranking 24 documents on a CPU measured ~10s and dominates the turn;
+# the embedder cannot move (the corpus is bge-m3) but the reranker can, so it goes to NIM and
+# retrieval drops back to roughly a second. This is the profile to deploy on a free CPU box.
+CPU_LEAN = Profile("cpu_lean", "nim", None, model_vram_mb=0, embed_batch=2, rerank_batch=25,
+                   note="embedding local on CPU, reranking on NIM — for CPU-only hosting")
+PROFILES = PROFILES + (CPU_LEAN,)
+
+PROFILE_REQUEST = env_str("KYR_PROFILE", "auto")          # auto | quality | balanced | lean | cpu
+# 1 GB left for the desktop. This is what makes `balanced` rather than `quality` the default
+# on a 4 GB laptop card that is also driving a display.
+VRAM_RESERVE_MB = env_int("KYR_VRAM_RESERVE_MB", 1024)
+RAM_FLOOR_MB = env_int("KYR_RAM_FLOOR_MB", 1200)          # refuse to load below this
+RAM_LOAD_HEADROOM_MB = env_int("KYR_RAM_LOAD_HEADROOM_MB", 2600)  # bge-m3 load spike (measured 2329 MB)
+MODEL_IDLE_EVICT_S = env_int("KYR_MODEL_IDLE_EVICT_S", 0)  # 0 = never evict
+GPU_OOM_RETRIES = env_int("KYR_GPU_OOM_RETRIES", 2)       # batch halvings before falling back
+
+
+# ── retrieval ─────────────────────────────────────────────────────────────────────────
+FETCH_K = env_int("KYR_FETCH_K", 25)          # per ranked list, before fusion
+TOP_K = env_int("KYR_TOP_K", 5)               # sections returned to the answer layer
+RERANK_POOL = env_int("KYR_RERANK_POOL", 24)  # candidates that reach the cross-encoder
+RRF_K = env_int("KYR_RRF_K", 60)
+MMR_LAMBDA = env_float("KYR_MMR_LAMBDA", 0.6)
+# When the question names a specific Act, several sections *of that Act* is the right answer,
+# so diversity is dialled down rather than spreading results across unrelated statutes.
+MMR_LAMBDA_FOCUSED = env_float("KYR_MMR_LAMBDA_FOCUSED", 0.85)
+# How much extra weight a ranked list restricted to a named Act carries in the fusion.
+ACT_FILTER_WEIGHT = env_float("KYR_ACT_FILTER_WEIGHT", 2.5)
+
+# The general law of the land. Dozens of sectoral statutes grant *someone* a power of arrest —
+# forest officers, naval authorities, railway police — and they rank well for a query like
+# "can the police arrest me" while being useless to the person asking. When a question is
+# plainly about crime or policing and names no particular Act, these four get their own
+# weighted ranked lists so the general code outranks the specialist one.
+GENERAL_CODES = (
+    "Constitution of India",
+    "Bharatiya Nyaya Sanhita, 2023",
+    "Bharatiya Nagarik Suraksha Sanhita, 2023",
+    "Bharatiya Sakshya Adhiniyam, 2023",
+)
+GENERAL_CODE_WEIGHT = env_float("KYR_GENERAL_CODE_WEIGHT", 2.0)
+# Applied to the *ordering* after reranking, not to the reported score. Large enough to beat
+# a near-tie, since sectoral and general provisions are often worded almost identically.
+GENERAL_CODE_BOOST = env_float("KYR_GENERAL_CODE_BOOST", 0.25)
+# Words that mean "this is a general criminal-law or policing question".
+CRIMINAL_TRIGGERS = (
+    "police", "arrest", "arrested", "custody", "detain", "detention", "bail", "fir",
+    "offence", "offense", "crime", "criminal", "punishment", "penalty", "imprison",
+    "jail", "magistrate", "accused", "charge", "prosecut", "remand", "interrogat",
+    "search warrant", "seizure", "handcuff", "lock-up", "lockup",
+)
+TOPK_MIN, TOPK_MAX = 2, 12
+
+# Thresholds are reranker-specific: a local sigmoid score and a NIM logit live on different
+# scales. scripts/calibrate.py re-derives these per profile and writes them to
+# .runtime/thresholds.json, which overrides these defaults at load time.
+LOW_SCORE = env_float("KYR_LOW_SCORE", 0.05)          # below this -> abstain, go to the web
+CITE_MIN_SCORE = env_float("KYR_CITE_MIN_SCORE", 0.20)  # pre-filter before the LLM grader
+THRESHOLDS_FILE = RUNTIME_DIR / "thresholds.json"
+
+
+# ── research depth ────────────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class DepthBudget:
+    name: str
+    max_rounds: int
+    max_crawls: int
+    nav_depth: int
+    max_llm_calls: int
+    deadline_s: float
+    max_queries_per_subq: int
+
+
+DEPTHS: dict[str, DepthBudget] = {
+    "quick":    DepthBudget("quick",    max_rounds=1, max_crawls=0,  nav_depth=0, max_llm_calls=4,  deadline_s=25,  max_queries_per_subq=1),
+    "standard": DepthBudget("standard", max_rounds=1, max_crawls=3,  nav_depth=1, max_llm_calls=8,  deadline_s=75,  max_queries_per_subq=3),
+    "deep":     DepthBudget("deep",     max_rounds=4, max_crawls=10, nav_depth=2, max_llm_calls=20, deadline_s=240, max_queries_per_subq=4),
+}
+DEFAULT_DEPTH = env_str("KYR_DEFAULT_DEPTH", "auto")
+
+
+# ── context window management ─────────────────────────────────────────────────────────
+# Deliberately far below the model's advertised window: latency, credits and
+# lost-in-the-middle all degrade long before the context limit does.
+WRITER_INPUT_BUDGET_TOKENS = env_int("KYR_WRITER_INPUT_BUDGET", 14_000)
+FAST_INPUT_BUDGET_TOKENS = env_int("KYR_FAST_INPUT_BUDGET", 8_000)
+CONTEXT_SAFETY_TOKENS = env_int("KYR_CONTEXT_SAFETY", 512)
+
+STATUTE_TEXT_CAP = env_int("KYR_STATUTE_TEXT_CAP", 2600)   # chars per statute section
+WEB_TEXT_CAP = env_int("KYR_WEB_TEXT_CAP", 1800)           # chars per web/crawl source
+WIKI_TEXT_CAP = env_int("KYR_WIKI_TEXT_CAP", 1200)
+PAGE_CHUNK_CHARS = env_int("KYR_PAGE_CHUNK_CHARS", 1400)   # crawled-page chunk size
+PAGE_CHUNKS_KEPT = env_int("KYR_PAGE_CHUNKS_KEPT", 3)      # top chunks kept per page
+
+HISTORY_TURNS_VERBATIM = env_int("KYR_HISTORY_TURNS", 4)
+HISTORY_SUMMARY_TRIGGER = env_int("KYR_HISTORY_SUMMARY_TRIGGER", 8)
+
+
+# ── web search & crawling ─────────────────────────────────────────────────────────────
+WEB_MAX_RESULTS = env_int("KYR_WEB_MAX_RESULTS", 5)
+WEB_TIMEOUT = env_float("KYR_WEB_TIMEOUT", 12.0)
+WEB_CACHE_TTL = env_int("KYR_WEB_CACHE_TTL", 1800)
+WEB_MAX_PER_MIN = env_int("KYR_WEB_MAX_PER_MIN", 10)
+
+WIKI_MAX_RESULTS = env_int("KYR_WIKI_MAX_RESULTS", 2)
+WIKI_TIMEOUT = env_float("KYR_WIKI_TIMEOUT", 10.0)
+
+CRAWL_TIMEOUT_S = env_float("KYR_CRAWL_TIMEOUT_S", 25.0)
+CRAWL_CACHE_TTL = env_int("KYR_CRAWL_CACHE_TTL", 86_400)
+CRAWL_MAX_CONCURRENT = env_int("KYR_CRAWL_MAX_CONCURRENT", 3)
+CRAWL_USE_BROWSER = env_bool("KYR_CRAWL_USE_BROWSER", True)   # escalate to Chromium when needed
+CRAWL_BROWSER_IDLE_S = env_int("KYR_CRAWL_BROWSER_IDLE_S", 180)
+CRAWL_MIN_CHARS = env_int("KYR_CRAWL_MIN_CHARS", 400)         # below this, retry with a browser
+CRAWL_RESPECT_ROBOTS = env_bool("KYR_CRAWL_RESPECT_ROBOTS", True)
+CRAWL_USER_AGENT = env_str(
+    "KYR_CRAWL_USER_AGENT",
+    "KnowYourRights/0.1 (public legal-information assistant; +https://github.com/)",
+)
+
+# Trust tiers. Higher wins when the writer must choose between conflicting sources.
+TIER_STATUTE = 100
+TIER_OFFICIAL = 80
+TIER_LEGAL_PORTAL = 60
+TIER_WIKIPEDIA = 40
+TIER_WEB = 20
+
+OFFICIAL_DOMAINS = (
+    "indiacode.nic.in", "gov.in", "nic.in", "sci.gov.in", "egazette.gov.in",
+    "eci.gov.in", "rti.gov.in", "rtionline.gov.in", "consumerhelpline.gov.in",
+    "doj.gov.in", "mha.gov.in", "labour.gov.in", "india.gov.in",
+)
+LEGAL_PORTAL_DOMAINS = ("indiankanoon.org", "prsindia.org", "barandbench.com", "livelaw.in")
+
+
+# ── safety ────────────────────────────────────────────────────────────────────────────
+HELPLINES = (
+    ("Emergency (police / fire / ambulance)", "112"),
+    ("Women's helpline", "1091"),
+    ("Women's helpline (domestic abuse)", "181"),
+    ("Childline", "1098"),
+    ("Free legal aid (NALSA)", "15100"),
+    ("Mental health (Tele-MANAS)", "14416"),
+)
+
+DISCLAIMER = (
+    "General information about central Indian law, with citations. This is not legal advice — "
+    "for your situation consult a qualified lawyer, or call NALSA on 15100 for free legal aid."
+)
+
+CATEGORIES = (
+    "Fundamental Rights", "Criminal & Police", "Consumer & Services",
+    "Employment & Labour", "Family & Marriage", "Property & Housing",
+    "Women & Children", "Privacy & Data", "Health & Medicine", "Education",
+    "Environment", "Taxation & Finance", "Business & Companies", "Information & RTI",
+    "Civil Procedure & Courts", "Transport & Motor", "Government & Administration", "Other",
+)
+
+# The corpus is central law but a few state acts leak in, and the `jurisdiction` column is
+# unreliable — the act title is the trustworthy signal. See DB README §9.
+STATE_PREFIXES = (
+    "Andhra Pradesh", "Arunachal", "Assam", "Bihar", "Chhattisgarh", "Goa", "Gujarat",
+    "Haryana", "Himachal", "Jharkhand", "Karnataka", "Kerala", "Madhya Pradesh",
+    "Maharashtra", "Manipur", "Meghalaya", "Mizoram", "Nagaland", "Odisha", "Orissa",
+    "Punjab", "Rajasthan", "Sikkim", "Tamil Nadu", "Telangana", "Tripura",
+    "Uttar Pradesh", "Uttarakhand", "West Bengal", "Jammu", "Puducherry", "Pondicherry",
+)
+
+INDIAN_STATES = (
+    "Andhra Pradesh", "Arunachal Pradesh", "Assam", "Bihar", "Chhattisgarh", "Delhi", "Goa",
+    "Gujarat", "Haryana", "Himachal Pradesh", "Jammu & Kashmir", "Jharkhand", "Karnataka",
+    "Kerala", "Ladakh", "Madhya Pradesh", "Maharashtra", "Manipur", "Meghalaya", "Mizoram",
+    "Nagaland", "Odisha", "Puducherry", "Punjab", "Rajasthan", "Sikkim", "Tamil Nadu",
+    "Telangana", "Tripura", "Uttar Pradesh", "Uttarakhand", "West Bengal",
+)
+
+
+# ── server ────────────────────────────────────────────────────────────────────────────
+HOST = env_str("KYR_HOST", "127.0.0.1")
+PORT = env_int("KYR_PORT", 8000)
+LOG_LEVEL = env_str("KYR_LOG_LEVEL", "INFO")
+TRACE_ENABLED = env_bool("KYR_TRACE", True)
+
+
+def ensure_runtime_dirs() -> None:
+    """Create the writable runtime tree. Safe to call repeatedly."""
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)

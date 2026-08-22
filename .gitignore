@@ -1,0 +1,27 @@
+# Secrets
+.env
+
+# Runtime state: caches, usage ledger, calibrated thresholds, feedback
+.runtime/
+
+# The database bundle is large (~330 MB) and rebuilt by 01-building-database.ipynb
+data/legal_db/
+data/chunks_metadata.parquet
+data/enrichment_cache.json
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Crawl4AI's own cache
+.crawl4ai/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
