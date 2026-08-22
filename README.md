@@ -7,7 +7,7 @@ Ask in English, Hindi or Hinglish — it searches the statute, reads official go
 when the answer depends on current procedure, and replies in plain language **with the section
 it relied on.**
 
-[![tests](https://github.com/kuldeep/KnowYourRightsAI/actions/workflows/tests.yml/badge.svg)](../../actions)
+[![tests](../../actions/workflows/tests.yml/badge.svg)](../../actions/workflows/tests.yml)
 ![python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![retrieval](https://img.shields.io/badge/Recall%405-98%25-brightgreen)
