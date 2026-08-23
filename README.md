@@ -194,20 +194,27 @@ convention does *not* work on Nemotron 3.
 
 ## Quick start
 
+The corpus ships with the repo via **Git LFS**, so a clone is immediately runnable — install
+[git-lfs](https://git-lfs.com) first or you will get 134-byte pointer files instead of a 350 MB
+database.
+
 ```bash
-git clone https://github.com/<you>/KnowYourRightsAI.git
+git lfs install
+git clone https://github.com/DamnKuldeep/KnowYourRightsAI.git
 cd KnowYourRightsAI
 pip install -r requirements.txt
 cp .env.example .env            # add NVIDIA_API_KEY — free at build.nvidia.com
 ```
 
-The ~330 MB database is not in git. Either rebuild it with
-[`notebooks/01-building-database.ipynb`](notebooks/01-building-database.ipynb) (Kaggle, 2×T4),
-or publish the bundle once to a Hugging Face dataset and pull it:
+To skip the 350 MB download and fetch it later (or on a server):
 
 ```bash
-KYR_DATA_REPO=<you>/knowyourrights-db python scripts/fetch_data.py
+GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/DamnKuldeep/KnowYourRightsAI.git
+cd KnowYourRightsAI && git lfs pull          # when you actually want the data
 ```
+
+The corpus can also be rebuilt from scratch with
+[`notebooks/01-building-database.ipynb`](notebooks/01-building-database.ipynb) (Kaggle, 2×T4).
 
 Then:
 
@@ -246,6 +253,7 @@ documented in [`data/KnowYourRights_DB_README.md`](data/KnowYourRights_DB_README
 | Embeddings | `BAAI/bge-m3`, 1024-d, L2-normalised, no query prefix |
 | Indexes | LanceDB vector + BM25 full-text over `embed_text` |
 | Resident memory | **12.6 MB** section index; rows and vectors fetched on demand (25 rows in 0.14 s, vectors in 0.025 s) |
+| On disk | ~350 MB, committed via Git LFS so the repo runs straight after a clone |
 
 The colonial criminal codes were removed and replaced by the 2023 sanhitas, effective
 2024-07-01. `jurisdiction` is unreliable — the **act title** is the trustworthy signal.

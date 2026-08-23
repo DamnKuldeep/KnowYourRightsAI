@@ -1,5 +1,7 @@
 # Normalise line endings so the repo is identical on Windows, macOS and Linux.
 * text=auto eol=lf
-
 # Notebooks are JSON — keep them binary-ish in diffs to avoid noisy merges.
 *.ipynb -text diff=jupyternotebook
+data/enrichment_cache.json filter=lfs diff=lfs merge=lfs -text
+*.lance filter=lfs diff=lfs merge=lfs -text
+*.parquet filter=lfs diff=lfs merge=lfs -text
