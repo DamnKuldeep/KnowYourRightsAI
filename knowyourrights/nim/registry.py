@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from typing import Literal
 
 from .. import config
@@ -19,6 +20,17 @@ from .. import config
 log = logging.getLogger(__name__)
 
 ModelRole = Literal["fast", "writer", "rerank"]
+
+# How many failures before a model's unavailability is written to disk. One is too few:
+# NVIDIA returns 410 under load as well as for genuine retirement.
+PERSIST_AFTER_FAILURES = 3
+# How long a recorded failure counts for. After this, the model is tried again — hosted
+# catalogues recover, and nothing should be retired permanently by an outage.
+UNAVAILABLE_TTL_S = 3600.0
+
+# Models sidelined for *this process only*, so the current request fails over immediately
+# without condemning the model for everyone.
+_sidelined: dict[str, float] = {}
 
 
 def probe_file():
@@ -79,20 +91,47 @@ def _save() -> None:
         log.debug("could not persist model probe results: %s", exc)
 
 
+def _usable(model_id: str, persisted: set[str]) -> bool:
+    """Is this model worth trying right now?"""
+    if model_id in _sidelined:
+        if time.time() - _sidelined[model_id] < UNAVAILABLE_TTL_S:
+            return False
+        del _sidelined[model_id]     # cooled off — give it another chance
+    return model_id not in persisted
+
+
 def resolve(role: ModelRole) -> str:
     """The model id to use for ``role`` right now."""
     with _lock:
         state = _load()
+        persisted = _expired_pruned(state)
         pinned = state.get("resolved", {}).get(role)
-        unavailable = set(state.get("unavailable", []))
-        if pinned and pinned not in unavailable:
+        if pinned and _usable(pinned, persisted):
             return pinned
         for candidate in candidates(role):
-            if candidate not in unavailable:
+            if _usable(candidate, persisted):
                 return candidate
-        # Everything is marked dead — fall back to the configured id and let the call fail
-        # with a real error rather than silently doing nothing.
+        # Everything is sidelined. Rather than do nothing, clear the temporary sidelining and
+        # try the configured model again — a real error is more useful than silent paralysis.
+        _sidelined.clear()
         return candidates(role)[0]
+
+
+def _expired_pruned(state: dict) -> set[str]:
+    """Drop recorded failures that have aged out, so recovered models return by themselves."""
+    now = time.time()
+    failures = state.get("failures", {})
+    persisted = set(state.get("unavailable", []))
+    revived = [m for m in list(persisted)
+               if now - failures.get(m, {}).get("last", 0) > UNAVAILABLE_TTL_S]
+    if revived:
+        for model_id in revived:
+            persisted.discard(model_id)
+            failures.pop(model_id, None)
+            log.info("model %s has been sidelined for over an hour — trying it again", model_id)
+        state["unavailable"] = sorted(persisted)
+        _save()
+    return persisted
 
 
 def pin(role: ModelRole, model_id: str) -> None:
@@ -106,14 +145,45 @@ def pin(role: ModelRole, model_id: str) -> None:
 
 
 def mark_unavailable(model_id: str, reason: str = "") -> str | None:
-    """Retire a model id after a 404/400 and return the next candidate for its role."""
+    """Take a model out of rotation after a 404/410 and return the next candidate.
+
+    Sidelining is **temporary and in-memory first**. NVIDIA returns 410 transiently under
+    load, not only for genuinely retired models — observed live: a model 410'd on one call and
+    answered normally on the next. Persisting the first 410 to disk meant one blip retired a
+    healthy model until somebody hand-edited the file, and the app quietly ran on its fallback
+    from then on.
+
+    So: fail over immediately (the current request still needs an answer), but only write the
+    verdict to disk once a model has failed ``PERSIST_AFTER_FAILURES`` times, and let even that
+    expire after ``UNAVAILABLE_TTL_S`` so a recovered model comes back on its own.
+    """
+    now = time.time()
     with _lock:
         state = _load()
-        unavailable = set(state.get("unavailable", []))
-        if model_id not in unavailable:
-            unavailable.add(model_id)
-            state["unavailable"] = sorted(unavailable)
-            log.warning("model %s marked unavailable%s", model_id, f" ({reason})" if reason else "")
+        failures = state.setdefault("failures", {})
+        record = failures.get(model_id) or {"count": 0, "first": now}
+        # A failure long after the last one starts a new streak rather than compounding.
+        if now - record.get("last", record["first"]) > UNAVAILABLE_TTL_S:
+            record = {"count": 0, "first": now}
+        record["count"] += 1
+        record["last"] = now
+        record["reason"] = reason
+        failures[model_id] = record
+
+        _sidelined[model_id] = now
+        persisted = set(state.get("unavailable", []))
+        if record["count"] >= PERSIST_AFTER_FAILURES and model_id not in persisted:
+            persisted.add(model_id)
+            state["unavailable"] = sorted(persisted)
+            log.warning("model %s failed %d times — recording it as unavailable%s",
+                        model_id, record["count"], f" ({reason})" if reason else "")
+        else:
+            log.warning("model %s unavailable this run (failure %d/%d)%s",
+                        model_id, record["count"], PERSIST_AFTER_FAILURES,
+                        f" ({reason})" if reason else "")
+
+        if state.get("resolved", {}).get(model_id) == model_id:
+            state["resolved"].pop(model_id, None)
         for role, options in (("fast", candidates("fast")),
                               ("writer", candidates("writer")),
                               ("rerank", candidates("rerank"))):
@@ -121,12 +191,30 @@ def mark_unavailable(model_id: str, reason: str = "") -> str | None:
                 if state.get("resolved", {}).get(role) == model_id:
                     state["resolved"].pop(role, None)
                 _save()
-                nxt = next((c for c in options if c not in unavailable), None)
+                nxt = next((c for c in options if _usable(c, persisted)), None)
                 if nxt:
                     log.warning("role %r falling back to %s", role, nxt)
+                else:
+                    log.error("role %r has no reachable model left", role)
                 return nxt
         _save()
         return None
+
+
+def mark_available(model_id: str) -> None:
+    """Clear a model's failure streak after it answers successfully."""
+    with _lock:
+        _sidelined.pop(model_id, None)
+        state = _load()
+        changed = False
+        if state.get("failures", {}).pop(model_id, None) is not None:
+            changed = True
+        if model_id in state.get("unavailable", []):
+            state["unavailable"].remove(model_id)
+            log.info("model %s is answering again — returning it to rotation", model_id)
+            changed = True
+        if changed:
+            _save()
 
 
 def snapshot() -> dict:

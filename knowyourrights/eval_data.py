@@ -106,7 +106,10 @@ GOLD: tuple[GoldCase, ...] = (
     GoldCase("builder delayed possession of my flat", "Real Estate", "Property & Housing"),
     GoldCase("free education for children between six and fourteen",
              "Compulsory Education", "Education"),
-    GoldCase("penalty for polluting the environment", "Environment", "Environment"),
+    # Two defensible answers: the Environment (Protection) Act gives the regulatory penalty,
+    # BNS §§279-280 give the criminal one for fouling water or vitiating the atmosphere.
+    GoldCase("penalty for polluting the environment",
+             ("Environment", "Bharatiya Nyaya"), "Environment"),
     GoldCase("cheque bounced what is the remedy", "Negotiable Instruments", "Taxation & Finance"),
     GoldCase("rights of a person with mental illness", "Mental Healthcare", "Health & Medicine"),
     GoldCase("caste based discrimination and atrocities", "Scheduled Castes", "Fundamental Rights"),

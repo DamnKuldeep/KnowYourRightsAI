@@ -209,30 +209,40 @@ never searched. Reading the stored vectors back instead is both correct and fast
 
 ## What the numbers say
 
-Measured with [`scripts/eval.py`](scripts/eval.py) against a 42-question gold set covering all
-18 categories of the corpus taxonomy, plus stress questions designed to *fail*.
+Measured against a 42-question gold set covering the corpus taxonomy, plus stress questions
+designed to *fail*. Full methodology, per-category results and latency breakdowns are in
+**[EVALUATION.md](EVALUATION.md)**.
 
 | | Notebook | Now |
 |---|---|---|
-| Recall@5 | 95% | **98%** (41/42) |
-| MRR | 0.783 | **0.837** |
-| Answer is the top hit | 67% | **74%** |
+| Recall@5 | 95.2% | **100%** (42/42) |
+| MRR | 0.783 | **0.873** |
+| Answer is the top hit | 66.7% | **78.6%** |
 | Exact "what does Article 21 say" lookups | — | **4/4** |
 | Off-topic questions it answers anyway | 1 in 2 | **0 in 8** |
+| Median retrieval latency | 674 ms | **399 ms** |
 
-That last row is the one I care about most, and it came entirely from calibration — see below.
+That "0 in 8" is the row I care about most, and it came entirely from calibration — see below.
 
-**How long it takes** (RTX 3050, GPU config):
+**Where the time goes in one retrieval:**
 
-| | | |
-|---|---|---|
-| `quick` | a lookup | 5–8 s |
-| `standard` | statute + grading | 10–25 s |
-| `deep` | multiple rounds, reads official sites | 17–60 s |
+| | |
+|---|---|
+| Embed the query | 61 ms |
+| Vector search | 23 ms *(was 304 ms — the corpus shipped with no vector index)* |
+| BM25 search | 23 ms |
+| Fetch rows + stored vectors | 47 ms |
+| **Cross-encoder rerank** | **309 ms** ← the dominant cost |
+| **Whole search** | **399 ms** |
 
-**What it costs to run:** bge-m3 in fp16 is 1090 MiB of VRAM; the reranker adds 760 MiB;
-reranking 25 documents takes 0.39 s. The first query pays a 1.86 s CUDA warmup, so the server
-warms up at startup and every query after that encodes in ~25 ms.
+**A full answer** takes 5–8 s (`quick`), 10–25 s (`standard`) or 17–60 s (`deep`) — dominated
+by the language model, not by this system. When NVIDIA's endpoint degraded mid-evaluation those
+same turns took 18 s, 26–120 s and 227 s; retrieval still contributed under half a second to
+every one of them.
+
+**What it costs to run:** bge-m3 in fp16 is 1090 MiB of VRAM, the reranker adds 760 MiB, and
+the resident section index is 12.6 MB. The first query pays a 1.86 s CUDA warmup, so the server
+warms up at boot and every query after that encodes in ~25 ms.
 
 ---
 
@@ -339,6 +349,7 @@ pip install -r requirements.txt
 cp .env.example .env          # add NVIDIA_API_KEY — free from build.nvidia.com
 
 python scripts/probe_resources.py   # what this machine can run
+python scripts/build_index.py       # vector index — 23s, and worth 300ms per query
 python scripts/probe_nim.py         # which models the key can reach
 python scripts/calibrate.py         # thresholds — genuinely don't skip this
 
@@ -377,10 +388,24 @@ knowyourrights/
   web/              the interface — plain HTML, CSS and JS, no build step
 
 notebooks/          01 built the database · 02 was the first chatbot
-scripts/            probes, calibration, evaluation, and CLI harnesses
-tests/              56 tests, fully mocked — no GPU, no network, no API credits
+scripts/            probes, index build, calibration, evaluation, CLI harnesses
+tests/              58 tests, fully mocked — no GPU, no network, no API credits
 data/               the corpus itself (Git LFS)
 ```
+
+| Document | |
+|---|---|
+| **[EVALUATION.md](EVALUATION.md)** | The full report — what's in the corpus, the question sets, per-category accuracy, stage-by-stage latency, and the changes that moved each number. |
+| **[DEPLOY_AWS.md](DEPLOY_AWS.md)** | Running it on AWS for roughly $8/month, and the production failures worth pre-empting. |
+
+| Script | |
+|---|---|
+| `build_index.py` | Builds the vector index. **Run once** — without it every query scans 159 MB. |
+| `calibrate.py` | Derives the abstention thresholds for whichever reranker you're using. |
+| `benchmark.py` | The measurements in EVALUATION.md. `--all` is free; `--e2e` spends credits. |
+| `eval.py` | Recall/MRR against the gold set; `--compare` A/Bs the ranking settings. |
+| `probe_resources.py` / `probe_nim.py` | What this machine can run; which models the key can reach. |
+| `try_search.py` / `try_tools.py` / `try_agent.py` | Retrieval, each tool, and the whole agent from the terminal. |
 
 ---
 

@@ -102,9 +102,10 @@ async def test_deadline_beats_infinite_retrying():
 
 
 @pytest.mark.asyncio
-async def test_retired_model_falls_through_to_an_alternate():
-    """410 Gone is a retirement — observed live on llama-3.2-nv-rerankqa-1b-v2."""
-    registry._state = {"resolved": {}, "unavailable": []}
+async def test_unreachable_model_falls_through_to_an_alternate():
+    """A 410 must fail over immediately — the current request still needs an answer."""
+    registry._state = {"resolved": {}, "unavailable": [], "failures": {}}
+    registry._sidelined.clear()
     seen: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -120,9 +121,58 @@ async def test_retired_model_falls_through_to_an_alternate():
     assert reply == "from the alternate"
     assert seen[0] == config.FAST_MODEL.id
     assert seen[1] in config.FAST_MODEL.alternates
-    assert config.FAST_MODEL.id in registry._state["unavailable"]
-    registry._state = {"resolved": {}, "unavailable": []}
+    registry._sidelined.clear()
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_single_410_does_not_permanently_retire_a_model():
+    """Regression, and it happened for real.
+
+    NVIDIA returns 410 transiently under load, not only for genuinely retired models — a model
+    410'd on one call here and answered normally on the next. Persisting the first failure
+    meant one blip retired a healthy model on disk, and the app silently ran on its fallback
+    from then on.
+    """
+    registry._state = {"resolved": {}, "unavailable": [], "failures": {}}
+    registry._sidelined.clear()
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        model = json.loads(request.content)["model"]
+        if model == config.FAST_MODEL.id and calls["n"] == 1:
+            return httpx.Response(410, json={"title": "Gone"})
+        return chat_response(f"ok from {model}")
+
+    client = make_client(handler)
+    await client.chat([{"role": "user", "content": "hi"}], role="fast")
+
+    assert config.FAST_MODEL.id not in registry._state["unavailable"], \
+        "one transient failure must not be written to disk"
+    assert registry._state["failures"][config.FAST_MODEL.id]["count"] == 1
+
+    # After the in-process cooldown the model is tried again, and succeeding clears its streak.
+    registry._sidelined.clear()
+    reply = await client.chat([{"role": "user", "content": "hi"}], role="fast")
+    assert reply == f"ok from {config.FAST_MODEL.id}"
+    assert not registry._state["failures"], "a success must clear the failure streak"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_repeated_failures_are_eventually_recorded():
+    """Persistent failure is different from a blip, and should be remembered."""
+    registry._state = {"resolved": {}, "unavailable": [], "failures": {}}
+    registry._sidelined.clear()
+
+    for _ in range(registry.PERSIST_AFTER_FAILURES):
+        registry._sidelined.clear()
+        registry.mark_unavailable(config.FAST_MODEL.id, "HTTP 410")
+
+    assert config.FAST_MODEL.id in registry._state["unavailable"]
+    registry._state = {"resolved": {}, "unavailable": [], "failures": {}}
+    registry._sidelined.clear()
 
 
 @pytest.mark.asyncio

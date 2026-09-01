@@ -248,6 +248,9 @@ class NimClient:
                 continue
 
             if response.status_code == 200:
+                # A success clears any failure streak, so a model that 410'd under load
+                # earns its way back instead of staying sidelined.
+                registry.mark_available(model)
                 data = response.json()
                 usage = data.get("usage") or {}
                 self._ledger.record_call(
@@ -377,6 +380,7 @@ class NimClient:
                                 emitted += len(text)
                                 yield text
 
+                    registry.mark_available(model)
                     self._ledger.record_call(model, seconds=time.monotonic() - started,
                                              completion_tokens=emitted // 4,
                                              session=session, stage=stage)
@@ -438,6 +442,7 @@ class NimClient:
                     continue
 
                 if response.status_code == 200:
+                    registry.mark_available(model)
                     self._rerank_url_cache[model] = url
                     self._ledger.record_call(model, seconds=time.monotonic() - started,
                                              session=session, stage=stage)

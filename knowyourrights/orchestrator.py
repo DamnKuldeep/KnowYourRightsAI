@@ -246,9 +246,21 @@ class Orchestrator:
             turn.evidence = dedupe(turn.evidence + gathered)
             assign_ids(turn.evidence)
 
+            # An exact citation lookup cannot be off-topic — the user named the provision and
+            # we fetched that provision. Grading it wastes a model call, which at ~2.6s per
+            # call under load is a third of a quick turn.
+            only_exact = turn.evidence and all(
+                e.meta.get("exact_lookup") for e in turn.evidence)
+            if only_exact:
+                emit(events.stage("grade", "Checking which sources are actually relevant",
+                                  "done", detail="exact citation — no grading needed"))
+                assign_ids(turn.evidence)
+                for item in turn.evidence:
+                    emit(events.source(item))
+
             # Grade before deciding anything: an ungraded pile makes the gap analyst think it
             # has coverage it does not have.
-            if turn.evidence:
+            elif turn.evidence:
                 emit(events.stage("grade", "Checking which sources are actually relevant"))
                 before = len(turn.evidence)
                 turn.evidence = await stages.grade(
@@ -490,12 +502,21 @@ class Orchestrator:
                 emit(events.token(delta))
         except (NimError, NimDeadlineExceeded) as exc:
             if not collected:
-                emit(events.error(
-                    "The AI service could not be reached to write the answer. "
-                    "The sources found are listed alongside — they are still useful.",
-                    recoverable=True))
-                log.warning("writer unavailable: %s", exc)
-                conversation.add_assistant("", packed.included)
+                # The research succeeded and only the prose failed. Handing back the provisions
+                # we actually found is far more useful than an error — measured during a
+                # provider slowdown, this is the difference between a usable answer and a
+                # blank screen.
+                log.warning("writer unavailable (%s) — falling back to a source digest", exc)
+                emit(events.notice(
+                    "The writing model could not be reached, so here are the provisions found "
+                    "for your question, unedited.", level="warn"))
+                digest = _source_digest(packed.included, turn.message)
+                for line in digest.splitlines(keepends=True):
+                    emit(events.token(line))
+                turn.answer = digest
+                conversation.add_assistant(digest, packed.included)
+                emit(events.verdict(len(packed.included), [],
+                                    coverage="written without the model", degraded=True))
                 return
 
         answer = "".join(collected)
@@ -568,6 +589,44 @@ class Orchestrator:
             "ram_available_mb": live.get("ram_available_mb"),
             "throttled": any(b.get("throttled") for b in self.client.status()["limiters"]),
         }
+
+
+def _source_digest(items: list[Evidence], question: str) -> str:
+    """A readable answer assembled without a model, for when the writer cannot be reached.
+
+    Deliberately quotes rather than paraphrases: with no model in the loop there is nothing to
+    do the summarising, and a verbatim provision with its citation is still a real answer.
+    """
+    if not items:
+        return ("I could not reach the writing model, and no sources were found for this "
+                "question. Please try again in a moment.")
+
+    lines = [f"**Provisions found for:** {question}", ""]
+    statutes = [i for i in items if i.is_statute]
+    others = [i for i in items if not i.is_statute]
+
+    for item in statutes[:4]:
+        excerpt = " ".join(item.text.split())[:420]
+        flags = []
+        if item.state:
+            flags.append(f"applies only in {item.state}")
+        if item.is_omitted:
+            flags.append("this provision has been omitted")
+        note = f"  _({'; '.join(flags)})_" if flags else ""
+        lines.append(f"**{item.label()}**{note}")
+        lines.append(f"> {excerpt}…")
+        lines.append("")
+
+    if others:
+        lines.append("**Also found:**")
+        for item in others[:4]:
+            link = f"[{item.title[:70]}]({item.url})" if item.url else item.title[:70]
+            lines.append(f"- {link}")
+        lines.append("")
+
+    lines.append("_This is the raw statutory text, not an explanation — the model that writes "
+                 "the plain-language answer was unavailable. Try again shortly._")
+    return "\n".join(lines)
 
 
 _ORCHESTRATOR: Orchestrator | None = None
