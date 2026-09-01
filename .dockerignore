@@ -1,0 +1,27 @@
+# Keep the build context small. Without this, Docker uploads the 350 MB corpus and the whole
+# git history on every build — the corpus is mounted as a volume instead (see compose).
+.git
+.gitattributes
+data/legal_db
+data/chunks_metadata.parquet
+data/enrichment_cache.json
+
+.runtime
+.venv
+venv
+__pycache__
+**/__pycache__
+*.py[cod]
+.pytest_cache
+.crawl4ai
+
+notebooks
+.github
+*.md
+!README.md
+
+.env
+.vscode
+.idea
+.DS_Store
+Thumbs.db

@@ -1,0 +1,53 @@
+# Run the whole thing with:  docker compose up
+#
+# The corpus is mounted read-only from the repo and the model weights live in a named volume,
+# so `docker compose up` after a rebuild does not re-download 2.3 GB of bge-m3.
+
+services:
+  app:
+    build: .
+    image: knowyourrights:latest
+    container_name: knowyourrights
+    restart: unless-stopped
+
+    env_file:
+      - .env                       # NVIDIA_API_KEY lives here; it is gitignored
+
+    environment:
+      # CPU-only container. Local reranking is ~10 s per query on 2 cores, so the candidate
+      # pool is halved — it is the single knob that decides whether a CPU box feels usable.
+      KYR_PROFILE: cpu
+      KYR_RERANK_POOL: "12"
+      KYR_RAM_FLOOR_MB: "800"
+      # Chromium is not installed in the image; HTTP-only crawling still reads static gov.in
+      # pages, and skips the JS-rendered portals.
+      KYR_CRAWL_USE_BROWSER: "false"
+      KYR_DEFAULT_DEPTH: standard
+      KYR_SESSION_CREDIT_BUDGET: "800"
+      KYR_MODEL_IDLE_EVICT_S: "1800"
+      KYR_LOG_LEVEL: INFO
+
+    ports:
+      - "127.0.0.1:8000:8000"      # bind to localhost; put Caddy or a tunnel in front
+
+    volumes:
+      - ./data:/data:ro            # the corpus — read-only, never written by the app
+      - kyr-models:/models         # HF cache: bge-m3 downloads once and stays
+      - ./.runtime:/runtime        # calibrated thresholds, usage ledger, caches
+
+    # A hard ceiling, so a runaway process cannot take the host down with it. bge-m3 spikes
+    # to ~2.3 GB while loading, hence 3.5 GB rather than something tighter.
+    deploy:
+      resources:
+        limits:
+          memory: 3500M
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 240s
+      retries: 5
+
+volumes:
+  kyr-models:

@@ -391,12 +391,30 @@ notebooks/          01 built the database · 02 was the first chatbot
 scripts/            probes, index build, calibration, evaluation, CLI harnesses
 tests/              58 tests, fully mocked — no GPU, no network, no API credits
 data/               the corpus itself (Git LFS)
+deploy/             wake-on-demand Lambda and the idle-shutdown timer
+Dockerfile          CPU image, x86_64 and ARM64
+docker-compose.yml  corpus mounted, model weights in a volume
 ```
 
 | Document | |
 |---|---|
 | **[EVALUATION.md](EVALUATION.md)** | The full report — what's in the corpus, the question sets, per-category accuracy, stage-by-stage latency, and the changes that moved each number. |
-| **[DEPLOY_AWS.md](DEPLOY_AWS.md)** | Running it on AWS for roughly $8/month, and the production failures worth pre-empting. |
+| **[DEPLOY_AWS.md](DEPLOY_AWS.md)** | A demo that sleeps when idle and wakes when someone opens the link — ~$20 for six months — plus the production failures worth pre-empting. |
+
+Docker, if you'd rather not install anything:
+
+```bash
+cp .env.example .env && docker compose up --build
+docker compose exec app python scripts/build_index.py   # first run only
+docker compose exec app python scripts/calibrate.py
+```
+
+The image holds neither the corpus nor the model weights — the corpus is mounted read-only from
+the clone and the models live in a named volume, so rebuilds don't re-download bge-m3. It comes
+to **3.34 GB**; baking both in would push it near 6 GB.
+
+On Windows use `docker compose` rather than `docker run -v`: Git Bash silently rewrites
+`/data:ro` into a Windows path and the mount lands somewhere useless.
 
 | Script | |
 |---|---|

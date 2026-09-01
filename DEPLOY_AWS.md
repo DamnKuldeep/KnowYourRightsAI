@@ -1,139 +1,120 @@
-# Deploying on AWS with $100 of credit
+# Deploying on AWS — a demo that wakes on demand
 
-Two goals: it should not break in production, and it should cost nothing while nobody is using
-it. Those pull in different directions — the honest answer is below.
+Goal: a link you can share, that costs almost nothing between demos, and does not fall over
+during one.
+
+**Your situation:** $100 of credit, expiring in **182 days**. That is the number that shapes
+everything below. There is no point stretching the money over two years — it expires first.
+$100 / 182 days is about **$0.55 a day** of headroom, which is far more than this needs.
 
 ---
 
-## What has to fit, and what that rules out
+## The short version
+
+| | |
+|---|---|
+| Instance | `t4g.medium` (ARM Graviton, 2 vCPU, 4 GB) — **stopped by default** |
+| Wake | A Lambda Function URL that starts it when someone opens the link |
+| Sleep | A cron job on the box that stops it after 30 minutes with no questions |
+| Cost between demos | **~$2.40/month** (the EBS volume, nothing else) |
+| Cost during demos | **$0.034/hour** |
+| **Total over 182 days** | **≈ $25–40** — comfortably inside the credit |
+
+You get a permanent URL. Visiting it when the box is asleep shows a "booting, ~2 minutes"
+page that refreshes itself and then hands over to the app.
+
+---
+
+## Why not something that truly scales to zero
+
+Worth stating plainly, because it is the obvious question:
+
+| | Why it does not work |
+|---|---|
+| **Lambda** | 15-minute cap, no memory retained between invocations, and a 2.3 GB model reload per cold start. A deep research turn alone can exceed the limit. |
+| **Fargate + ALB** | ECS will not scale a service to zero behind a load balancer, and the ALB is ~$16/month on its own — more than the instance. |
+| **App Runner** | Has a scale-to-zero mode, but provisioned memory is still billed and every wake reloads the model. |
+| **EC2 `t3.micro`/`small`** | 1–2 GB RAM. `bge-m3` alone needs ~2.3 GB. |
+
+Nothing on AWS gives request-driven scaling for a workload that must keep 2.3 GB of weights
+resident. Wake-on-demand is the honest substitute: the *link* is always up, the *machine* is not.
+
+---
+
+## What has to fit
 
 | Component | Cost | Can it move off the box? |
 |---|---|---|
-| `BAAI/bge-m3` embedder | ~2.3 GB RAM (fp32 CPU) | **No.** The corpus is embedded with it. A different model means re-embedding all 38,890 chunks. |
-| Reranker | ~1.1 GB, **~10 s/query on CPU** | In principle yes — but see the warning below. |
-| Corpus (LanceDB + parquet) | ~350 MB disk | No, but it is just files. |
+| `BAAI/bge-m3` embedder | ~2.3 GB RAM | **No.** The corpus is embedded with it — a different model means re-embedding all 38,890 chunks. |
+| Reranker | ~1.1 GB, **~10 s/query on 2 CPU cores** | In principle, but see the warning. |
+| Corpus | ~350 MB disk | No, but it is just files. |
 | LLMs | — | Already remote (NVIDIA NIM). |
-| Chromium (crawl4ai) | 300–500 MB RSS | Optional: `KYR_CRAWL_USE_BROWSER=false`. |
+| Chromium | 300–500 MB RSS | Optional — `KYR_CRAWL_USE_BROWSER=false`. |
 
-**Minimum viable instance: 4 GB RAM.** This rules out `t3.micro` (1 GB) and `t3.small` (2 GB).
-
-> ### Warning — do not rely on remote reranking
-> The `cpu_lean` profile pushes reranking to NVIDIA to avoid the 10-second CPU cost. During
-> evaluation **every NIM reranking endpoint returned 410 or 404** — `llama-3.2-nv-rerankqa-1b-v2`,
-> `llama-nemotron-rerank-1b-v2` and `nv-rerankqa-mistral-4b-v3` all failed within one probe.
-> The system degrades correctly (it falls back to fusion-only ranking and says so), but you
-> should not *plan* a deployment around that endpoint being there.
->
-> Deploy with local reranking and size the instance for it.
+> **Do not plan around the remote reranker.** The `cpu_lean` profile offloads reranking to
+> NVIDIA to dodge the CPU cost. During evaluation **every NIM reranking endpoint returned 410
+> or 404** — `llama-3.2-nv-rerankqa-1b-v2`, `llama-nemotron-rerank-1b-v2` and
+> `nv-rerankqa-mistral-4b-v3` all failed inside one probe. The app degrades correctly and says
+> so, but deploy with `KYR_PROFILE=cpu` and tune `KYR_RERANK_POOL` instead.
 
 ---
 
-## The AWS free tier is not what it used to be
+## Part 1 — the instance
 
-Accounts opened after **15 July 2025** no longer get the 12-month free EC2 allowance. New
-accounts get **$200 in credits** ($100 on signup, $100 more for usage) that draw down against
-normal pricing. Your $100 is a **budget, not a free tier** — when it is gone, billing starts.
+### Launch
 
-So the design goal is: make $100 last, and make sure it cannot silently become $300.
+- **AMI** Ubuntu 22.04 **ARM64**, **type** `t4g.medium`, **storage** 30 GB gp3
+- **Security group** inbound 22 from your IP only, and 443. Do **not** open 8000.
+- **No Elastic IP.** It is free only while attached to a *running* instance and billed when
+  stopped — exactly backwards for this design. Use a Cloudflare Tunnel for a stable address.
 
----
-
-## Recommended: one EC2 instance you switch on and off
-
-Simple, debuggable, and the cost is genuinely proportional to uptime.
-
-### Instance choice
-
-| Instance | vCPU | RAM | $/hour | Notes |
-|---|---:|---:|---:|---|
-| **`t4g.medium`** (ARM Graviton) | 2 | 4 GB | **~$0.0336** | **Recommended.** ~20% cheaper than x86. |
-| `t3.medium` (x86) | 2 | 4 GB | ~$0.0416 | Use if an ARM wheel is ever missing. |
-| `t4g.large` | 2 | 8 GB | ~$0.0672 | Comfortable if you also want Chromium. |
-
-### What $100 actually buys
-
-Storage is billed whether the instance runs or not: **30 GB gp3 ≈ $2.40/month**. That is the
-floor. Everything else scales with uptime.
-
-| Pattern | Compute/month | + storage | **Total/month** | $100 lasts |
-|---|---:|---:|---:|---:|
-| Always on | $24.20 | $2.40 | **$26.60** | ~3.8 months |
-| 12 h/day | $12.10 | $2.40 | **$14.50** | ~6.9 months |
-| 8 h/day weekdays | $5.80 | $2.40 | **$8.20** | ~12 months |
-| On demand only (~2 h/day) | $2.00 | $2.40 | **$4.40** | ~22 months |
-| Stopped, storage only | $0 | $2.40 | **$2.40** | ~41 months |
-
-Add a **Spot instance** and compute drops ~70% again — `t4g.medium` spot is around $0.010/hr,
-so always-on becomes ~$9.60/month. Spot can be reclaimed with a 2-minute warning, which is fine
-for a demo and not for anything anyone depends on.
-
-**Skip the load balancer.** An ALB is ~$16/month on its own — more than the instance. Use
-Caddy on the box for HTTPS, or a Cloudflare Tunnel (free, and no inbound ports at all).
-
----
-
-## Setting it up
-
-### 1. Launch
-
-- AMI: **Ubuntu 22.04 ARM64**, instance `t4g.medium`, storage **30 GB gp3**
-- Security group: inbound **22** (your IP only) and **443**. Do not open 8000 publicly.
-- Allocate an **Elastic IP** only if you need a stable address — it is free while attached to a
-  *running* instance but **charged when the instance is stopped**. If you will stop the box
-  often, skip it and use a Cloudflare Tunnel instead.
-
-### 2. Install
+### Install
 
 ```bash
 sudo apt update && sudo apt install -y python3-pip python3-venv git git-lfs
-git lfs install
+git lfs install                       # BEFORE cloning, or you get 134-byte pointer files
 
 git clone https://github.com/DamnKuldeep/KnowYourRightsAI.git
 cd KnowYourRightsAI
 python3 -m venv .venv && source .venv/bin/activate
-
-# CPU-only torch: ~200 MB instead of ~2.5 GB with the CUDA runtime
-pip install --index-url https://download.pytorch.org/whl/cpu torch
+pip install --index-url https://download.pytorch.org/whl/cpu torch   # ~200 MB, not 2.5 GB
 pip install -r requirements.txt
 ```
 
-Without `git lfs install` **before** cloning you get 134-byte pointer files instead of the
-database, and a confusing startup failure. This is the single most common way to get this wrong.
+Forgetting `git lfs install` before the clone is the single most common way to get this wrong —
+the app starts, then fails confusingly because `data/legal_db` is pointer text.
 
-### 3. Configure
+### Configure
 
 ```bash
 cat > .env <<'EOF'
 NVIDIA_API_KEY=nvapi-your-key-here
 
-KYR_PROFILE=cpu                  # local reranking — do not depend on the remote reranker
+KYR_PROFILE=cpu                  # local reranking; do not depend on the remote one
+KYR_RERANK_POOL=12               # halves the CPU rerank cost — the key knob on 2 cores
 KYR_HOST=127.0.0.1               # Caddy/tunnel faces the internet, not uvicorn
 KYR_CRAWL_USE_BROWSER=false      # saves ~400 MB; loses JS-only portals
-KYR_DEFAULT_DEPTH=standard       # cap research depth on a shared instance
+KYR_DEFAULT_DEPTH=standard       # cap research depth on a shared demo box
 KYR_SESSION_CREDIT_BUDGET=800    # downshift depth before NIM credits run out
-KYR_MODEL_IDLE_EVICT_S=1800      # release model memory after 30 min idle
-KYR_RERANK_POOL=12               # halves the 10 s CPU rerank; costs a little recall
+KYR_MODEL_IDLE_EVICT_S=1800
 KYR_LOG_LEVEL=WARNING
 EOF
 chmod 600 .env
 ```
 
-`KYR_RERANK_POOL=12` is the important CPU tuning knob: reranking is ~75% of retrieval time and
-scales with pool size.
-
-### 4. Build the index and calibrate — both required
+### Prepare — both steps are required
 
 ```bash
 python scripts/build_index.py     # 23 s. Without it every query scans 159 MB.
 python scripts/probe_nim.py       # pin reachable models
-python scripts/calibrate.py       # REQUIRED — thresholds don't transfer between rerankers
-python scripts/benchmark.py --all # confirm the numbers on this machine
+python scripts/calibrate.py       # thresholds do not transfer between rerankers
+python scripts/benchmark.py --all # confirm Recall@5 on this machine
 ```
 
 Skipping `calibrate.py` leaves uncalibrated defaults, which is how off-topic questions start
 getting confident answers.
 
-### 5. Run it as a service
+### Run it as a service
 
 ```bash
 sudo tee /etc/systemd/system/kyr.service >/dev/null <<'EOF'
@@ -149,10 +130,8 @@ Environment=HF_HOME=/home/ubuntu/.cache/huggingface
 ExecStart=/home/ubuntu/KnowYourRightsAI/.venv/bin/python -m knowyourrights.server
 Restart=always
 RestartSec=15
-# Models take up to ~140 s to load on a cold CPU box; don't let systemd kill the boot.
-TimeoutStartSec=300
-# Hard ceiling so a runaway process cannot take the machine down with it.
-MemoryMax=3500M
+TimeoutStartSec=300          # models take up to ~140 s on a cold CPU box
+MemoryMax=3500M              # hard ceiling; bge-m3 spikes to ~2.3 GB while loading
 OOMPolicy=stop
 
 [Install]
@@ -160,142 +139,10 @@ WantedBy=multi-user.target
 EOF
 
 sudo systemctl daemon-reload && sudo systemctl enable --now kyr
-sudo systemctl status kyr
 journalctl -u kyr -f
 ```
 
-### 6. HTTPS
-
-```bash
-sudo apt install -y caddy
-echo 'your.domain { reverse_proxy 127.0.0.1:8000 }' | sudo tee /etc/caddy/Caddyfile
-sudo systemctl restart caddy      # certificates are automatic
-```
-
-No domain? A Cloudflare Tunnel gives you a public HTTPS URL with no open inbound ports:
-
-```bash
-cloudflared tunnel --url http://localhost:8000
-```
-
----
-
-## Making it cost only what you use
-
-### Option A — a schedule (simplest, predictable)
-
-EventBridge Scheduler rules that start and stop the instance. Two rules, no code:
-
-```bash
-INSTANCE_ID=i-0123456789abcdef0
-ROLE_ARN=arn:aws:iam::<account>:role/EventBridgeEC2Role   # needs ec2:StartInstances/StopInstances
-
-aws scheduler create-schedule --name kyr-start \
-  --schedule-expression "cron(0 9 ? * MON-FRI *)" --schedule-expression-timezone "Asia/Kolkata" \
-  --flexible-time-window '{"Mode":"OFF"}' \
-  --target "{\"Arn\":\"arn:aws:scheduler:::aws-sdk:ec2:startInstances\",\"RoleArn\":\"$ROLE_ARN\",\"Input\":\"{\\\"InstanceIds\\\":[\\\"$INSTANCE_ID\\\"]}\"}"
-
-aws scheduler create-schedule --name kyr-stop \
-  --schedule-expression "cron(0 21 ? * MON-FRI *)" --schedule-expression-timezone "Asia/Kolkata" \
-  --flexible-time-window '{"Mode":"OFF"}' \
-  --target "{\"Arn\":\"arn:aws:scheduler:::aws-sdk:ec2:stopInstances\",\"RoleArn\":\"$ROLE_ARN\",\"Input\":\"{\\\"InstanceIds\\\":[\\\"$INSTANCE_ID\\\"]}\"}"
-```
-
-9am–9pm on weekdays is ~$8/month all-in — **$100 lasts about a year**.
-
-### Option B — idle auto-shutdown (pay for actual use)
-
-Let the box turn *itself* off when nobody has asked anything. The server already tracks this.
-
-```bash
-cat > /home/ubuntu/idle-shutdown.sh <<'EOF'
-#!/bin/bash
-# Stop the instance after 30 minutes with no questions asked.
-IDLE_LIMIT=1800
-STATE=/tmp/kyr-last-activity
-CALLS=$(curl -s http://127.0.0.1:8000/api/usage | python3 -c \
-        'import sys,json; print(json.load(sys.stdin).get("total_calls",0))' 2>/dev/null || echo 0)
-PREV=$(cut -d' ' -f1 "$STATE" 2>/dev/null || echo -1)
-NOW=$(date +%s)
-if [ "$CALLS" != "$PREV" ]; then
-  echo "$CALLS $NOW" > "$STATE"; exit 0
-fi
-LAST=$(cut -d' ' -f2 "$STATE" 2>/dev/null || echo "$NOW")
-if [ $((NOW - LAST)) -gt "$IDLE_LIMIT" ]; then
-  logger "kyr: idle for $IDLE_LIMIT s, shutting down"
-  sudo shutdown -h now
-fi
-EOF
-chmod +x /home/ubuntu/idle-shutdown.sh
-(crontab -l 2>/dev/null; echo "*/5 * * * * /home/ubuntu/idle-shutdown.sh") | crontab -
-```
-
-Then start it on demand from your phone or laptop:
-
-```bash
-aws ec2 start-instances --instance-ids i-0123456789abcdef0
-```
-
-Two caveats worth being clear about: a stopped instance takes **~2–3 minutes** to boot and load
-models, and this is *scale-to-zero-by-schedule*, not true request-driven autoscaling. Nothing on
-AWS gives you the latter for a workload that must keep 2.3 GB of model weights resident.
-
-### Option C — Spot for the cheapest always-on
-
-A persistent Spot request at `t4g.medium` runs ~$0.010/hr — **~$9.60/month always on**. AWS can
-reclaim it with a 2-minute warning. Fine for a portfolio demo; not for anything with users who
-would notice.
-
-### What does *not* work
-
-| | Why |
-|---|---|
-| **Lambda** | 15-minute cap, no persistent memory between invocations, and a 2.3 GB model reload per cold start. A deep turn already exceeds this. |
-| **Fargate scale-to-zero** | ECS does not scale to zero for a service behind a load balancer, and the ALB alone is ~$16/month. |
-| **App Runner** | Has a scale-to-zero mode, but a provisioned-memory charge continues and cold starts reload the model. |
-| **`t3.micro` / `t3.small`** | 1–2 GB RAM. bge-m3 alone needs ~2.3 GB. |
-
----
-
-## Not breaking in production
-
-The failures below were all observed during evaluation, not imagined.
-
-### Set a billing alarm before anything else
-
-```bash
-aws budgets create-budget --account-id <account> \
-  --budget '{"BudgetName":"kyr","BudgetLimit":{"Amount":"25","Unit":"USD"},
-             "TimeUnit":"MONTHLY","BudgetType":"COST"}' \
-  --notifications-with-subscribers '[{"Notification":{"NotificationType":"ACTUAL",
-    "ComparisonOperator":"GREATER_THAN","Threshold":50},
-    "Subscribers":[{"SubscriptionType":"EMAIL","Address":"you@example.com"}]}]'
-```
-
-Credits run out silently. This is the difference between a $100 project and a surprise bill.
-
-### The NIM free tier is metered too
-
-~1,000 credits, roughly one per request, and a legal question costs **3–9**. That is a few
-hundred questions. `KYR_SESSION_CREDIT_BUDGET=800` makes the agent downshift research depth as
-the budget depletes rather than failing once it is gone. Watch `/api/usage`.
-
-### Health checks
-
-`/api/health` reports readiness, the active profile, live VRAM/RAM, model resolution and cache
-stats. It returns `ready: false` while models load — do not route traffic on process liveness
-alone, or the first users hit a cold, unwarmed instance.
-
-```bash
-curl -s localhost:8000/api/health | python3 -m json.tool | head -20
-```
-
-### Memory is the thing that will kill it
-
-The bge-m3 load spikes host RAM to ~2.3 GB. On a 4 GB box with anything else running, that is
-the failure. Mitigations already in place: a RAM floor check that refuses to load and degrades
-to keyword-only search rather than being OOM-killed, and `MemoryMax` in the unit file as a hard
-ceiling. Add swap as insurance:
+Add swap as insurance against the load spike:
 
 ```bash
 sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile
@@ -303,32 +150,200 @@ sudo mkswap /swapfile && sudo swapon /swapfile
 echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 ```
 
-### One worker, always
+### A public address
 
-A second uvicorn worker loads a second copy of bge-m3 and doubles memory for no benefit — GPU
-and model access are already serialised internally. The server defaults to one; do not "tune"
-this.
+```bash
+# Cloudflare Tunnel — free, no inbound ports, survives the instance changing IP
+cloudflared tunnel --url http://localhost:8000
+```
 
-### Model retirement is a live event, not a hypothetical
+Or with your own domain and Caddy:
 
-During evaluation `nemotron-3-nano-30b-a3b` returned 410 and every reranking endpoint returned
-410 or 404. The registry fails over to alternates automatically. It also — after a bug found
-exactly this way — treats a single 410 as *transient*: the model is sidelined for the process
-and retried later, and only recorded as unavailable after 3 failures within an hour. One blip
-no longer permanently retires a healthy model.
+```bash
+sudo apt install -y caddy
+echo 'demo.yourdomain.com { reverse_proxy 127.0.0.1:8000 }' | sudo tee /etc/caddy/Caddyfile
+sudo systemctl restart caddy      # certificates are automatic
+```
 
-Check what is actually resolved: `curl -s localhost:8000/api/health | grep -A5 models`.
+---
 
-### Back up what you cannot rebuild cheaply
+## Part 2 — sleeping when idle
+
+Install the timer that stops the box when nobody is asking anything:
+
+```bash
+sudo cp deploy/idle-shutdown.sh /usr/local/bin/ && sudo chmod +x /usr/local/bin/idle-shutdown.sh
+( crontab -l 2>/dev/null; echo "*/5 * * * * /usr/local/bin/idle-shutdown.sh" ) | crontab -
+```
+
+It watches the app's own LLM-call counter rather than CPU load, because the box is *supposed*
+to sit warm-but-quiet between questions in a demo. It also refuses to act within 15 minutes of
+boot, so a visitor arriving during startup is never killed mid-load.
+
+`shutdown -h` on an EBS-backed instance **stops** it rather than terminating — the disk and
+everything on it survives until the next wake.
+
+---
+
+## Part 3 — waking on demand
+
+A Lambda Function URL (no API Gateway, no cost at demo volumes) that starts the instance when
+someone opens the link and shows a waiting page until the app reports ready.
+
+### IAM role
+
+```bash
+cat > trust.json <<'EOF'
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+ "Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}
+EOF
+
+aws iam create-role --role-name kyr-waker --assume-role-policy-document file://trust.json
+aws iam attach-role-policy --role-name kyr-waker \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+INSTANCE_ID=i-0123456789abcdef0
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+REGION=$(aws configure get region)
+
+cat > ec2-policy.json <<EOF
+{"Version":"2012-10-17","Statement":[
+ {"Effect":"Allow","Action":["ec2:StartInstances"],
+  "Resource":"arn:aws:ec2:${REGION}:${ACCOUNT}:instance/${INSTANCE_ID}"},
+ {"Effect":"Allow","Action":["ec2:DescribeInstances"],"Resource":"*"}]}
+EOF
+
+aws iam put-role-policy --role-name kyr-waker \
+  --policy-name kyr-start-instance --policy-document file://ec2-policy.json
+```
+
+Scoped to one instance id — the waker can start that box and nothing else.
+
+### The function
+
+```bash
+cd deploy && zip waker.zip wake_lambda.py && cd ..
+
+aws lambda create-function --function-name kyr-waker \
+  --runtime python3.12 --handler wake_lambda.handler \
+  --role arn:aws:iam::${ACCOUNT}:role/kyr-waker \
+  --zip-file fileb://deploy/waker.zip --timeout 15 --memory-size 256 \
+  --environment "Variables={INSTANCE_ID=${INSTANCE_ID},APP_URL=https://demo.yourdomain.com,REGION=${REGION}}"
+
+aws lambda create-function-url-config --function-name kyr-waker --auth-type NONE
+aws lambda add-permission --function-name kyr-waker --statement-id public \
+  --action lambda:InvokeFunctionUrl --principal '*' --function-url-auth-type NONE
+aws lambda get-function-url-config --function-name kyr-waker --query FunctionUrl --output text
+```
+
+That URL is what you share. It is always live, costs nothing at demo volumes (Lambda's 1M
+free requests a month never expire), and it boots the demo when someone arrives.
+
+**Flow:** visitor opens the link → Lambda sees the instance stopped → starts it, returns a
+waiting page that refreshes every 10 s → once `/api/health` reports `ready: true`, the page
+redirects to the app. Roughly two minutes, most of it loading the models.
+
+---
+
+## Docker, if you prefer it
+
+The repo ships a `Dockerfile` and `docker-compose.yml`. The image deliberately contains
+**neither the corpus nor the model weights** — the corpus is mounted read-only from the clone,
+and the models live in a named volume so they download once and survive rebuilds. That keeps
+the image at ~1.5 GB rather than ~4 GB, which matters when you are pulling it onto a
+billed-by-the-second instance.
+
+```bash
+cp .env.example .env      # add NVIDIA_API_KEY
+docker compose up --build
+
+# first run only: build the index and calibrate, inside the container
+docker compose exec app python scripts/build_index.py
+docker compose exec app python scripts/calibrate.py
+docker compose restart app
+```
+
+On the EC2 box the only difference is installing Docker first:
+
+```bash
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker ubuntu && newgrp docker
+git lfs install && git clone https://github.com/DamnKuldeep/KnowYourRightsAI.git
+cd KnowYourRightsAI && cp .env.example .env   # edit it
+docker compose up -d --build
+```
+
+`restart: unless-stopped` in the compose file means the container comes back by itself after
+the instance wakes — no systemd unit needed if you go this route. Use one or the other, not
+both.
+
+---
+
+## What it actually costs
+
+`t4g.medium` is $0.0336/hour; 30 GB of gp3 is $2.40/month whether the instance runs or not.
+
+| Pattern | Compute (182 days) | Storage | **Total** |
+|---|---:|---:|---:|
+| **Wake-on-demand, ~1 h/day** | $6.11 | $14.40 | **$20.51** |
+| Wake-on-demand, ~3 h/day | $18.34 | $14.40 | **$32.74** |
+| Weekdays 9–9 on a schedule | $35.28 | $14.40 | **$49.68** |
+| Always on | $146.75 | $14.40 | **$161.15** ✗ over budget |
+
+Always-on does not fit in $100 for 182 days. Wake-on-demand uses about a fifth of the credit
+and leaves the rest spare.
+
+Lambda is free at this volume. Egress is well inside the 100 GB/month free allowance. Skip the
+Elastic IP and there is nothing else billing.
+
+**If you want the demo to feel fast**, `g4dn.xlarge` (T4 GPU) at $0.526/hour runs the GPU
+profile — 399 ms retrieval instead of ~5 s. Two hours a week for 26 weeks is ~$27 of compute,
+which fits. It needs a Deep Learning AMI and more setup, and the language model dominates
+end-to-end time anyway, so I would only bother if the retrieval delay is visibly annoying in
+front of an audience.
+
+---
+
+## Not breaking in production
+
+Each of these is a failure actually observed, not a hypothetical.
+
+**Set a billing alarm first.** Credits run out silently and then billing just… continues.
+
+```bash
+aws budgets create-budget --account-id ${ACCOUNT} \
+  --budget '{"BudgetName":"kyr","BudgetLimit":{"Amount":"20","Unit":"USD"},
+             "TimeUnit":"MONTHLY","BudgetType":"COST"}' \
+  --notifications-with-subscribers '[{"Notification":{"NotificationType":"ACTUAL",
+    "ComparisonOperator":"GREATER_THAN","Threshold":50},
+    "Subscribers":[{"SubscriptionType":"EMAIL","Address":"you@example.com"}]}]'
+```
+
+**Your NIM credits will run out before your AWS credits.** ~1,000 credits, 3–9 per legal
+question — a few hundred questions total. `KYR_SESSION_CREDIT_BUDGET=800` makes the agent
+downshift research depth as the budget depletes rather than failing after. Watch `/api/usage`.
+
+**Memory is what kills it.** The bge-m3 load spikes to ~2.3 GB. On a 4 GB box with anything
+else running, that is the failure. Already mitigated: a RAM floor check that refuses to load
+and degrades to keyword-only search rather than being OOM-killed, plus `MemoryMax` and swap.
+
+**One worker, always.** A second uvicorn worker loads a second copy of bge-m3 for no benefit —
+model access is already serialised internally.
+
+**Models get retired mid-run.** During evaluation `nemotron-3-nano-30b-a3b` returned 410, and
+every reranking endpoint returned 410 or 404. The registry fails over automatically, and after
+a bug found exactly this way it treats a single 410 as *transient* — sidelined for the process,
+retried later, only recorded as unavailable after 3 failures in an hour. Check what is actually
+resolved with `curl -s localhost:8000/api/health`.
+
+**Back up the calibration.** `thresholds.json` is the difference between abstaining properly
+and answering off-topic questions confidently.
 
 ```bash
 tar czf ~/kyr-runtime-$(date +%F).tgz .runtime/thresholds.json .runtime/nim_probe.json
 ```
 
-`thresholds.json` is the calibration. Losing it silently degrades abstention — regenerate with
-`scripts/calibrate.py` rather than guessing.
-
-### Log rotation
+**Rotate the logs.** `usage.jsonl` grows with every API call.
 
 ```bash
 sudo tee /etc/logrotate.d/kyr >/dev/null <<'EOF'
@@ -343,32 +358,19 @@ sudo tee /etc/logrotate.d/kyr >/dev/null <<'EOF'
 EOF
 ```
 
-`usage.jsonl` grows with every API call and will otherwise fill the disk eventually.
-
 ---
 
 ## Pre-flight checklist
 
-- [ ] Billing alarm set at $25
-- [ ] `git lfs install` run **before** cloning; `data/legal_db/` is ~350 MB, not 134-byte pointers
+- [ ] Billing alarm set
+- [ ] `git lfs install` run **before** cloning; `data/legal_db/` is ~350 MB, not pointer files
 - [ ] `scripts/build_index.py` run — vector search ~23 ms, not ~300 ms
-- [ ] `scripts/calibrate.py` run — `thresholds.json` exists and is not "config default"
+- [ ] `scripts/calibrate.py` run — `thresholds.json` exists and does not say "config default"
 - [ ] `scripts/benchmark.py --all` gives Recall@5 ≈ 100% on this machine
-- [ ] `KYR_PROFILE=cpu` (not `cpu_lean` — remote reranking is unreliable)
-- [ ] `KYR_HOST=127.0.0.1` with Caddy or a tunnel in front; port 8000 not public
+- [ ] `KYR_PROFILE=cpu`, `KYR_RERANK_POOL=12`
+- [ ] `KYR_HOST=127.0.0.1` with Caddy or a tunnel in front; 8000 not public
 - [ ] `.env` is `chmod 600` and not in git
-- [ ] Swap added; `MemoryMax` set in the unit file
-- [ ] `/api/health` returns `ready: true` before you share the URL
-- [ ] Schedule or idle-shutdown configured, and you have tested that it restarts cleanly
-
----
-
-## What I would actually do with $100
-
-Run `t4g.medium` on a **weekday 9am–9pm schedule** with idle-shutdown as a backstop: about
-**$8/month**, so the credit lasts roughly a year, and the site is up whenever anyone is likely
-to look at it. Keep a Cloudflare Tunnel rather than an Elastic IP so a stopped instance costs
-nothing but its disk.
-
-If you need it up permanently, Spot at ~$9.60/month is the cheaper route — accept that AWS can
-reclaim it with two minutes' notice.
+- [ ] Swap added; `MemoryMax` set
+- [ ] `/api/health` returns `ready: true` before you share the link
+- [ ] Idle-shutdown installed **and tested** — stop it once and confirm the Lambda wakes it
+- [ ] No Elastic IP attached (it bills while the instance is stopped)
