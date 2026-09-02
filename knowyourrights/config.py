@@ -223,6 +223,16 @@ class Profile:
     embed_batch: int
     rerank_batch: int
     note: str = ""
+    # `lite` turns the embedder off entirely and runs on BM25 alone. Measured on the gold set:
+    # Recall@5 95.2% and MRR 0.800 against 100% / 0.873 for the full pipeline, at 37 ms instead
+    # of 399 ms, in under 1 GB of RAM. It works this well because the BM25 index covers
+    # `embed_text`, which carries the LLM-generated citizen questions — so keyword search is
+    # querying the way people ask, not raw statutory language.
+    use_embedder: bool = True
+
+    @property
+    def needs_models(self) -> bool:
+        return self.use_embedder or self.rerank_backend == "local"
 
 
 # Ordered best-first; the first profile that fits the probed machine wins.
@@ -242,6 +252,14 @@ PROFILES: tuple[Profile, ...] = (
 # retrieval drops back to roughly a second. This is the profile to deploy on a free CPU box.
 CPU_LEAN = Profile("cpu_lean", "nim", None, model_vram_mb=0, embed_batch=2, rerank_batch=25,
                    note="embedding local on CPU, reranking on NIM — for CPU-only hosting")
+
+# For a box too small to hold bge-m3 at all — a 1-2 GB free-tier instance. Never selected
+# automatically: it trades real retrieval quality for fitting, and that should be a decision
+# somebody makes, not something that quietly happens.
+LITE = Profile("lite", "none", None, model_vram_mb=0, embed_batch=1, rerank_batch=1,
+               use_embedder=False,
+               note="BM25 only — no models, <1 GB RAM, Recall@5 95% at 37 ms")
+
 PROFILES = PROFILES + (CPU_LEAN,)
 
 PROFILE_REQUEST = env_str("KYR_PROFILE", "auto")          # auto | quality | balanced | lean | cpu
@@ -259,10 +277,15 @@ FETCH_K = env_int("KYR_FETCH_K", 25)          # per ranked list, before fusion
 TOP_K = env_int("KYR_TOP_K", 5)               # sections returned to the answer layer
 RERANK_POOL = env_int("KYR_RERANK_POOL", 24)  # candidates that reach the cross-encoder
 RRF_K = env_int("KYR_RRF_K", 60)
+# BM25 score treated as "certainly relevant" when no reranker is available. Measured on
+# this corpus: on-topic legal queries peak around 24-31, off-topic ones around 13-19.
+BM25_FULL_SCORE = env_float("KYR_BM25_FULL_SCORE", 40.0)
 MMR_LAMBDA = env_float("KYR_MMR_LAMBDA", 0.6)
 # When the question names a specific Act, several sections *of that Act* is the right answer,
 # so diversity is dialled down rather than spreading results across unrelated statutes.
 MMR_LAMBDA_FOCUSED = env_float("KYR_MMR_LAMBDA_FOCUSED", 0.85)
+# Without a reranker the base ordering is weaker, so diversity costs more than it returns.
+MMR_LAMBDA_NO_RERANK = env_float("KYR_MMR_LAMBDA_NO_RERANK", 0.97)
 # How much extra weight a ranked list restricted to a named Act carries in the fusion.
 ACT_FILTER_WEIGHT = env_float("KYR_ACT_FILTER_WEIGHT", 2.5)
 

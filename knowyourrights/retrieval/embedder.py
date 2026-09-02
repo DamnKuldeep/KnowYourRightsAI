@@ -83,6 +83,13 @@ class Embedder:
         """Load once. Returns False if the model is unavailable — never raises."""
         if self._model is not None:
             return True
+        if not self.plan.use_embedder:
+            # The `lite` profile runs on BM25 alone. This is a deliberate configuration, not a
+            # failure, so it is recorded once and never retried.
+            if self._load_failed is None:
+                self._load_failed = "lite profile: semantic search is off by configuration"
+                log.info("lite profile — no embedder will be loaded")
+            return False
         if self._load_failed is not None:
             return False
 
@@ -154,6 +161,11 @@ class Embedder:
         items = [str(t or "") for t in texts]
         if not items:
             return np.zeros((0, config.EMBED_DIM), dtype="float32")
+        if not self.plan.use_embedder:
+            # Answering some queries from cache and not others would make retrieval quality
+            # depend on what happened to be asked before. In lite mode semantic search is off,
+            # consistently.
+            return None
 
         cache = get_cache() if use_cache else None
         out: list = [None] * len(items)

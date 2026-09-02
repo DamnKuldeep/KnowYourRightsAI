@@ -64,6 +64,7 @@ class ResourcePlan:
     embed_batch: int
     rerank_batch: int
     ram_ok: bool               # enough RAM to survive the load spike?
+    use_embedder: bool = True  # False in `lite`: BM25 only, no models at all
     reasons: tuple[str, ...] = field(default_factory=tuple)
 
     @property
@@ -77,10 +78,12 @@ class ResourcePlan:
         return self.snapshot.vram_free_mb - self.profile.model_vram_mb
 
     def describe(self) -> str:
-        lines = [
-            f"profile      : {self.name}  ({self.profile.note})",
-            f"embedder     : {config.EMBED_MODEL} on {self.embed_device} / {self.embed_dtype}",
-        ]
+        lines = [f"profile      : {self.name}  ({self.profile.note})"]
+        if self.use_embedder:
+            lines.append(f"embedder     : {config.EMBED_MODEL} on "
+                         f"{self.embed_device} / {self.embed_dtype}")
+        else:
+            lines.append("embedder     : none — BM25 keyword search only")
         if self.rerank_backend == "local":
             lines.append(f"reranker     : {self.rerank_model} on {self.rerank_device} / {self.rerank_dtype}")
         elif self.rerank_backend == "nim":
@@ -158,10 +161,14 @@ def probe() -> ResourceSnapshot:
 
 
 def _profile_by_name(name: str) -> config.Profile | None:
+    if name == "lite":
+        return config.LITE
     return next((p for p in config.PROFILES if p.name == name), None)
 
 
 def _fits(profile: config.Profile, snap: ResourceSnapshot) -> bool:
+    if not profile.use_embedder:
+        return True                      # lite loads nothing, so it fits anywhere
     if profile.name in ("cpu", "cpu_lean"):
         # cpu_lean needs a key, since its reranking is remote.
         return profile.name == "cpu" or bool(config.NVIDIA_API_KEY)
@@ -233,8 +240,14 @@ def _build_plan(profile: config.Profile, snap: ResourceSnapshot,
             f"keyword-only until memory frees up."
         )
 
+    if not profile.use_embedder:
+        reasons.append("lite profile: no models are loaded — retrieval is BM25 only "
+                       "(Recall@5 95% against 100%, but it fits in under 1 GB)")
+        ram_ok = True          # nothing large is being loaded, so the RAM floor does not apply
+
     return ResourcePlan(
         profile=profile,
+        use_embedder=profile.use_embedder,
         snapshot=snap,
         embed_device=device,
         embed_dtype=dtype,

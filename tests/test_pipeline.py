@@ -365,3 +365,35 @@ def test_procedure_accepts_a_bare_step_list():
 
     procedure = Procedure.model_validate([{"n": 1, "text": "Serve a legal notice"}])
     assert len(procedure.steps) == 1 and procedure.is_useful
+
+
+# ── the lite profile (for a box too small to hold the embedder) ────────────────────────
+def test_lite_profile_loads_no_models():
+    from knowyourrights.runtime import resources
+
+    plan = resources.select_profile(requested="lite")
+    assert plan.use_embedder is False
+    assert plan.rerank_backend == "none"
+    assert plan.profile.needs_models is False
+    assert plan.ram_ok, "lite loads nothing, so the RAM floor cannot block it"
+
+
+def test_lite_fits_any_machine():
+    """It is the fallback for a 1-2 GB instance, so it must never be judged too big."""
+    from knowyourrights.runtime import resources
+
+    tiny = resources.ResourceSnapshot(
+        cuda_available=False, device_name="", vram_total_mb=0, vram_free_mb=0,
+        ram_total_mb=900, ram_available_mb=300, ram_percent=70.0,
+        process_rss_mb=100, cpu_physical=1, cpu_logical=2)
+    assert resources._fits(config.LITE, tiny)
+
+
+def test_fusion_scoring_can_distinguish_relevance():
+    """Regression: normalising fusion scores by the observed maximum pinned the top hit at
+    exactly 1.0 for every query, so a good match and the best of a bad lot looked identical
+    and abstention was impossible. BM25 magnitude is the absolute signal."""
+    from knowyourrights.retrieval.search import rrf
+
+    strong = rrf([(["a", "b"], 1.0), (["a", "c"], 1.0)])
+    assert strong["a"] > strong["b"], "agreement across lists must rank higher"

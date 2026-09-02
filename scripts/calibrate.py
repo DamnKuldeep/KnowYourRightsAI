@@ -63,8 +63,10 @@ async def main_async(dry_run: bool) -> int:
           f"cite={status['reranker']['cite_min_score']} "
           f"[{status['reranker']['thresholds_source']}]")
     if backend == "none":
-        print("\n  No reranker is available, so there is nothing to calibrate.")
-        return 1
+        # Still worth calibrating. Without a reranker the ranking signal is normalised RRF
+        # fusion, which has its own distribution — and abstention matters just as much when the
+        # pipeline is smaller. The `lite` profile depends on this.
+        print("  no reranker — calibrating the fusion scores instead")
 
     rule("measuring")
     answerable: list[float] = []

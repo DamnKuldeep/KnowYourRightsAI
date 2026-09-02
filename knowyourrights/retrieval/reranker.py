@@ -105,6 +105,8 @@ class Reranker:
 
     @property
     def model_name(self) -> str | None:
+        if self.backend == "none":
+            return "rrf"          # the fusion scores are the ranking signal, and get their own
         if self.backend == "local":
             return self.plan.rerank_model
         if self.backend == "nim":
@@ -204,6 +206,11 @@ class Reranker:
         docs = [str(d or "") for d in documents]
         if not docs:
             return []
+
+        if self.plan.rerank_backend == "none":
+            # The profile says rank on fusion scores alone. Reaching for a remote reranker here
+            # would spend API calls the operator explicitly opted out of.
+            return None
 
         if self.plan.rerank_backend == "local" and await self._ensure_local():
             pairs = [[query, d] for d in docs]

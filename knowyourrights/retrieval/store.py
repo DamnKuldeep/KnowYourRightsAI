@@ -149,15 +149,28 @@ class LegalStore:
             log.warning("dense search failed: %s", exc)
             return []
 
-    def fts(self, text: str, k: int = 25, where: str | None = None) -> list[str]:
-        """BM25 over `embed_text`. Needs no model and no network — our last-resort path."""
+    def fts(self, text: str, k: int = 25, where: str | None = None,
+            scores: dict[str, float] | None = None) -> list[str]:
+        """BM25 over `embed_text`. Needs no model and no network — our last-resort path.
+
+        Pass ``scores`` to collect LanceDB's ``_score`` per chunk. Unlike a fusion rank, BM25
+        magnitude is an *absolute* relevance signal — measured, a real legal query scores ~30
+        against ~13 for an off-topic one — which is the only thing that makes abstention
+        possible when no reranker is available.
+        """
         if not self._fts_available or not text.strip():
             return []
         try:
             query = self.table.search(_fts_sanitize(text), query_type="fts").limit(k)
             if where:
                 query = query.where(where)
-            return query.to_pandas()["chunk_id"].tolist()
+            df = query.to_pandas()
+            if scores is not None and "_score" in df.columns:
+                # Zip the columns rather than itertuples: pandas renames any column starting
+                # with an underscore to a positional name, so `row._score` silently is not it.
+                for chunk_id, score in zip(df["chunk_id"], df["_score"]):
+                    scores[chunk_id] = max(scores.get(chunk_id, 0.0), float(score))
+            return df["chunk_id"].tolist()
         except Exception as exc:
             # Distinguish "this query upset the parser" from "there is no FTS index at all".
             if "index" in str(exc).lower() and "fts" in str(exc).lower():
