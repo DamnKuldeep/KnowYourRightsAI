@@ -361,7 +361,7 @@ cp .env.example .env          # add NVIDIA_API_KEY — free from build.nvidia.co
 
 python scripts/probe_resources.py   # what this machine can run
 python scripts/build_index.py       # vector index — 23s, and worth 300ms per query
-python scripts/probe_nim.py         # which models the key can reach
+python scripts/probe_models.py         # which models the key can reach
 python scripts/calibrate.py         # thresholds — genuinely don't skip this
 
 python -m knowyourrights.server     # http://127.0.0.1:8000
@@ -442,7 +442,7 @@ On Windows use `docker compose` rather than `docker run -v`: Git Bash silently r
 | `calibrate.py` | Derives the abstention thresholds for whichever reranker you're using. |
 | `benchmark.py` | The measurements in EVALUATION.md. `--all` is free; `--e2e` spends credits. |
 | `eval.py` | Recall/MRR against the gold set; `--compare` A/Bs the ranking settings. |
-| `probe_resources.py` / `probe_nim.py` | What this machine can run; which models the key can reach. |
+| `probe_resources.py` / `probe_models.py` | What this machine can run; which models the key can reach. |
 | `try_search.py` / `try_tools.py` / `try_agent.py` | Retrieval, each tool, and the whole agent from the terminal. |
 
 ---

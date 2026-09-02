@@ -18,7 +18,8 @@ $100 / 182 days is about **$0.55 a day** of headroom, which is far more than thi
 | Sleep | A cron job on the box that stops it after 30 minutes with no questions |
 | Cost between demos | **~$2.40/month** (the EBS volume, nothing else) |
 | Cost during demos | **$0.034/hour** |
-| **Total over 182 days** | **≈ $25–40** — comfortably inside the credit |
+| **A demo a week, over 182 days** | **≈ $16** — 16% of the credit |
+| Pausable to | **$0.60/month** (snapshot) or **$0** (delete and rebuild from the repo) |
 
 You get a permanent URL. Visiting it when the box is asleep shows a "booting, ~2 minutes"
 page that refreshes itself and then hands over to the app.
@@ -48,7 +49,7 @@ resident. Wake-on-demand is the honest substitute: the *link* is always up, the 
 | `BAAI/bge-m3` embedder | ~2.3 GB RAM | **No.** The corpus is embedded with it — a different model means re-embedding all 38,890 chunks. |
 | Reranker | ~1.1 GB, **~10 s/query on 2 CPU cores** | In principle, but see the warning. |
 | Corpus | ~350 MB disk | No, but it is just files. |
-| LLMs | — | Already remote (NVIDIA NIM). |
+| LLMs | — | Already remote — NVIDIA NIM and OpenRouter, free tiers only. |
 | Chromium | 300–500 MB RSS | Optional — `KYR_CRAWL_USE_BROWSER=false`. |
 
 > **Do not plan around the remote reranker.** The `cpu_lean` profile offloads reranking to
@@ -89,6 +90,7 @@ the app starts, then fails confusingly because `data/legal_db` is pointer text.
 ```bash
 cat > .env <<'EOF'
 NVIDIA_API_KEY=nvapi-your-key-here
+OPENROUTER_API_KEY=sk-or-v1-your-key-here   # second provider; free models only
 
 KYR_PROFILE=cpu                  # local reranking; do not depend on the remote one
 KYR_RERANK_POOL=12               # halves the CPU rerank cost — the key knob on 2 cores
@@ -106,7 +108,7 @@ chmod 600 .env
 
 ```bash
 python scripts/build_index.py     # 23 s. Without it every query scans 159 MB.
-python scripts/probe_nim.py       # pin reachable models
+python scripts/probe_models.py       # pin reachable models
 python scripts/calibrate.py       # thresholds do not transfer between rerankers
 python scripts/benchmark.py --all # confirm Recall@5 on this machine
 ```
@@ -279,30 +281,117 @@ both.
 
 ---
 
-## What it actually costs
+## What it actually costs — for occasional demos
 
-`t4g.medium` is $0.0336/hour; 30 GB of gp3 is $2.40/month whether the instance runs or not.
+`t4g.medium` is $0.0336/hour. 30 GB of gp3 is $2.40/month **whether the instance runs or not** —
+that is the only charge you cannot avoid while the project exists.
 
-| Pattern | Compute (182 days) | Storage | **Total** |
-|---|---:|---:|---:|
-| **Wake-on-demand, ~1 h/day** | $6.11 | $14.40 | **$20.51** |
-| Wake-on-demand, ~3 h/day | $18.34 | $14.40 | **$32.74** |
-| Weekdays 9–9 on a schedule | $35.28 | $14.40 | **$49.68** |
-| Always on | $146.75 | $14.40 | **$161.15** ✗ over budget |
+Your $100 expires in 182 days, so the question is not "how long can this last" but "will I
+plausibly spend it". For occasional demos, the answer is no:
 
-Always-on does not fit in $100 for 182 days. Wake-on-demand uses about a fifth of the credit
-and leaves the rest spare.
+| How you use it | Compute over 182 days | + storage | **Total** | % of $100 |
+|---|---:|---:|---:|---:|
+| **A demo every week (2 h each)** | $1.75 | $14.40 | **$16.15** | 16% |
+| A demo twice a week | $3.50 | $14.40 | **$17.90** | 18% |
+| ~1 hour a day | $6.11 | $14.40 | **$20.51** | 21% |
+| Weekdays 9–9 on a schedule | $35.28 | $14.40 | **$49.68** | 50% |
+| Always on | $146.75 | $14.40 | **$161.15** | ✗ over |
 
-Lambda is free at this volume. Egress is well inside the 100 GB/month free allowance. Skip the
-Elastic IP and there is nothing else billing.
+**At a demo a week you will spend about $16 of $100 across the whole six months**, and roughly
+90% of that is the disk sitting there. You are in no danger of exhausting the credit.
 
-**If you want the demo to feel fast**, `g4dn.xlarge` (T4 GPU) at $0.526/hour runs the GPU
-profile — 399 ms retrieval instead of ~5 s. Two hours a week for 26 weeks is ~$27 of compute,
-which fits. It needs a Deep Learning AMI and more setup, and the language model dominates
-end-to-end time anyway, so I would only bother if the retrieval delay is visibly annoying in
-front of an audience.
+If even $2.40/month bothers you, see *Pausing completely* below — it takes that to near zero.
 
 ---
+
+## Pausing a demo, completely
+
+Three levels, depending on how long you are stepping away.
+
+### Between demos — nothing to do
+
+The idle timer stops the instance ~30 minutes after the last question. You pay **$2.40/month**
+for the disk and nothing else, and the Lambda link stays live so the next visitor wakes it.
+This is the normal resting state; it needs no action from you.
+
+### After showing someone — stop it immediately
+
+Do not wait for the timer:
+
+```bash
+aws ec2 stop-instances --instance-ids i-0123456789abcdef0
+```
+
+Billing for compute stops the moment it reaches `stopped`. Everything on disk — models,
+corpus, calibration — survives, and the next wake takes ~2 minutes.
+
+**To make the link stop working too**, so nobody can wake it while you are away:
+
+```bash
+# take the wake URL offline (keeps the function and its config)
+aws lambda delete-function-url-config --function-name kyr-waker
+
+# put it back when you next need it
+aws lambda create-function-url-config --function-name kyr-waker --auth-type NONE
+aws lambda add-permission --function-name kyr-waker --statement-id public   --action lambda:InvokeFunctionUrl --principal '*' --function-url-auth-type NONE
+```
+
+That is a genuinely paused demo: nothing can start the instance, and cost is the disk alone.
+
+### Done for months — pay nothing at all
+
+Snapshot the disk and delete the instance. A snapshot is **$0.05/GB-month** and only bills for
+used blocks, so a 30 GB volume holding ~12 GB costs about **$0.60/month** instead of $2.40.
+
+```bash
+# 1. stop it first so the snapshot is consistent
+aws ec2 stop-instances --instance-ids $INSTANCE_ID
+aws ec2 wait instance-stopped --instance-ids $INSTANCE_ID
+
+# 2. snapshot the root volume
+VOL=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID       --query 'Reservations[0].Instances[0].BlockDeviceMappings[0].Ebs.VolumeId' --output text)
+aws ec2 create-snapshot --volume-id $VOL --description "knowyourrights-$(date +%F)"   --tag-specifications 'ResourceType=snapshot,Tags=[{Key=Name,Value=knowyourrights}]'
+
+# 3. once the snapshot is 'completed', terminate the instance
+aws ec2 terminate-instances --instance-ids $INSTANCE_ID
+```
+
+To bring it back, launch a new instance from the snapshot, then point the Lambda at the new id:
+
+```bash
+aws lambda update-function-configuration --function-name kyr-waker   --environment "Variables={INSTANCE_ID=<new-id>,APP_URL=<url>,REGION=$REGION}"
+```
+
+**To pay literally nothing**, delete the snapshot too. The repo has everything — corpus
+included, via Git LFS — so a rebuild is the 20-minute setup above, not lost work.
+
+| Level | Monthly cost | Restart takes |
+|---|---:|---|
+| Stopped, link live | $2.40 | ~2 min (automatic) |
+| Stopped, link removed | $2.40 | ~2 min + re-add the URL |
+| Snapshot only | ~$0.60 | ~15 min |
+| Nothing kept | **$0.00** | ~20 min from the repo |
+
+---
+
+## The limit you will actually hit
+
+Not AWS. **The model providers.**
+
+| | Free allowance | A legal question costs | Runs out after |
+|---|---|---|---|
+| NVIDIA NIM | ~1,000 credits total | 3–9 calls | a few hundred questions |
+| OpenRouter | 1,000 requests **per day** | 3–9 calls | ~150 questions/day, resets daily |
+
+OpenRouter resetting daily is what makes the demo sustainable — NVIDIA's pool does not refill.
+Both are tracked client-side, and a spent provider is skipped rather than tried and refused.
+
+```bash
+curl -s localhost:8000/api/usage | python3 -m json.tool
+```
+
+Set `KYR_SESSION_CREDIT_BUDGET=800` so the agent downshifts research depth as the pool drains
+rather than failing once it is gone.
 
 ## Not breaking in production
 
