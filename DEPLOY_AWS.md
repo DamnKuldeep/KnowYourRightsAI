@@ -35,7 +35,7 @@ Worth stating plainly, because it is the obvious question:
 | **Lambda** | 15-minute cap, no memory retained between invocations, and a 2.3 GB model reload per cold start. A deep research turn alone can exceed the limit. |
 | **Fargate + ALB** | ECS will not scale a service to zero behind a load balancer, and the ALB is ~$16/month on its own — more than the instance. |
 | **App Runner** | Has a scale-to-zero mode, but provisioned memory is still billed and every wake reloads the model. |
-| **EC2 `t3.micro`/`small`** | 1–2 GB RAM. `bge-m3` alone needs ~2.3 GB. |
+| **EC2 `t3.micro`/`small`** | 1–2 GB RAM. `bge-m3` alone needs ~2.3 GB — but see the `lite` profile below, which needs none of it. |
 
 Nothing on AWS gives request-driven scaling for a workload that must keep 2.3 GB of weights
 resident. Wake-on-demand is the honest substitute: the *link* is always up, the *machine* is not.
@@ -57,6 +57,37 @@ resident. Wake-on-demand is the honest substitute: the *link* is always up, the 
 > or 404** — `llama-3.2-nv-rerankqa-1b-v2`, `llama-nemotron-rerank-1b-v2` and
 > `nv-rerankqa-mistral-4b-v3` all failed inside one probe. The app degrades correctly and says
 > so, but deploy with `KYR_PROFILE=cpu` and tune `KYR_RERANK_POOL` instead.
+
+---
+
+## If you only have free-tier instances
+
+`t4g.small` (2 GB) and `t3.micro` (1 GB) are the free-tier-eligible sizes, and neither can hold
+`bge-m3` at ~2.3 GB. Rather than that being the end of it, run **`KYR_PROFILE=lite`**: no
+embedder, no reranker, BM25 keyword search alone, in **under 1 GB**.
+
+| | Full pipeline (4 GB) | **`lite` (fits 1–2 GB)** |
+|---|---|---|
+| Recall@5 | 100% | **90.5%** |
+| MRR | 0.873 | 0.769 |
+| Retrieval latency | 399 ms | **51 ms** |
+| RAM needed | ~3 GB | **under 1 GB** |
+| Startup | 40–140 s | **a few seconds** |
+
+It holds up this well because the BM25 index covers `embed_text`, which carries the
+LLM-generated *citizen questions* written during the corpus build — so keyword search is
+already querying the way people ask, not raw statutory language. That is most of what the
+embedder was buying.
+
+**The honest cost.** Retrieval-level abstention is weaker: 5 of 8 off-topic questions score
+above the cut, against 0 of 8 with a reranker. In practice the planner classifies those as
+`out_of_scope` before retrieval runs at all — asked who won the 2011 World Cup, `lite` answers
+conversationally and redirects rather than citing a statute — so a user is not misled. But it
+is one fewer line of defence, and worth knowing.
+
+To use it, set `KYR_PROFILE=lite` in `.env` instead of `KYR_PROFILE=cpu`, then run
+`python scripts/calibrate.py` (its scores are on their own scale, so it needs its own
+threshold). Everything else in this guide is unchanged.
 
 ---
 
