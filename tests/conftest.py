@@ -33,7 +33,7 @@ def isolated_runtime(tmp_path, monkeypatch):
     healthy production model, and the app quietly runs on its fallback afterwards. This
     happened, which is why the registry now resolves its path lazily.
     """
-    from knowyourrights.nim import registry
+    from knowyourrights.llm import registry
 
     runtime = tmp_path / "runtime"
     runtime.mkdir(parents=True, exist_ok=True)

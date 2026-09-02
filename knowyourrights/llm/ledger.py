@@ -19,6 +19,7 @@ from .. import config
 log = logging.getLogger(__name__)
 
 USAGE_FILE = config.RUNTIME_DIR / "usage.jsonl"
+DAILY_FILE = config.RUNTIME_DIR / "daily_usage.json"
 
 
 @dataclass
@@ -45,6 +46,11 @@ class Ledger:
     by_model: dict[str, ModelUsage] = field(default_factory=dict)
     tools: Counter = field(default_factory=Counter)
     tool_errors: Counter = field(default_factory=Counter)
+    # OpenRouter's free tier is capped per *day*, not per minute, and the counter resets at
+    # midnight UTC. It survives restarts so a demo cannot quietly blow the allowance by
+    # bouncing the server.
+    provider_day: str = ""
+    provider_calls: Counter = field(default_factory=Counter)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _persist: bool = True
 
@@ -78,6 +84,45 @@ class Ledger:
                 usage.errors += 1
         self._append({"t": time.time(), "kind": kind, "model": model, "stage": stage,
                       "session": session, "detail": detail[:300]})
+
+    def note_provider_call(self, provider: str) -> None:
+        """Count a call against the provider's daily allowance, rolling over at UTC midnight."""
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        with self._lock:
+            if self.provider_day != today:
+                self.provider_day = today
+                self.provider_calls.clear()
+            self.provider_calls[provider] += 1
+        self._persist_daily()
+
+    def daily_remaining(self, provider: str = "openrouter") -> int:
+        """Requests left today before we stop using this provider."""
+        if provider != "openrouter":
+            return 10**9
+        limit = config.OPENROUTER_DAILY_LIMIT - config.OPENROUTER_DAILY_RESERVE
+        return max(0, limit - self.provider_calls.get(provider, 0))
+
+    def daily_exhausted(self, provider: str = "openrouter") -> bool:
+        return self.daily_remaining(provider) <= 0
+
+    def _persist_daily(self) -> None:
+        try:
+            config.ensure_runtime_dirs()
+            DAILY_FILE.write_text(json.dumps(
+                {"day": self.provider_day, "calls": dict(self.provider_calls)}), encoding="utf-8")
+        except OSError:
+            pass
+
+    def load_daily(self) -> None:
+        """Restore today's counts on startup; a different day starts clean."""
+        try:
+            data = json.loads(DAILY_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        if data.get("day") == today:
+            self.provider_day = today
+            self.provider_calls = Counter(data.get("calls", {}))
 
     def record_tool(self, name: str, ok: bool = True) -> None:
         with self._lock:
@@ -122,6 +167,8 @@ class Ledger:
                 "estimated_credits": self.estimated_credits,
                 "budget": config.SESSION_CREDIT_BUDGET or None,
                 "budget_pressure": round(self.budget_pressure(), 3),
+                "provider_calls_today": dict(self.provider_calls),
+                "openrouter_remaining_today": self.daily_remaining("openrouter"),
             }
 
     def report(self) -> str:

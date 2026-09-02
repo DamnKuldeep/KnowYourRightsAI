@@ -14,11 +14,11 @@ import httpx
 import pytest
 
 from knowyourrights import config
-from knowyourrights.nim import registry
-from knowyourrights.nim.client import (
+from knowyourrights.llm import registry
+from knowyourrights.llm.client import (
     NimClient, NimDeadlineExceeded, NimError, extract_json,
 )
-from knowyourrights.nim.limiter import TokenBucket
+from knowyourrights.llm.limiter import TokenBucket
 
 
 def chat_response(text: str) -> httpx.Response:
@@ -26,6 +26,12 @@ def chat_response(text: str) -> httpx.Response:
         "choices": [{"message": {"role": "assistant", "content": text}}],
         "usage": {"prompt_tokens": 10, "completion_tokens": 5},
     })
+
+
+def _fast_candidates():
+    """(first choice, the rest) for the fast role, as configured right now."""
+    options = registry.candidates("fast")
+    return options[0], options[1:]
 
 
 def make_client(handler) -> NimClient:
@@ -62,6 +68,8 @@ async def test_rate_limit_pauses_then_succeeds():
     # AIMD imposes afterwards. What matters is that the rate limits were reported as such.
     assert any(p[2] == "rate limit" for p in pauses)
     assert all(p[2] in ("rate limit", "pacing") for p in pauses)
+    # Buckets are keyed by the provider-qualified id, so providers never share an allowance.
+    assert all(":" in p[0] for p in pauses)
     await client.aclose()
 
 
@@ -106,12 +114,13 @@ async def test_unreachable_model_falls_through_to_an_alternate():
     """A 410 must fail over immediately — the current request still needs an answer."""
     registry._state = {"resolved": {}, "unavailable": [], "failures": {}}
     registry._sidelined.clear()
+    first, alternates = _fast_candidates()
     seen: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         model = json.loads(request.content)["model"]
         seen.append(model)
-        if model == config.FAST_MODEL.id:
+        if model == first.id:
             return httpx.Response(410, json={"title": "Gone"})
         return chat_response("from the alternate")
 
@@ -119,10 +128,76 @@ async def test_unreachable_model_falls_through_to_an_alternate():
     reply = await client.chat([{"role": "user", "content": "hi"}], role="fast")
 
     assert reply == "from the alternate"
-    assert seen[0] == config.FAST_MODEL.id
-    assert seen[1] in config.FAST_MODEL.alternates
+    assert seen[0] == first.id
+    assert seen[1] in {spec.id for spec in alternates}
     registry._sidelined.clear()
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failover_crosses_providers():
+    """The whole point of two providers: NVIDIA going down must not take the answer with it.
+
+    The fast role's candidate list deliberately alternates between NIM and OpenRouter, so one
+    provider failing entirely still leaves somewhere to go.
+    """
+    registry._state = {"resolved": {}, "unavailable": [], "failures": {}}
+    registry._sidelined.clear()
+    hosts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        hosts.append(request.url.host)
+        if "nvidia" in request.url.host:
+            return httpx.Response(503, text="upstream unavailable")
+        return chat_response("answered by the other provider")
+
+    client = make_client(handler)
+    reply = await client.chat([{"role": "user", "content": "hi"}], role="fast",
+                              deadline=time.monotonic() + 30)
+
+    assert reply == "answered by the other provider"
+    assert any("openrouter" in h for h in hosts), f"never reached OpenRouter: {hosts}"
+    registry._sidelined.clear()
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_openrouter_gets_its_own_auth_and_attribution_headers():
+    """Each provider needs its own key; OpenRouter also wants attribution on free models."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "openrouter" in request.url.host:
+            captured.update(dict(request.headers))
+            return chat_response("ok")
+        return httpx.Response(410, json={"title": "Gone"})
+
+    registry._state = {"resolved": {}, "unavailable": [], "failures": {}}
+    registry._sidelined.clear()
+    client = make_client(handler)
+    await client.chat([{"role": "user", "content": "hi"}], role="fast")
+
+    assert captured.get("x-title") == config.OPENROUTER_APP_NAME
+    assert "http-referer" in captured
+    registry._sidelined.clear()
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_daily_budget_takes_openrouter_out_of_rotation():
+    """OpenRouter's free tier is capped per day, so exhausting it is expected, not an error."""
+    from knowyourrights.llm.ledger import get_ledger
+
+    ledger = get_ledger()
+    ledger.provider_calls.clear()
+    assert any(s.provider == "openrouter" for s in registry.candidates("fast"))
+
+    ledger.provider_calls["openrouter"] = config.OPENROUTER_DAILY_LIMIT
+    assert ledger.daily_exhausted("openrouter")
+    assert registry.spec("fast").provider == "nim", \
+        "a spent OpenRouter allowance must route to the other provider"
+
+    ledger.provider_calls.clear()
 
 
 @pytest.mark.asyncio
@@ -136,26 +211,27 @@ async def test_a_single_410_does_not_permanently_retire_a_model():
     """
     registry._state = {"resolved": {}, "unavailable": [], "failures": {}}
     registry._sidelined.clear()
+    first, _ = _fast_candidates()
     calls = {"n": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls["n"] += 1
         model = json.loads(request.content)["model"]
-        if model == config.FAST_MODEL.id and calls["n"] == 1:
+        if model == first.id and calls["n"] == 1:
             return httpx.Response(410, json={"title": "Gone"})
         return chat_response(f"ok from {model}")
 
     client = make_client(handler)
     await client.chat([{"role": "user", "content": "hi"}], role="fast")
 
-    assert config.FAST_MODEL.id not in registry._state["unavailable"], \
+    assert first.key not in registry._state["unavailable"], \
         "one transient failure must not be written to disk"
-    assert registry._state["failures"][config.FAST_MODEL.id]["count"] == 1
+    assert registry._state["failures"][first.key]["count"] == 1
 
     # After the in-process cooldown the model is tried again, and succeeding clears its streak.
     registry._sidelined.clear()
     reply = await client.chat([{"role": "user", "content": "hi"}], role="fast")
-    assert reply == f"ok from {config.FAST_MODEL.id}"
+    assert reply == f"ok from {first.id}"
     assert not registry._state["failures"], "a success must clear the failure streak"
     await client.aclose()
 
@@ -166,11 +242,12 @@ async def test_repeated_failures_are_eventually_recorded():
     registry._state = {"resolved": {}, "unavailable": [], "failures": {}}
     registry._sidelined.clear()
 
+    first, _ = _fast_candidates()
     for _ in range(registry.PERSIST_AFTER_FAILURES):
         registry._sidelined.clear()
-        registry.mark_unavailable(config.FAST_MODEL.id, "HTTP 410")
+        registry.mark_unavailable(first.key, "HTTP 410")
 
-    assert config.FAST_MODEL.id in registry._state["unavailable"]
+    assert first.key in registry._state["unavailable"]
     registry._state = {"resolved": {}, "unavailable": [], "failures": {}}
     registry._sidelined.clear()
 

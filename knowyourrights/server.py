@@ -24,8 +24,8 @@ from pydantic import BaseModel, Field
 
 from . import config, events
 from .context.memory import Conversation
-from .nim.client import get_client
-from .nim.ledger import get_ledger
+from .llm.client import get_client
+from .llm.ledger import get_ledger
 from .orchestrator import get_orchestrator
 from .retrieval.search import get_engine
 from .runtime import gpu, resources

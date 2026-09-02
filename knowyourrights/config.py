@@ -60,62 +60,110 @@ def env_bool(key: str, default: bool) -> bool:
     return v.strip().lower() in ("1", "true", "yes", "on")
 
 
-# ── NVIDIA NIM ────────────────────────────────────────────────────────────────────────
+# ── providers ─────────────────────────────────────────────────────────────────────────
+# Two OpenAI-compatible endpoints, used together. NVIDIA has been unreliable in practice —
+# live 410s on healthy models, 503s, and calls swinging from 1s to 2.6s — so every role can
+# fail over to the other provider rather than to nothing.
 NIM_BASE_URL = env_str("NIM_BASE_URL", "https://integrate.api.nvidia.com/v1")
 NIM_RETRIEVAL_BASE = env_str("NIM_RETRIEVAL_BASE", "https://ai.api.nvidia.com/v1/retrieval")
 NVIDIA_API_KEY = env_str("NVIDIA_API_KEY", "")
 NIM_TIMEOUT_S = env_float("NIM_TIMEOUT_S", 90.0)
 
+OPENROUTER_BASE_URL = env_str("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+OPENROUTER_API_KEY = env_str("OPENROUTER_API_KEY", "")
+# Sent as HTTP-Referer/X-Title; OpenRouter uses them for attribution on free models.
+OPENROUTER_APP_URL = env_str("OPENROUTER_APP_URL", "https://github.com/DamnKuldeep/KnowYourRightsAI")
+OPENROUTER_APP_NAME = env_str("OPENROUTER_APP_NAME", "KnowYourRightsAI")
+# Free tier: 20 requests/minute, and a daily cap. Both are enforced client-side so we degrade
+# on our own terms rather than being cut off mid-answer.
+OPENROUTER_RPM = env_int("OPENROUTER_RPM", 15)
+OPENROUTER_DAILY_LIMIT = env_int("OPENROUTER_DAILY_LIMIT", 1000)
+# Stop well short of the ceiling so a demo never dies on the last few requests.
+OPENROUTER_DAILY_RESERVE = env_int("OPENROUTER_DAILY_RESERVE", 60)
+
+PROVIDERS = ("nim", "openrouter")
+
+
+def provider_available(name: str) -> bool:
+    return bool(NVIDIA_API_KEY) if name == "nim" else bool(OPENROUTER_API_KEY)
+
 
 @dataclass(frozen=True)
 class ModelSpec:
-    """One NIM model and the limits we hold ourselves to when calling it.
+    """One model on one provider, and the limits we hold ourselves to when calling it.
 
-    ``rpm`` is a *per-model* budget: NVIDIA's free tier caps around 40 requests/minute per
-    model, so distinct models get genuinely independent buckets. Staying a little under the
-    published ceiling leaves room for the retry traffic our own backoff generates.
+    ``rpm`` is per-model. NVIDIA caps around 40 requests/minute *per model*, so distinct models
+    get genuinely independent buckets; OpenRouter caps per-account instead, which the daily
+    ledger handles separately.
 
-    ``thinking`` controls Nemotron 3's reasoning pass. Measured on nemotron-3-nano: disabling
-    it via ``chat_template_kwargs`` cut a small structured reply from 63 completion tokens to
-    11. Reasoning arrives in a separate ``reasoning_content`` field rather than mixed into the
+    ``thinking`` controls Nemotron's reasoning pass. Measured on nemotron-3-nano: disabling it
+    via ``chat_template_kwargs`` cut a small structured reply from 63 completion tokens to 11.
+    Reasoning arrives in a separate ``reasoning_content`` field rather than mixed into the
     answer, so this is purely a latency/credit decision — and for the writer also a UX one,
     since a thinking pass delays the first visible token of a streamed answer.
     """
 
     id: str
+    provider: str = "nim"
     rpm: int = 30
     ctx: int = 128_000
     max_out: int = 1024
     temperature: float = 0.2
     thinking: bool = False
-    # Tried in order if `id` is unavailable (renamed / retired on the catalog).
-    alternates: tuple[str, ...] = ()
+
+    @property
+    def key(self) -> str:
+        """Provider-qualified id — both providers serve some of the same model names."""
+        return f"{self.provider}:{self.id}"
 
 
-# Cheap, high-frequency structured-output stages. Own rate-limit bucket.
-FAST_MODEL = ModelSpec(
-    id=env_str("KYR_FAST_MODEL", "nvidia/nemotron-3-nano-30b-a3b"),
-    rpm=env_int("KYR_FAST_RPM", 30),
-    ctx=env_int("KYR_FAST_CTX", 128_000),
-    max_out=env_int("KYR_FAST_MAX_OUT", 1400),
-    temperature=0.1,
-    thinking=env_bool("KYR_FAST_THINKING", False),
-    alternates=("nvidia/nemotron-3.5-lightning-30b-a3b", "nvidia/nemotron-nano-3-30b-a3b",
-                "nvidia/llama-3.3-nemotron-super-49b-v1.5"),
+# Order is measured, not assumed — see scripts/race_models.py. Two findings drove it:
+#
+#   * OpenRouter's free tier shares roughly 20 requests/minute across *all* free models, and
+#     the fast role fires 4-6 times per question. Racing them produced 429s almost immediately,
+#     so NVIDIA leads the fast list: its limit is 40/min **per model**, which is a much better
+#     fit for a chatty stage. OpenRouter is the fallback, which is exactly what it is good at.
+#   * Bigger is not better here. nemotron-3-ultra-550b is the largest free model available and
+#     took **21.5 s** for a two-sentence answer; nemotron-3-super-120b on NIM did the same job
+#     in 2.8 s. The 550B model is kept last as a availability backstop, not as a first choice.
+#
+# Measured medians (2 calls each, realistic prompts):
+#   fast   nim-lightning-30b 4.8 s · openrouter-lightning 3.6 s · nim-nano intermittent 410
+#   writer nim-super-120b 2.8 s · openrouter-super-120b 4.1 s · openrouter-ultra-550b 21.6 s
+
+# Cheap, high-frequency structured stages: planning, query writing, grading, gap analysis,
+# verification. Runs several times per question, so throughput matters more than eloquence.
+FAST_MODELS: tuple[ModelSpec, ...] = (
+    ModelSpec("nvidia/nemotron-3-nano-30b-a3b", "nim", rpm=30, max_out=1400, temperature=0.1),
+    ModelSpec("nvidia/nemotron-3.5-lightning-30b-a3b", "nim", rpm=30, max_out=1400,
+              temperature=0.1),
+    ModelSpec("nvidia/nemotron-3.5-lightning:free", "openrouter", rpm=OPENROUTER_RPM,
+              ctx=1_000_000, max_out=1400, temperature=0.1),
+    ModelSpec("google/gemma-4-26b-a4b-it:free", "openrouter", rpm=OPENROUTER_RPM,
+              ctx=262_144, max_out=1400, temperature=0.1),
 )
 
-# The user-facing writer. Quality matters; at most two calls per turn. Own bucket.
-WRITER_MODEL = ModelSpec(
-    id=env_str("KYR_WRITER_MODEL", "nvidia/nemotron-3-super-120b-a12b"),
-    rpm=env_int("KYR_WRITER_RPM", 25),
-    ctx=env_int("KYR_WRITER_CTX", 128_000),
-    max_out=env_int("KYR_WRITER_MAX_OUT", 1600),
-    temperature=0.3,
-    # Off by default: the pipeline has already done the reasoning across its stages, and a
-    # thinking pass would delay the first visible token of the streamed answer.
-    thinking=env_bool("KYR_WRITER_THINKING", False),
-    alternates=("nvidia/llama-3.3-nemotron-super-49b-v1.5", "nvidia/nemotron-3-nano-30b-a3b"),
+# The user-facing answer: one or two calls a turn, so quality is worth more than speed — but
+# not at 21 seconds. NIM's 120B leads on measured latency and OpenRouter covers the outage case.
+WRITER_MODELS: tuple[ModelSpec, ...] = (
+    ModelSpec("nvidia/nemotron-3-super-120b-a12b", "nim", rpm=25, max_out=1600,
+              temperature=0.3),
+    ModelSpec("google/gemma-4-31b-it:free", "openrouter", rpm=OPENROUTER_RPM,
+              ctx=262_144, max_out=1800, temperature=0.3),
+    ModelSpec("nvidia/nemotron-3-super-120b-a12b:free", "openrouter", rpm=OPENROUTER_RPM,
+              ctx=262_144, max_out=1800, temperature=0.3),
+    ModelSpec("z-ai/glm-5.2:free", "openrouter", rpm=OPENROUTER_RPM,
+              ctx=256_000, max_out=1800, temperature=0.3),
+    ModelSpec("nvidia/nemotron-3-ultra-550b-a55b:free", "openrouter", rpm=OPENROUTER_RPM,
+              ctx=1_000_000, max_out=1800, temperature=0.3),
 )
+
+# Force a single model for experiments, as "provider:model-id".
+FAST_MODEL_OVERRIDE = env_str("KYR_FAST_MODEL", "")
+WRITER_MODEL_OVERRIDE = env_str("KYR_WRITER_MODEL", "")
+FAST_MODEL = FAST_MODELS[0]
+WRITER_MODEL = WRITER_MODELS[0]
+
 
 # Optional remote reranker — used when the `lean` profile offloads reranking off-GPU.
 # Independent of the embedder (a cross-encoder reads text, not vectors), so it stays valid

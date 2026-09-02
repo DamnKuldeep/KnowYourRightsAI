@@ -330,3 +330,35 @@ textarea::placeholder { color: var(--text-faint); }
   position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
   overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
 }
+
+/* ── jurisdiction ───────────────────────────────────────────────────────────────────
+   Which law governs the reader is the first thing that decides whether a provision even
+   applies to them, so it is the loudest thing on a source card — and a mismatch with the
+   reader's own state is styled as a warning, not a footnote. */
+.badge.juris { font-weight: 650; letter-spacing: .01em; }
+.badge.juris.central {
+  color: var(--statute);
+  background: var(--accent-soft);
+}
+.badge.juris.state {
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 14%, transparent);
+}
+.badge.juris.mismatch {
+  color: #fff; background: var(--danger);
+}
+:root[data-theme="dark"] .badge.juris.mismatch,
+:root:not([data-theme="light"]) .badge.juris.mismatch { color: var(--bg); }
+
+.src.mismatch { border-color: var(--danger); }
+.src .warn-line {
+  margin-top: 7px; padding: 6px 9px; border-radius: 6px;
+  font-size: 12px; line-height: 1.45;
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 9%, transparent);
+}
+
+/* Fact-checking reads as a distinct kind of work from searching, so it gets its own dot. */
+.step.done .dot { background: var(--statute); }
+.timeline .step .label { white-space: nowrap; }
+@media (max-width: 900px) { .timeline .step .label { white-space: normal; } }

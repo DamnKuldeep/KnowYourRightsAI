@@ -240,7 +240,7 @@ E2E_QUESTIONS = [
 
 async def end_to_end(limit: int) -> dict:
     from knowyourrights.context.memory import Conversation
-    from knowyourrights.nim.ledger import get_ledger
+    from knowyourrights.llm.ledger import get_ledger
     from knowyourrights.orchestrator import get_orchestrator
 
     orchestrator = get_orchestrator()

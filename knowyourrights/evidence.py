@@ -69,6 +69,7 @@ class Evidence:
     citation: str = ""
     act_title: str = ""
     unit_id: str = ""
+    source_type: str = ""        # constitution | central_act | criminal_code
     status: str = ""
     effective_date: str = ""
     source_snapshot: str = ""
@@ -90,6 +91,42 @@ class Evidence:
     @property
     def is_omitted(self) -> bool:
         return (self.status or "").lower() == "omitted"
+
+    @property
+    def jurisdiction(self) -> str:
+        """CENTRAL, STATE, CONSTITUTION or empty — never a guess.
+
+        Read from the Act's own title, because the corpus's ``jurisdiction`` column says
+        ``central`` for every row including the state Acts that leaked into it (DB README §9).
+        Getting this wrong is the worst kind of error this system can make: telling someone in
+        Kerala that a Maharashtra rent law governs them is worse than telling them nothing.
+        """
+        if not self.is_statute:
+            return ""
+        if self.source_type == "constitution":
+            return "CONSTITUTION"
+        return "STATE" if self.state else "CENTRAL"
+
+    @property
+    def jurisdiction_label(self) -> str:
+        """A phrase safe to show a non-lawyer."""
+        if self.jurisdiction == "CONSTITUTION":
+            return "Constitution of India — applies nationwide"
+        if self.jurisdiction == "STATE":
+            return f"{self.state} state law — applies only in {self.state}"
+        if self.jurisdiction == "CENTRAL":
+            return "Central law — applies across India"
+        return ""
+
+    def applies_in(self, user_state: str | None) -> bool | None:
+        """Does this apply where the user is? ``None`` when we cannot tell."""
+        if self.jurisdiction in ("CENTRAL", "CONSTITUTION"):
+            return True
+        if self.jurisdiction == "STATE":
+            if not user_state:
+                return None
+            return user_state.strip().lower() == (self.state or "").strip().lower()
+        return None
 
     @property
     def domain(self) -> str:
@@ -123,6 +160,8 @@ class Evidence:
             "status": self.status,
             "effective_date": self.effective_date,
             "state": self.state,
+            "jurisdiction": self.jurisdiction,
+            "jurisdiction_label": self.jurisdiction_label,
             "category": self.category,
             "source_snapshot": self.source_snapshot,
         }
@@ -165,6 +204,7 @@ def from_hit(hit, query: str = "") -> Evidence:
         citation=hit.citation,
         act_title=hit.act_title,
         unit_id=hit.unit_id,
+        source_type=hit.source_type,
         status=hit.status,
         effective_date=hit.effective_date,
         source_snapshot=hit.source_snapshot,

@@ -13,9 +13,10 @@ from datetime import date
 
 from .. import config, legal_terms
 from ..evidence import Evidence
-from ..nim.client import get_client
+from ..llm.client import get_client
 from . import prompts
 from .schemas import (
+    FactCheck,
     Coverage, Grades, Plan, Procedure, ResearchStep, SafetyCheck, SearchQueries, SubQuestion,
 )
 
@@ -370,3 +371,45 @@ def used_evidence(answer: str, items: list[Evidence]) -> list[Evidence]:
 
 def today_str() -> str:
     return date.today().isoformat()
+
+
+# ── self-verification ─────────────────────────────────────────────────────────────────
+async def find_risky_claims(question: str, draft: str, items: list[Evidence], *,
+                            deadline: float | None = None, on_pause=None,
+                            session: str = "") -> FactCheck:
+    """Ask the agent what in its own draft it is not sure enough about.
+
+    Deliberately run against a *written draft* rather than raw evidence. A model is much better
+    at spotting "I asserted the fee is Rs 10 and only one blog says so" than at predicting in
+    advance which retrieved facts will end up load-bearing.
+    """
+    if not draft.strip():
+        return FactCheck(confident=True)
+    evidence = "\n".join(
+        f"[{i.id}] ({i.kind}{'/' + i.jurisdiction if i.jurisdiction else ''}) "
+        f"{i.label()}: {i.text[:180]}" for i in items[:12])
+    client = get_client()
+    return await client.chat_json(
+        _messages(prompts.FACT_CHECKER,
+                  f"QUESTION: {question}\n\nEVIDENCE:\n{evidence}\n\nDRAFT:\n{draft[:2500]}"),
+        FactCheck, FactCheck(confident=True), role="fast", stage="factcheck",
+        deadline=deadline, on_pause=on_pause, session=session, max_tokens=700,
+    )
+
+
+def summarise_verification(claims: list, findings: dict[str, list[Evidence]]) -> str:
+    """Render check results for the writer's second pass."""
+    if not findings:
+        return ""
+    lines = ["VERIFICATION PASS — these claims were checked against fresh web sources.",
+             "Where a check CONFIRMS a claim, state it confidently. Where it CONTRADICTS or",
+             "finds nothing, correct the claim or say it could not be confirmed."]
+    for claim in claims:
+        found = findings.get(claim.claim, [])
+        lines.append(f"\nCLAIM: {claim.claim}")
+        if not found:
+            lines.append("  no confirming source found — soften this or drop it")
+            continue
+        for item in found[:2]:
+            lines.append(f"  [{item.id}] {item.label()}: {item.text[:220]}")
+    return "\n".join(lines)

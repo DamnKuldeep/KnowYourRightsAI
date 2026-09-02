@@ -10,7 +10,8 @@ English, Hindi, or Hinglish.
 [![tests](../../actions/workflows/tests.yml/badge.svg)](../../actions/workflows/tests.yml)
 ![python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
-![retrieval](https://img.shields.io/badge/Recall%405-98%25-brightgreen)
+![retrieval](https://img.shields.io/badge/Recall%405-100%25-brightgreen)
+![providers](https://img.shields.io/badge/providers-NIM%20%2B%20OpenRouter-blueviolet)
 ![corpus](https://img.shields.io/badge/corpus-38%2C890%20chunks-informational)
 
 *General legal information, not legal advice.*
@@ -154,6 +155,16 @@ fee, the BPL exemption, the 30-day deadline and the appeal route. Not a snippet.
 
 **It knows when to stop.** Below a calibrated confidence threshold it says so and searches the
 web instead of forcing a citation. Eight off-topic questions in a row get declined.
+
+**It checks its own work.** In deep mode it reads back its own draft and asks which claims it
+should not stand behind unverified — a fee, a deadline, anything supported by a single web page
+— then runs targeted searches and rewrites with what they said. If it is confident, nothing is
+spent.
+
+**It never guesses jurisdiction.** Every statute carries CENTRAL, STATE or CONSTITUTION read
+from the Act's own title, because the corpus's `jurisdiction` column says "central" for all
+35,170 rows including the 53 state Acts that leaked in. Ask about a Mumbai deposit from Kerala
+and it says plainly that the Maharashtra Rent Control Act applies only in Maharashtra.
 
 **It won't run your machine out of memory.** On startup it measures free VRAM and RAM and picks
 a configuration that leaves headroom. If the GPU runs out mid-query it halves the batch, then
@@ -398,8 +409,17 @@ docker-compose.yml  corpus mounted, model weights in a volume
 
 | Document | |
 |---|---|
+| **[ARCHITECTURE.md](ARCHITECTURE.md)** | Diagrams of the whole pipeline — what runs, when, and why it is there rather than something simpler. Start here. |
 | **[EVALUATION.md](EVALUATION.md)** | The full report — what's in the corpus, the question sets, per-category accuracy, stage-by-stage latency, and the changes that moved each number. |
 | **[DEPLOY_AWS.md](DEPLOY_AWS.md)** | A demo that sleeps when idle and wakes when someone opens the link — ~$20 for six months — plus the production failures worth pre-empting. |
+
+**Two providers, free tiers only.** NVIDIA NIM and OpenRouter both serve every role, and any
+stage can fail over between them. The order is measured, not assumed
+([`scripts/race_models.py`](scripts/race_models.py)): NVIDIA leads because its limit is 40
+requests/minute *per model* while OpenRouter shares ~20/min across all free models — and the
+cheap stages fire 4–6 times per question. Bigger is not better either; the largest free model
+available, `nemotron-3-ultra-550b`, took **21.6 s** for a two-sentence answer against 2.8 s for
+a 120B, so it is kept last as an availability backstop.
 
 Docker, if you'd rather not install anything:
 

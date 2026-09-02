@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 Intent = Literal["smalltalk", "capability", "legal_question", "out_of_scope"]
 Depth = Literal["quick", "standard", "deep"]
@@ -84,7 +84,19 @@ class ProcedureStep(BaseModel):
 
 
 class Procedure(BaseModel):
-    """A how-to extracted from official sources, rendered by the UI as a checklist."""
+    """A how-to extracted from official sources, rendered by the UI as a checklist.
+
+    Accepts a bare list of steps as well as the full object. Models asked for
+    ``{"steps": [...], "fees": ...}`` quite often return just the ``[...]`` — observed live,
+    and losing the whole procedure card over a wrapper is a silly way to fail.
+    """
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_bare_step_list(cls, value):
+        if isinstance(value, list):
+            return {"steps": value}
+        return value
 
     title: str = ""
     steps: list[ProcedureStep] = Field(default_factory=list)
@@ -104,3 +116,21 @@ class SafetyCheck(BaseModel):
     urgent: bool = False
     kind: str = ""
     reason: str = ""
+
+
+class RiskyClaim(BaseModel):
+    """A factual assertion the agent wants to confirm before standing behind it."""
+
+    claim: str = ""
+    risk: Literal["high", "medium"] = "medium"
+    why: str = ""
+    query: str = ""
+
+
+class FactCheck(BaseModel):
+    claims: list[RiskyClaim] = Field(default_factory=list)
+    confident: bool = True
+
+    @property
+    def needs_checking(self) -> bool:
+        return bool(self.claims) and not self.confident

@@ -303,3 +303,65 @@ def test_reset_clears_everything():
     conversation.remember(statute())
     conversation.reset()
     assert not conversation.turns and not conversation.pool
+
+
+# ── jurisdiction (the thing it must not get wrong) ────────────────────────────────────
+@pytest.mark.parametrize("act,source_type,state,expected", [
+    ("Right to Information Act, 2005", "central_act", None, "CENTRAL"),
+    ("Bharatiya Nyaya Sanhita, 2023", "criminal_code", None, "CENTRAL"),
+    ("Constitution of India", "constitution", None, "CONSTITUTION"),
+    ("Maharashtra Rent Control Act, 1999", "central_act", "Maharashtra", "STATE"),
+])
+def test_jurisdiction_is_read_from_the_title(act, source_type, state, expected):
+    """The corpus's own `jurisdiction` column says 'central' for every row, state Acts
+    included, so the Act title is the only trustworthy signal (DB README §9)."""
+    item = Evidence(kind="statute", title=act, text="t", act_title=act,
+                    source_type=source_type, state=state)
+    assert item.jurisdiction == expected
+
+
+def test_state_law_does_not_apply_in_another_state():
+    """Telling someone in Kerala that Maharashtra rent law governs them is the worst error
+    this system can make."""
+    mh = Evidence(kind="statute", title="x", text="t",
+                  act_title="Maharashtra Rent Control Act, 1999",
+                  source_type="central_act", state="Maharashtra")
+    assert mh.applies_in("Kerala") is False
+    assert mh.applies_in("Maharashtra") is True
+    assert mh.applies_in(None) is None, "unknown state must be unknown, not assumed"
+    assert "only in Maharashtra" in mh.jurisdiction_label
+
+
+def test_central_law_applies_everywhere():
+    rti = Evidence(kind="statute", title="x", text="t",
+                   act_title="Right to Information Act, 2005", source_type="central_act")
+    assert rti.applies_in("Kerala") is True
+    assert "across India" in rti.jurisdiction_label
+
+
+def test_packer_always_states_jurisdiction_for_a_statute():
+    item = assign_ids([Evidence(kind="statute", title="x", text="body",
+                                act_title="Maharashtra Rent Control Act, 1999",
+                                source_type="central_act", state="Maharashtra",
+                                tier=config.TIER_STATUTE, score=0.9)])[0]
+    block = packer.render(item)
+    assert "jurisdiction: STATE" in block
+    assert "only in Maharashtra" in block
+
+
+# ── self-verification ─────────────────────────────────────────────────────────────────
+def test_factcheck_defaults_to_confident():
+    """No claims means nothing to check — the verification pass must cost nothing."""
+    from knowyourrights.agents.schemas import FactCheck, RiskyClaim
+
+    assert FactCheck().needs_checking is False
+    assert FactCheck(claims=[RiskyClaim(claim="fee is Rs 10")], confident=False).needs_checking
+
+
+def test_procedure_accepts_a_bare_step_list():
+    """Regression: the extractor returned [...] instead of {"steps": [...]} and the whole
+    procedure card was lost to a wrapper."""
+    from knowyourrights.agents.schemas import Procedure
+
+    procedure = Procedure.model_validate([{"n": 1, "text": "Serve a legal notice"}])
+    assert len(procedure.steps) == 1 and procedure.is_useful

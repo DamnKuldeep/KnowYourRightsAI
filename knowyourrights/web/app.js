@@ -213,25 +213,45 @@ function renderSources() {
     .sort((a, b) => (TIER_ORDER[a.tier_label] ?? 9) - (TIER_ORDER[b.tier_label] ?? 9)
                  || (b.score - a.score));
 
+  const userState = state.userState;
+
   sourcesPane.innerHTML = items.map((s) => {
     const badges = [];
+
+    // Jurisdiction leads, always — for a legal answer it is the first thing that decides
+    // whether a provision even applies to the reader.
+    if (s.jurisdiction === 'CENTRAL') {
+      badges.push('<span class="badge juris central">Central law · all India</span>');
+    } else if (s.jurisdiction === 'CONSTITUTION') {
+      badges.push('<span class="badge juris central">Constitution · all India</span>');
+    } else if (s.jurisdiction === 'STATE') {
+      const mismatch = userState && s.state &&
+                       userState.toLowerCase() !== s.state.toLowerCase();
+      badges.push(`<span class="badge juris ${mismatch ? 'mismatch' : 'state'}">`
+        + `${esc(s.state)} only${mismatch ? ` — not ${esc(userState)}` : ''}</span>`);
+    }
+
     if (s.status === 'in_force') badges.push('<span class="badge force">in force</span>');
     if (s.status === 'omitted') badges.push('<span class="badge omitted">omitted</span>');
     if (s.effective_date) badges.push(`<span class="badge">from ${esc(s.effective_date)}</span>`);
-    if (s.state) badges.push(`<span class="badge state">${esc(s.state)} state law</span>`);
     if (s.category) badges.push(`<span class="badge">${esc(s.category)}</span>`);
 
     const title = s.url
       ? `<a href="${esc(s.url)}" target="_blank" rel="noopener noreferrer">${esc(s.title)}</a>`
       : esc(s.title);
 
-    return `<div class="src" id="src-${esc(s.id)}" data-kind="${esc(s.kind)}">
+    const mismatched = s.jurisdiction === 'STATE' && userState && s.state &&
+                       userState.toLowerCase() !== s.state.toLowerCase();
+    return `<div class="src${mismatched ? ' mismatch' : ''}" id="src-${esc(s.id)}"
+                 data-kind="${esc(s.kind)}">
       <div class="top"><span class="id">${esc(s.id)}</span>
         <span class="tier">${esc(s.tier_label)}</span></div>
       <div class="title">${title}</div>
       ${s.domain ? `<div class="domain">${esc(s.domain)}</div>` : ''}
       <div class="snippet">${esc(s.snippet)}</div>
       ${badges.length ? `<div class="meta">${badges.join('')}</div>` : ''}
+      ${mismatched ? `<div class="warn-line">This is ${esc(s.state)} law and does not
+        apply in ${esc(userState)}.</div>` : ''}
     </div>`;
   }).join('');
 }
@@ -312,15 +332,12 @@ function handleEvent(ev) {
       }
       break;
 
-    case 'stage':
-      setStep(ev.id, ev.label, ev.status, ev.detail);
-      break;
-
     case 'tool':
       setStep(`tool:${ev.tool}:${ev.query}`,
               ({ legal_db: 'Searching Indian law', web: 'Searching the web',
                  official: 'Checking official sources', wikipedia: 'Reading background',
-                 navigate: 'Navigating the portal', crawl: 'Reading pages' })[ev.tool] || ev.tool,
+                 navigate: 'Navigating the portal', crawl: 'Reading pages',
+                 verify: 'Fact-checking my own answer' })[ev.tool] || ev.tool,
               ev.status,
               ev.status === 'done' ? `${ev.count} found · ${ev.elapsed_ms} ms` : '',
               ev.status === 'running' ? ev.query : '');
@@ -342,6 +359,15 @@ function handleEvent(ev) {
     case 'procedure': addProcedure(ev); break;
     case 'notice':    addNotice(ev); break;
     case 'safety':    addSafety(ev); break;
+
+    case 'stage':
+      // A rewrite after fact-checking must replace the draft, not append to it.
+      if (ev.id === 'write' && ev.status === 'running' && state.answerText) {
+        state.answerText = '';
+        if (state.answerEl) state.answerEl.innerHTML = '';
+      }
+      setStep(ev.id, ev.label, ev.status, ev.detail);
+      break;
 
     case 'token':
       state.answerText += ev.delta;

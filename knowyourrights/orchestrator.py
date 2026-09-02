@@ -27,8 +27,8 @@ from .context import packer
 from .context.memory import Conversation
 from .context.reduce import reduce_pages
 from .evidence import Evidence, assign_ids, dedupe
-from .nim.client import NimDeadlineExceeded, NimError, get_client
-from .nim.ledger import get_ledger
+from .llm.client import NimDeadlineExceeded, NimError, get_client
+from .llm.ledger import get_ledger
 from .tools import crawl, legal_db, web, wikipedia
 
 log = logging.getLogger(__name__)
@@ -89,6 +89,7 @@ class TurnState:
     notes: list[str] = field(default_factory=list)
     answer: str = ""
     query_variants: list[str] | None = None
+    verification_note: str = ""
     cancelled: asyncio.Event = field(default_factory=asyncio.Event)
     started: float = field(default_factory=time.monotonic)
 
@@ -227,8 +228,9 @@ class Orchestrator:
         if plan.answer_kind in ("procedure", "mixed") and not turn.budget.expired:
             await self._extract_procedure(turn, emit, on_pause)
 
-        # 6 — write
+        # 6 — write, then check its own work
         await self._write_answer(turn, emit, on_pause)
+        await self._self_verify(turn, emit, on_pause)
 
     # ── research loop ────────────────────────────────────────────────────────────────
     async def _research(self, turn: TurnState, emit, on_pause) -> None:
@@ -450,7 +452,8 @@ class Orchestrator:
                               detail="no clear procedure found"))
 
     # ── writing ──────────────────────────────────────────────────────────────────────
-    async def _write_answer(self, turn: TurnState, emit, on_pause, degraded: bool = False):
+    async def _write_answer(self, turn: TurnState, emit, on_pause, degraded: bool = False,
+                            revision: bool = False):
         plan = turn.plan
         conversation = turn.conversation
 
@@ -481,11 +484,19 @@ class Orchestrator:
             procedure_block = ("\n\nEXTRACTED PROCEDURE (from the official sources above):\n"
                                + turn.procedure.model_dump_json(indent=None))
 
+        # On a revision pass the fact-check results ride along, so the model corrects its own
+        # draft against what the web actually said rather than restating it.
+        verification_block = ""
+        if revision and turn.verification_note:
+            verification_block = f"\n\n{turn.verification_note}"
+
         user = (f"{history}\n\nQUESTION: {turn.message}\n"
                 f"ANSWER SHAPE: {plan.answer_kind}\n\n{context}\n\n"
-                f"VETTED SOURCES — cite only these, by id:\n{sources_block}{procedure_block}")
+                f"VETTED SOURCES — cite only these, by id:\n{sources_block}"
+                f"{procedure_block}{verification_block}")
 
-        emit(events.stage("write", "Writing the answer"))
+        label = "Rewriting with the confirmed details" if revision else "Writing the answer"
+        emit(events.stage("write", label))
         collected: list[str] = []
         try:
             stream = self.client.chat_stream(
@@ -535,7 +546,7 @@ class Orchestrator:
                 f"Removed {len(unsupported)} citation marker(s) that did not match any source.",
                 level="warn"))
 
-        emit(events.stage("write", "Writing the answer", "done"))
+        emit(events.stage("write", label, "done"))
         conversation.add_assistant(cleaned, packed.included)
 
         if conversation.needs_summary:
@@ -547,6 +558,65 @@ class Orchestrator:
                     conversation.set_summary(
                         (conversation.summary + "\n" + summary).strip(),
                         len(conversation.turns) - config.HISTORY_TURNS_VERBATIM * 2)
+
+    # ── self-verification ────────────────────────────────────────────────────────────
+    async def _self_verify(self, turn: TurnState, emit, on_pause) -> None:
+        """Let the agent check its own draft against the live web before standing behind it.
+
+        Only runs in `deep` mode with time left, because it costs a model call plus searches.
+        The point is not to re-do the research — it is to catch the specific things a statute
+        corpus cannot know: a fee that changed, a deadline that moved, a procedure that went
+        online. The agent decides what is worth checking; if it is confident, nothing happens
+        and nothing is spent.
+        """
+        if turn.budget.depth != "deep" or turn.budget.expired or not turn.answer.strip():
+            return
+        if turn.cancelled.is_set():
+            return
+
+        emit(events.stage("verify", "Checking my own answer against live sources"))
+        check = await stages.find_risky_claims(
+            turn.plan.normalized_query or turn.message, turn.answer, turn.evidence,
+            deadline=turn.budget.deadline, on_pause=on_pause, session=turn.session_id)
+
+        if not check.needs_checking:
+            emit(events.stage("verify", "Checking my own answer against live sources", "done",
+                              detail="nothing needed checking"))
+            return
+
+        claims = check.claims[:2]      # two searches at most; this is a check, not a re-research
+        emit(events.stage("verify", "Checking my own answer against live sources", "done",
+                          detail=f"{len(claims)} claim(s) to confirm"))
+
+        findings: dict[str, list[Evidence]] = {}
+        for claim in claims:
+            if turn.budget.expired or turn.cancelled.is_set():
+                break
+            emit(events.tool("verify", claim.claim[:70], "running", detail=claim.why[:80]))
+            try:
+                found = await web.search_official(claim.query, n=3)
+            except Exception as exc:
+                emit(events.tool("verify", claim.claim[:70], "error", detail=str(exc)[:80]))
+                continue
+            findings[claim.claim] = found
+            emit(events.tool("verify", claim.claim[:70], "done", count=len(found)))
+
+        confirmed = [item for found in findings.values() for item in found]
+        if not confirmed:
+            emit(events.notice(
+                "I could not independently confirm one or more time-sensitive details, so "
+                "treat the fees and deadlines above as worth double-checking.", level="warn"))
+            return
+
+        # Fold the checks in and rewrite, so the user sees the corrected answer rather than a
+        # correction appended to a wrong one.
+        turn.evidence = dedupe(turn.evidence + confirmed)
+        assign_ids(turn.evidence)
+        turn.verification_note = stages.summarise_verification(claims, findings)
+        emit(events.notice(f"Confirmed {len(claims)} detail(s) against official sources; "
+                           f"rewriting with what they said.", level="info"))
+        turn.answer = ""
+        await self._write_answer(turn, emit, on_pause, revision=True)
 
     async def _concierge(self, turn: TurnState, emit, on_pause) -> None:
         history = turn.conversation.history_block(400)

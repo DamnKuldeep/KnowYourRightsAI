@@ -108,7 +108,7 @@ class Reranker:
         if self.backend == "local":
             return self.plan.rerank_model
         if self.backend == "nim":
-            from ..nim import registry
+            from ..llm import registry
 
             return registry.resolve("rerank")
         return None
@@ -220,7 +220,7 @@ class Reranker:
 
         if self._nim_failed is None and config.NVIDIA_API_KEY:
             try:
-                from ..nim.client import get_client
+                from ..llm.client import get_client
 
                 logits = await get_client().rerank(query, docs, deadline=deadline,
                                                    on_pause=on_pause, session=session)

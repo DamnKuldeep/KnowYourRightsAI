@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from knowyourrights.context.memory import Conversation                # noqa: E402
-from knowyourrights.nim.ledger import get_ledger                      # noqa: E402
+from knowyourrights.llm.ledger import get_ledger                      # noqa: E402
 from knowyourrights.orchestrator import get_orchestrator              # noqa: E402
 from knowyourrights.retrieval.search import get_engine                # noqa: E402
 from knowyourrights.runtime.console import bold, dim, rule, setup_console  # noqa: E402

@@ -116,11 +116,23 @@ class NimClient:
     """One shared client. Create it once; it holds a connection pool."""
 
     def __init__(self, api_key: str | None = None) -> None:
+        # `api_key` overrides NVIDIA's key only; it exists so tests can inject one.
         self.api_key = api_key if api_key is not None else config.NVIDIA_API_KEY
         self._client: httpx.AsyncClient | None = None
         self._limiters = get_limiters()
         self._ledger = get_ledger()
         self._rerank_url_cache: dict[str, str] = {}
+
+    def _endpoint(self, provider: str) -> tuple[str, dict]:
+        """Base URL and headers for a provider. Both speak OpenAI chat-completions."""
+        if provider == "openrouter":
+            return config.OPENROUTER_BASE_URL, {
+                "Authorization": f"Bearer {config.OPENROUTER_API_KEY}",
+                # OpenRouter uses these for attribution on free models.
+                "HTTP-Referer": config.OPENROUTER_APP_URL,
+                "X-Title": config.OPENROUTER_APP_NAME,
+            }
+        return config.NIM_BASE_URL, {"Authorization": f"Bearer {self.api_key}"}
 
     # ── lifecycle ────────────────────────────────────────────────────────────────────
     @property
@@ -128,11 +140,8 @@ class NimClient:
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(config.NIM_TIMEOUT_S, connect=15.0),
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Accept": "application/json",
-                    "Content-Type": "application/json",
-                },
+                # Auth is per-provider and added per request; only the common bits here.
+                headers={"Accept": "application/json", "Content-Type": "application/json"},
                 limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
             )
         return self._client
@@ -150,12 +159,13 @@ class NimClient:
             raise NimDeadlineExceeded(f"{stage}: ran out of time waiting for the model")
 
     async def _handle_failure(
-        self, response: httpx.Response, body: str, model: str, rpm: int,
+        self, response: httpx.Response, body: str, spec: config.ModelSpec,
         role: registry.ModelRole | None, stage: str, attempt: int,
         deadline: float | None, on_pause: PauseCallback | None, session: str,
-    ) -> str:
-        """Decide what to do about a failed response. Returns the model to use next."""
-        bucket = self._limiters.get(model, rpm)
+    ) -> config.ModelSpec:
+        """Decide what to do about a failed response. Returns the spec to use next."""
+        model = spec.key
+        bucket = self._limiters.get(model, spec.rpm)
 
         if response.status_code == 429:
             self._ledger.record_error(model, "rate_limit", session, stage)
@@ -170,7 +180,7 @@ class NimClient:
                     f"{stage}: rate limited for {wait:.0f}s, longer than the turn's remaining time"
                 )
             await asyncio.sleep(wait)
-            return model
+            return spec
 
         if role is not None and _is_unknown_model(response, body):
             self._ledger.record_error(model, "unknown_model", session, stage, body)
@@ -179,10 +189,29 @@ class NimClient:
                 raise NimUnavailable(f"{stage}: no usable model for role {role!r}")
             return nxt
 
+        # OpenRouter answers 402 when the free allowance is spent, and 403 when a model is
+        # gated. Neither is retryable on that model, but the other provider may still work.
+        if role is not None and response.status_code in (402, 403):
+            self._ledger.record_error(model, "quota", session, stage, body)
+            nxt = registry.mark_unavailable(model, f"HTTP {response.status_code} (quota/gated)")
+            if not nxt:
+                raise NimUnavailable(f"{stage}: no usable model for role {role!r}")
+            return nxt
+
         if response.status_code >= 500 or response.status_code == 408:
             self._ledger.record_error(model, "server_error", session, stage, body)
+            # One 5xx is a blip worth retrying. A second in a row means this provider is having
+            # a bad time, and continuing to back off against it just burns the turn's deadline
+            # — switch to the other provider instead. This is the resilience the second
+            # provider exists to buy.
+            if attempt >= 1 and role is not None:
+                nxt = registry.mark_unavailable(model, f"HTTP {response.status_code} (repeated)")
+                if nxt is not None and nxt.key != model:
+                    log.warning("%s keeps failing (%s) — switching to %s",
+                                model, response.status_code, nxt.key)
+                    return nxt
             await self._backoff(attempt, stage, deadline)
-            return model
+            return spec
 
         # 401/403 and other client errors are configuration problems; retrying won't help.
         self._ledger.record_error(model, "error", session, stage, body)
@@ -198,21 +227,26 @@ class NimClient:
         await asyncio.sleep(delay)
 
     # ── chat ─────────────────────────────────────────────────────────────────────────
-    def _chat_payload(self, spec: config.ModelSpec, model: str, messages: Sequence[dict],
+    def _chat_payload(self, spec: config.ModelSpec, messages: Sequence[dict],
                       temperature: float | None, max_tokens: int | None,
                       stream: bool, thinking: bool | None = None) -> dict:
         payload = {
-            "model": model,
+            "model": spec.id,
             "messages": list(messages),
             "temperature": spec.temperature if temperature is None else temperature,
             "max_tokens": max_tokens or spec.max_out,
             "stream": stream,
         }
-        # Nemotron 3 reasons by default and returns it in `reasoning_content`. Turning it off
-        # is a ~6x cut in completion tokens for our short structured stages.
+        # Nemotron reasons by default and returns it in `reasoning_content`. Turning it off is
+        # a ~6x cut in completion tokens on our short structured stages. NVIDIA accepts the
+        # chat-template flag; OpenRouter has its own `reasoning` block and rejects unknown keys
+        # on some upstreams, so each provider gets the form it understands.
         want_thinking = spec.thinking if thinking is None else thinking
         if not want_thinking:
-            payload["chat_template_kwargs"] = {"thinking": False}
+            if spec.provider == "openrouter":
+                payload["reasoning"] = {"enabled": False}
+            else:
+                payload["chat_template_kwargs"] = {"thinking": False}
         return payload
 
     async def chat(
@@ -230,17 +264,19 @@ class NimClient:
     ) -> str:
         """One completion, retried through rate limits. Returns the assistant's text."""
         spec = registry.spec(role)
-        model = spec.id
-        url = f"{config.NIM_BASE_URL}/chat/completions"
 
         for attempt in range(config.RETRY_MAX_ATTEMPTS):
             self._check_deadline(deadline, stage)
+            model = spec.key
+            base, headers = self._endpoint(spec.provider)
             await self._await_slot(model, spec.rpm, on_pause)
+            self._ledger.note_provider_call(spec.provider)
             started = time.monotonic()
             try:
                 response = await self.client.post(
-                    url, json=self._chat_payload(spec, model, messages, temperature,
-                                                 max_tokens, stream=False, thinking=thinking)
+                    f"{base}/chat/completions", headers=headers,
+                    json=self._chat_payload(spec, messages, temperature,
+                                            max_tokens, stream=False, thinking=thinking)
                 )
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 self._ledger.record_error(model, "transport", session, stage, str(exc))
@@ -268,8 +304,8 @@ class NimClient:
                 # short answer; fall back to it rather than returning an empty string.
                 return content or (message.get("reasoning_content") or "")
 
-            model = await self._handle_failure(response, response.text, model, spec.rpm,
-                                               role, stage, attempt, deadline, on_pause, session)
+            spec = await self._handle_failure(response, response.text, spec, role, stage,
+                                              attempt, deadline, on_pause, session)
 
         raise NimError(f"{stage}: gave up after {config.RETRY_MAX_ATTEMPTS} attempts")
 
@@ -341,26 +377,30 @@ class NimClient:
         of an apparently frozen screen) and are never mixed into the yielded answer.
         """
         spec = registry.spec(role)
-        model = spec.id
-        url = f"{config.NIM_BASE_URL}/chat/completions"
 
         for attempt in range(config.RETRY_MAX_ATTEMPTS):
             self._check_deadline(deadline, stage)
+            model = spec.key
+            base, headers = self._endpoint(spec.provider)
             await self._await_slot(model, spec.rpm, on_pause)
+            self._ledger.note_provider_call(spec.provider)
             started = time.monotonic()
-            payload = self._chat_payload(spec, model, messages, temperature, max_tokens,
+            payload = self._chat_payload(spec, messages, temperature, max_tokens,
                                          stream=True, thinking=thinking)
 
             try:
-                async with self.client.stream("POST", url, json=payload) as response:
+                async with self.client.stream("POST", f"{base}/chat/completions",
+                                              headers=headers, json=payload) as response:
                     if response.status_code != 200:
                         body = (await response.aread()).decode("utf-8", "replace")
-                        model = await self._handle_failure(response, body, model, spec.rpm, role,
-                                                           stage, attempt, deadline, on_pause, session)
+                        spec = await self._handle_failure(response, body, spec, role, stage,
+                                                          attempt, deadline, on_pause, session)
                         continue
 
                     emitted = 0
                     async for line in response.aiter_lines():
+                        # OpenRouter sends ": OPENROUTER PROCESSING" comment frames as
+                        # keep-alives; SSE comments start with ':' and carry no payload.
                         if not line or not line.startswith("data:"):
                             continue
                         chunk = line[5:].strip()
@@ -419,23 +459,26 @@ class NimClient:
         if not passages:
             return []
         spec = registry.spec("rerank")
-        model = spec.id
+        model = spec.key
 
         for attempt in range(config.RETRY_MAX_ATTEMPTS):
             self._check_deadline(deadline, stage)
             await self._await_slot(model, spec.rpm, on_pause)
+            # `model` is the provider-qualified key for bookkeeping; the wire needs the bare
+            # id. Reranking is NVIDIA-only — OpenRouter exposes no reranking endpoint.
             payload = {
-                "model": model,
+                "model": spec.id,
                 "query": {"text": query[:4000]},
                 "passages": [{"text": p[:8000]} for p in passages[:512]],
                 "truncate": "END",
             }
+            _, headers = self._endpoint("nim")
             started = time.monotonic()
             last_response: httpx.Response | None = None
 
-            for url in self._rerank_urls(model):
+            for url in self._rerank_urls(spec.id):
                 try:
-                    response = await self.client.post(url, json=payload)
+                    response = await self.client.post(url, headers=headers, json=payload)
                 except (httpx.TimeoutException, httpx.TransportError) as exc:
                     self._ledger.record_error(model, "transport", session, stage, str(exc))
                     last_response = None
@@ -443,7 +486,7 @@ class NimClient:
 
                 if response.status_code == 200:
                     registry.mark_available(model)
-                    self._rerank_url_cache[model] = url
+                    self._rerank_url_cache[spec.id] = url
                     self._ledger.record_call(model, seconds=time.monotonic() - started,
                                              session=session, stage=stage)
                     scores = [float("-inf")] * len(payload["passages"])
@@ -463,21 +506,23 @@ class NimClient:
                 await self._backoff(attempt, stage, deadline)
                 continue
 
-            model = await self._handle_failure(last_response, last_response.text, model, spec.rpm,
-                                               "rerank", stage, attempt, deadline, on_pause, session)
+            spec = await self._handle_failure(last_response, last_response.text, spec,
+                                              "rerank", stage, attempt, deadline, on_pause, session)
+            model = spec.key
 
         raise NimError(f"{stage}: reranking failed after {config.RETRY_MAX_ATTEMPTS} attempts")
 
     # ── diagnostics ──────────────────────────────────────────────────────────────────
-    async def list_models(self) -> list[str]:
-        response = await self.client.get(f"{config.NIM_BASE_URL}/models")
+    async def list_models(self, provider: str = "nim") -> list[str]:
+        """Enumerate a provider's catalogue. Free on both, and spends no quota."""
+        base, headers = self._endpoint(provider)
+        response = await self.client.get(f"{base}/models", headers=headers)
         response.raise_for_status()
         return sorted(m["id"] for m in response.json().get("data", []))
 
     def status(self) -> dict:
         return {
-            "base_url": config.NIM_BASE_URL,
-            "key_present": bool(self.api_key),
+            "providers": {p: config.provider_available(p) for p in config.PROVIDERS},
             "models": registry.snapshot(),
             "limiters": self._limiters.status(),
             "usage": self._ledger.snapshot(),
