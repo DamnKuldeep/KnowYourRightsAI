@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# One-shot setup for a fresh Ubuntu 22.04 box (ARM or x86).
+# One-shot setup for a fresh Ubuntu 22.04 or 24.04 box, ARM or x86.
+#
+# 24.04 ships Python 3.12 with PEP 668 enforced, so a bare `pip install` is refused. Every
+# install here goes through a venv, which is unaffected — verified on 24.04.4 / 3.12.3.
 #
 # Paste this into the EC2 browser terminal:
 #
@@ -17,15 +20,25 @@ REPO="https://github.com/DamnKuldeep/KnowYourRightsAI.git"
 APP_DIR="$HOME/KnowYourRightsAI"
 STEP=0
 
-say() { STEP=$((STEP + 1)); echo; echo "═══ [$STEP/9] $* ═══"; }
+say() { STEP=$((STEP + 1)); echo; echo "═══ [$STEP/10] $* ═══"; }
 ok()  { echo "  ✓ $*"; }
 die() { echo; echo "  ✗ $*" >&2; exit 1; }
 
 # ── 0. sanity ─────────────────────────────────────────────────────────────────────────
 [ "$(id -u)" -ne 0 ] || die "Run this as the 'ubuntu' user, not root."
 MEM_MB=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
-[ "$MEM_MB" -ge 3500 ] || die "This box has ${MEM_MB} MB of RAM. The embedding model needs ~2.3 GB
-  free; use a t4g.medium (4 GB) or larger."
+if [ "$MEM_MB" -lt 3500 ]; then
+  echo
+  echo "  This box has ${MEM_MB} MB of RAM and the embedding model needs ~2.3 GB free."
+  echo "  Two ways forward:"
+  echo "    · use a 4 GB+ instance (m7i-flex.large, c7i-flex.large, t4g.medium), or"
+  echo "    · run the lite profile here — no models at all, BM25 only, Recall@5 90.5%"
+  echo "      instead of 100%, in under 1 GB. Re-run with:  KYR_FORCE_LITE=1"
+  echo
+  [ "${KYR_FORCE_LITE:-0}" = "1" ] || die "Stopping. Pick a bigger box, or set KYR_FORCE_LITE=1."
+fi
+PROFILE="cpu"
+[ "${KYR_FORCE_LITE:-0}" = "1" ] && PROFILE="lite"
 ok "$(nproc) CPU(s), ${MEM_MB} MB RAM, $(uname -m)"
 
 # ── 1. keys ───────────────────────────────────────────────────────────────────────────
@@ -55,7 +68,9 @@ ok "python, git, git-lfs"
 # The model load spikes host RAM to ~2.3 GB. On a 4 GB box that is the likeliest way to get
 # OOM-killed mid-startup, and swap is cheap insurance.
 say "Adding swap"
-if swapon --show | grep -q swapfile; then
+if [ "$MEM_MB" -ge 6000 ]; then
+  ok "skipped — ${MEM_MB} MB is comfortably above the ~2.3 GB load spike"
+elif swapon --show | grep -q swapfile; then
   ok "swap already present"
 else
   sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile
@@ -63,6 +78,14 @@ else
   echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
   ok "2 GB swap enabled"
 fi
+
+# A hard ceiling so a runaway process cannot take the machine down, set from what this box
+# actually has rather than a constant — 3500M would needlessly cap an 8 GB instance.
+# The floor is 3500M because that is the ceiling actually validated on a 4 GB box: the app
+# peaks near 3 GB while bge-m3 loads, and a tighter limit would have systemd kill a healthy
+# process. Bigger boxes simply get more headroom.
+MEM_LIMIT=$(( MEM_MB * 70 / 100 ))
+[ "$MEM_LIMIT" -lt 3500 ] && MEM_LIMIT=3500
 
 # ── 4. code + corpus ──────────────────────────────────────────────────────────────────
 # git-lfs must be initialised BEFORE cloning or the 350 MB corpus arrives as 134-byte pointer
@@ -98,7 +121,7 @@ NVIDIA_API_KEY=${NVIDIA_KEY:-}
 OPENROUTER_API_KEY=${OR_KEY:-}
 
 # Local reranking. Do not use cpu_lean: every remote reranking endpoint currently 410s.
-KYR_PROFILE=cpu
+KYR_PROFILE=${PROFILE}
 # Reranking is ~75% of retrieval time and scales with this. 12 keeps a 2-core box usable.
 KYR_RERANK_POOL=12
 KYR_HOST=127.0.0.1
@@ -140,7 +163,7 @@ ExecStart=$APP_DIR/.venv/bin/python -m knowyourrights.server
 Restart=always
 RestartSec=15
 TimeoutStartSec=300
-MemoryMax=3500M
+MemoryMax=${MEM_LIMIT}M
 OOMPolicy=stop
 
 [Install]
@@ -157,6 +180,20 @@ sudo cp deploy/idle-shutdown.sh /usr/local/bin/ && sudo chmod +x /usr/local/bin/
   echo "*/5 * * * * /usr/local/bin/idle-shutdown.sh" ) | crontab -
 ok "the box will stop itself 30 minutes after the last question"
 
+# ── cloudflared ───────────────────────────────────────────────────────────────────────
+# Architecture matters here and nowhere else in this script: t4g is ARM, c7i/m7i/t3 are x86.
+say "Installing cloudflared (for a public URL)"
+if command -v cloudflared >/dev/null; then
+  ok "already installed"
+else
+  CF_ARCH=$([ "$(uname -m)" = "aarch64" ] && echo arm64 || echo amd64)
+  if curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"        -o /tmp/cloudflared; then
+    sudo install -m 755 /tmp/cloudflared /usr/local/bin/cloudflared && ok "cloudflared (${CF_ARCH})"
+  else
+    echo "  (download failed — install it later if you want a public URL)"
+  fi
+fi
+
 # ── wait for readiness ────────────────────────────────────────────────────────────────
 echo
 echo "Waiting for the models to load (up to 3 minutes on a cold box)…"
@@ -168,6 +205,7 @@ for _ in $(seq 1 36); do
     echo
     echo "  Next: expose it with a public URL —"
     echo "      cloudflared tunnel --url http://localhost:8000"
+    echo "  (cloudflared is already installed for this machine's architecture)"
     echo
     echo "  Check it:   curl -s localhost:8000/api/health | head -c 200"
     echo "  Logs:       journalctl -u kyr -f"
