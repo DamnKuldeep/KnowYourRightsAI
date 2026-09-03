@@ -12,7 +12,11 @@
 #
 # Transient LanceDB bookkeeping — no value in version control.
 data/legal_db/**/_transactions/
-data/legal_db/**/_deletions/
+#
+# _deletions/ is NOT transient and must stay committed. The table manifest names its deletion
+# files by path, so a clone without them cannot open the database at all — it fails with
+# "Not found: …/_deletions/0-2-….arrow" on the first query, long after the corpus check has
+# happily reported 299 MB present. It is 762 bytes. Ignoring it cost a deployment.
 
 # Python
 __pycache__/

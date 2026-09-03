@@ -57,9 +57,34 @@ else
   echo "  Both are free. Paste and press Enter (input is hidden)."
   echo "  NVIDIA:     https://build.nvidia.com   OpenRouter: https://openrouter.ai/keys"
   echo
+
+  # Terminals with bracketed paste on (the EC2 browser console among them) wrap a paste in
+  # ESC[200~ … ESC[201~. `read` captures those markers as part of the value, so the key silently
+  # becomes unusable — the provider then reports "no key", or httpx refuses to encode the
+  # Authorization header at all. Turn the mode off, and keep only characters an API key can
+  # contain, so nothing invisible survives into .env.
+  printf '\033[?2004l' 2>/dev/null || true
+  # Strip whole escape sequences before filtering characters. Removing the punctuation first
+  # would leave the digits behind — ESC[200~ would become a literal "200" glued to the key,
+  # which is corruption that looks like a valid key.
+  clean_key() {
+    printf '%s' "${1:-}" \
+      | sed -e 's/\x1b\[[0-9;?]*[a-zA-Z~]//g' \
+      | tr -cd 'A-Za-z0-9._-'
+  }
+
   read -rsp "  NVIDIA_API_KEY (nvapi-…): " NVIDIA_KEY; echo
   read -rsp "  OPENROUTER_API_KEY (sk-or-…, optional, Enter to skip): " OR_KEY; echo
-  [ -n "${NVIDIA_KEY:-}" ] || [ -n "${OR_KEY:-}" ] || die "At least one key is required."
+  NVIDIA_KEY=$(clean_key "${NVIDIA_KEY:-}")
+  OR_KEY=$(clean_key "${OR_KEY:-}")
+  [ -n "$NVIDIA_KEY" ] || [ -n "$OR_KEY" ] || die "At least one key is required."
+
+  # Say what was actually captured. A truncated or empty key is far cheaper to notice here than
+  # twenty minutes later when every model probe fails.
+  [ -n "$NVIDIA_KEY" ] && ok "NVIDIA key: ${#NVIDIA_KEY} chars, starts ${NVIDIA_KEY:0:6}" \
+                       || echo "  · no NVIDIA key — OpenRouter only"
+  [ -n "$OR_KEY" ] && ok "OpenRouter key: ${#OR_KEY} chars, starts ${OR_KEY:0:9}" \
+                   || echo "  · no OpenRouter key — NVIDIA only"
 fi
 
 # ── 2. packages ───────────────────────────────────────────────────────────────────────
@@ -118,6 +143,29 @@ say "Installing Python dependencies (several minutes)"
 ./.venv/bin/pip install -q --index-url https://download.pytorch.org/whl/cpu torch
 ./.venv/bin/pip install -q -r requirements.txt
 ok "dependencies installed"
+
+# Size is not integrity. A clone can be the full 299 MB and still be unopenable if one small
+# bookkeeping file is missing — a stale .gitignore rule caused exactly that, and the failure only
+# surfaced at calibration, after a ten-minute model download, as an unreadable Lance error
+# repeated once per query. Opening the table costs a second and turns that into a clear message
+# before anything expensive happens. This is the first point where lancedb exists to do it.
+if ! ./.venv/bin/python - <<'PY'
+import sys
+try:
+    import lancedb
+    rows = lancedb.connect("data/legal_db").open_table("laws").count_rows()
+except Exception as exc:                        # noqa: BLE001 — any failure here is fatal
+    print(f"    {type(exc).__name__}: {str(exc)[:200]}", file=sys.stderr)
+    sys.exit(1)
+print(f"    {rows:,} rows readable")
+sys.exit(0 if rows > 30000 else 1)
+PY
+then
+  die "The corpus is the right size but will not open — the clone is incomplete.
+  Try:  cd $APP_DIR && git pull && git lfs pull
+  If it still fails, delete $APP_DIR and re-run this script for a clean clone."
+fi
+ok "corpus opens and is complete"
 
 # ── 6. configuration ──────────────────────────────────────────────────────────────────
 say "Writing configuration"
