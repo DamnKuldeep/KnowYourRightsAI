@@ -282,8 +282,13 @@ ok "service installed and started"
 # ── 9. idle shutdown ──────────────────────────────────────────────────────────────────
 say "Installing the idle timer"
 sudo cp deploy/idle-shutdown.sh /usr/local/bin/ && sudo chmod +x /usr/local/bin/idle-shutdown.sh
-( crontab -l 2>/dev/null | grep -v idle-shutdown; \
-  echo "*/5 * * * * /usr/local/bin/idle-shutdown.sh" ) | crontab -
+# `grep -v` exits 1 when it selects no lines, which on a box with no crontab yet is the normal
+# case — and under `set -o pipefail` that exit status killed the installer here, silently, after
+# the service was already running. Everything after this point (cloudflared, the readiness wait,
+# the summary) simply never ran, twice, and looked like the script had finished.
+{ crontab -l 2>/dev/null || true; } | grep -v idle-shutdown > /tmp/kyr-cron || true
+echo "*/5 * * * * /usr/local/bin/idle-shutdown.sh" >> /tmp/kyr-cron
+crontab /tmp/kyr-cron && rm -f /tmp/kyr-cron
 ok "the box will stop itself 30 minutes after the last question"
 
 # ── cloudflared ───────────────────────────────────────────────────────────────────────
