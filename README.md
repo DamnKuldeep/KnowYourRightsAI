@@ -251,9 +251,65 @@ by the language model, not by this system. When NVIDIA's endpoint degraded mid-e
 same turns took 18 s, 26–120 s and 227 s; retrieval still contributed under half a second to
 every one of them.
 
-**What it costs to run:** bge-m3 in fp16 is 1090 MiB of VRAM, the reranker adds 760 MiB, and
-the resident section index is 12.6 MB. The first query pays a 1.86 s CUDA warmup, so the server
-warms up at boot and every query after that encodes in ~25 ms.
+### And what the numbers say on a machine you'd actually deploy on
+
+The table above is a laptop with a GPU. Running the identical suite on the free-tier cloud box
+this is deployed to — `m7i-flex.large`, 2 vCPU (**one physical core**), 8 GB, no GPU:
+
+| | Laptop (GPU) | EC2 (CPU) | |
+|---|---:|---:|---|
+| Recall@5 | 95.2%* | **95.2%** | identical |
+| Off-topic wrongly answered | 0/8 | **0/8** | identical |
+| Exact lookups | 4/4 | **4/4** | identical |
+| Cold start | 56.7 s | **16.0 s** | EC2 wins |
+| Dense search | 33 ms | **12 ms** | EC2 wins |
+| BM25 | 32 ms | **8 ms** | EC2 wins |
+| Cross-encoder | 309 ms | **6,625 ms** | one core, no GPU |
+
+\* both at `RERANK_POOL=8`, the deployed setting — the 100% row above is pool 24, which costs
+three times the reranking.
+
+**Accuracy is a property of the system; latency is a property of the box.** Same two models,
+same corpus, same ranking — so retrieval quality transferred exactly, and the small cloud
+instance is genuinely *faster* than the laptop at everything except the cross-encoder. Anyone
+can reproduce this: `python scripts/benchmark.py --all`, then `python scripts/deploy_report.py`.
+
+I learned this the hard way in the other direction too. Re-running the benchmark while the
+laptop's GPU sat pinned in its lowest power state reproduced every accuracy number exactly and
+reported reranking at 2420 ms instead of 309 ms. Nothing had changed but a clock.
+
+---
+
+## When someone is not asking a legal question
+
+Before any of the above runs — before the planner, before a single model call — the message
+goes through a safety gate. Someone typing *"he is hitting me right now"* needs 112, not a
+citation, and needs it even if every provider is rate-limited or down.
+
+| | |
+|---|---|
+| Disclosures caught | **33 / 33** |
+| False alarms on legal questions | **0 / 26** |
+| Cost | one embedding, which retrieval then reads from cache |
+
+It has two tiers. **Patterns** are instant and exact and cannot generalise. **Meaning** compares
+the message against curated exemplars of each crisis — written the way frightened people write,
+in English, Hindi and Hinglish — using the embedder already loaded for search.
+
+Getting it right meant fixing errors in both directions. *"I was molested"* did not fire,
+because the pattern demanded `being molested` and past tense is how people actually report.
+*"is suicide a crime in India"* did fire, because bare topic nouns are the vocabulary of the
+crime and of every legal question about it. Patterns are now marked strong or weak: strong ones
+carry a subject or object and fire unconditionally, weak ones are suppressed when the message
+reads as a question about the law.
+
+Try it: `my husband is hitting me` · `I was molested` · `my partner keeps hurting me and I'm
+scared to go home` (no literal pattern matches that last one). Then try `what is the punishment
+for rape` and `child labour laws in India`, which must stay quiet.
+
+Both labelled sets are in [`knowyourrights/safety_eval.py`](knowyourrights/safety_eval.py), and
+`python scripts/calibrate_safety.py` re-measures the trade — weighting a miss four times a
+false alarm, because they are not equally bad.
 
 ---
 
@@ -394,6 +450,8 @@ knowyourrights/
   config.py         every setting, in one file
   legal_terms.py    acronyms, repeals, corpus gaps, language detection
   orchestrator.py   the research loop
+  safety.py         the emergency gate — patterns, then meaning
+  safety_eval.py    33 labelled disclosures, 26 legal questions that must not fire
   retrieval/        the search pipeline
   tools/            statute · web · crawler · wikipedia
   context/          token budgets, page reduction, conversation memory
@@ -404,9 +462,14 @@ knowyourrights/
 
 notebooks/          01 built the database · 02 was the first chatbot
 scripts/            probes, index build, calibration, evaluation, CLI harnesses
-tests/              58 tests, fully mocked — no GPU, no network, no API credits
+  build_index.py      the ANN index — 304 ms of dense search becomes 23 ms
+  calibrate.py        abstention thresholds, per reranker configuration
+  calibrate_safety.py the safety gate's threshold, with the whole trade curve
+  benchmark.py        corpus, accuracy, abstention and stage latency
+  deploy_report.py    renders a benchmark as markdown; diffs two machines
+tests/              100 tests, fully mocked — no GPU, no network, no API credits
 data/               the corpus itself (Git LFS)
-deploy/             wake-on-demand Lambda and the idle-shutdown timer
+deploy/             one-shot installer, tunnel service, waker, idle timer
 Dockerfile          CPU image, x86_64 and ARM64
 docker-compose.yml  corpus mounted, model weights in a volume
 ```
@@ -415,7 +478,15 @@ docker-compose.yml  corpus mounted, model weights in a volume
 |---|---|
 | **[ARCHITECTURE.md](ARCHITECTURE.md)** | Diagrams of the whole pipeline — what runs, when, and why it is there rather than something simpler. Start here. |
 | **[EVALUATION.md](EVALUATION.md)** | The full report — what's in the corpus, the question sets, per-category accuracy, stage-by-stage latency, and the changes that moved each number. |
-| **[DEPLOY_AWS.md](DEPLOY_AWS.md)** | A demo that sleeps when idle and wakes when someone opens the link — ~$20 for six months — plus the production failures worth pre-empting. |
+| **[DEPLOY_AWS.md](DEPLOY_AWS.md)** | A demo that sleeps when idle and wakes when someone opens the link — ~$15 for six months — plus the production failures worth pre-empting. |
+
+Deploying is one paste on a fresh Ubuntu 24.04 box:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DamnKuldeep/KnowYourRightsAI/main/deploy/setup-ec2.sh -o setup.sh
+bash setup.sh                    # keys, corpus, index, calibration, service, idle timer
+bash deploy/tunnel.sh start      # a public URL that survives closing the terminal
+```
 
 **Two providers, free tiers only.** NVIDIA NIM and OpenRouter both serve every role, and any
 stage can fail over between them. The order is measured, not assumed

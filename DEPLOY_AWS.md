@@ -220,8 +220,22 @@ echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 
 ```bash
 # Cloudflare Tunnel — free, no inbound ports, survives the instance changing IP
-cloudflared tunnel --url http://localhost:8000
+bash deploy/tunnel.sh start      # prints the public URL
+bash deploy/tunnel.sh url        # prints it again later
+bash deploy/tunnel.sh status     # is the tunnel up, and is the app behind it healthy
+bash deploy/tunnel.sh stop       # take the link offline, leave the box running
 ```
+
+> **Do not type `cloudflared tunnel --url …` directly.** It is a foreground process owned by the
+> terminal you typed it in, so closing the EC2 browser tab kills it — and every visitor then
+> gets **HTTP 530**, "origin unreachable", while the app itself is running perfectly and every
+> log looks healthy. `tunnel.sh` installs it as a systemd unit that outlives the session,
+> restarts if it drops, and comes back after a reboot.
+>
+> The URL of a free quick tunnel is random and **changes every time the tunnel starts** — which
+> includes every time the idle timer stops the box and you start it again. Fetch the current one
+> with `tunnel.sh url` before sharing it. A permanent hostname needs a (free) Cloudflare account,
+> a domain, and a *named* tunnel.
 
 Or with your own domain and Caddy:
 
