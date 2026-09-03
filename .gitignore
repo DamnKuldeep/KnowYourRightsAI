@@ -34,3 +34,8 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
+
+# SSH private keys — never commit these
+*.pem
+*.ppk
+kyr-key*
