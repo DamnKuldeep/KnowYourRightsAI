@@ -212,6 +212,17 @@ Thresholds are stored per backend *and* model. Changing either invalidates them,
 
 ## 5. Latency
 
+> **Latency here is one machine's, and machines lie.** Re-running this report during a session
+> where the laptop's GPU sat pinned in its lowest power state — 210 MHz of a 2100 MHz clock, at
+> 100% utilisation — reproduced every accuracy number exactly and reported reranking at 2420 ms
+> instead of 309 ms. Nothing had changed but the clock. Retrieval accuracy is a property of the
+> system; retrieval latency is a property of the machine you run it on. Measure your own:
+>
+> ```bash
+> python scripts/benchmark.py --all            # free, no API calls
+> python scripts/deploy_report.py --out DEPLOYED.md
+> ```
+
 ### 5.1 Inside one retrieval
 
 Median of 5 runs, `FETCH_K=25`, `RERANK_POOL=24`:
