@@ -106,7 +106,11 @@ class Reranker:
     @property
     def model_name(self) -> str | None:
         if self.backend == "none":
-            return "rrf"          # the fusion scores are the ranking signal, and get their own
+            # The fusion scores are the ranking signal, so they get their own calibration — but
+            # *which* retrievers feed the fusion changes the distribution. `lite` fuses BM25
+            # lists alone; `cpu_lean` fuses dense and BM25. Sharing one key across both means
+            # calibrating either one silently mis-thresholds the other, so they are kept apart.
+            return "rrf" if self.plan.use_embedder else "rrf-bm25"
         if self.backend == "local":
             return self.plan.rerank_model
         if self.backend == "nim":

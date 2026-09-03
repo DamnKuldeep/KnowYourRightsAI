@@ -135,6 +135,37 @@ resolved by exact fetch, not similarity search — someone naming a section dese
 Recall@10 is also 100%, i.e. nothing is merely ranked deep — everything correct is inside the
 top 5.
 
+### The same corpus under every configuration it can run in
+
+The headline row needs a GPU. Most places this gets deployed do not have one, so every
+CPU-viable configuration was measured on the same 42 questions rather than assumed:
+
+| Configuration | Recall@5 | MRR | Top-1 | Off-topic caught | Retrieval |
+|---|---:|---:|---:|---:|---:|
+| **`cpu`/`balanced`, rerank pool 24** | **100%** | **0.873** | 79% | **11/11** | ~400 ms GPU · **20 s CPU** |
+| `cpu`, rerank pool 12 | 95.2% | 0.849 | 76% | 10/11 | 0.57× the above |
+| **`cpu`, rerank pool 8** ← deployed | 95.2% | **0.861** | 79% | 10/11 | **0.32×** |
+| `cpu`, rerank pool 6 | 93% | 0.846 | 79% | 10/11 | 0.26× |
+| `cpu_lean` — dense + BM25, no reranker | 93% | 0.787 | 71% | **5/11** | **71 ms** |
+| `lite` — BM25 only, no models | 90.5% | 0.769 | 69% | **5/11** | **61 ms** |
+
+Three things fall out of this table, none of which were obvious beforehand:
+
+**Accuracy is device-independent.** The `cpu` profile scores *identically* to the GPU one —
+100%, MRR 0.873, 4/4 exact, 11/11 stress — because it runs the same two models. Only latency
+moves, and it moves by a factor of fifty.
+
+**Pool 12 was strictly the wrong choice.** It had been the deployed setting. Pool 8 matches its
+recall, beats its MRR (0.861 vs 0.849), restores top-1 to the full 79%, and runs nearly twice as
+fast. Nothing was being bought with those extra four documents.
+
+**The cross-encoder's real job is refusal, not ranking.** Dropping it costs 7 points of
+Recall@5 — survivable. It also takes off-topic rejection from 10/11 to **5/11**, which is not:
+calibration shows the answerable and off-topic score populations *overlap* once it is gone
+(floor 0.414 against ceiling 0.468), so no threshold can separate them and the best achievable
+cut is 90% accurate. Reranking just 8 candidates is enough to keep that defence, which is why
+the deployed configuration keeps the model and shrinks the pool instead of the reverse.
+
 **Per-category Recall@5 is 100% across all 13 represented categories.** With 42 questions the
 per-category counts are small (1–10 each), so this says the system has no blind *domain*, not
 that each category is proven to three decimal places.
@@ -331,7 +362,8 @@ statutes are kept. Partial over-rejection remains the main open issue.
 
 ## 8. Test suite
 
-58 tests, fully mocked — no GPU, no network, no API credits, ~80 s.
+73 tests, fully mocked — no GPU, no network, no API credits, ~100 s. They run on Python 3.11 and
+3.12 in CI; 3.12 is what Ubuntu 24.04 ships, so it is the version the deployed box actually runs.
 
 | Area | What is guarded |
 |---|---|

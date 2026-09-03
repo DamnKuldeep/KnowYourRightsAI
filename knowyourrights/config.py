@@ -224,10 +224,12 @@ class Profile:
     rerank_batch: int
     note: str = ""
     # `lite` turns the embedder off entirely and runs on BM25 alone. Measured on the gold set:
-    # Recall@5 95.2% and MRR 0.800 against 100% / 0.873 for the full pipeline, at 37 ms instead
-    # of 399 ms, in under 1 GB of RAM. It works this well because the BM25 index covers
+    # Recall@5 90.5% and MRR 0.769 against 100% / 0.873 for the full pipeline, at ~60 ms instead
+    # of ~400 ms, in under 1 GB of RAM. It works this well because the BM25 index covers
     # `embed_text`, which carries the LLM-generated citizen questions — so keyword search is
     # querying the way people ask, not raw statutory language.
+    # The real cost is abstention, not recall: without a reranker only 5 of the 11 stress
+    # questions are caught at retrieval level, so the planner's out_of_scope check carries it.
     use_embedder: bool = True
 
     @property
@@ -247,18 +249,31 @@ PROFILES: tuple[Profile, ...] = (
             note="no usable CUDA; expect multi-second retrieval"),
 )
 
-# For CPU-only hosting. Reranking 24 documents on a CPU measured ~10s and dominates the turn;
-# the embedder cannot move (the corpus is bge-m3) but the reranker can, so it goes to NIM and
-# retrieval drops back to roughly a second. This is the profile to deploy on a free CPU box.
-CPU_LEAN = Profile("cpu_lean", "nim", None, model_vram_mb=0, embed_batch=2, rerank_batch=25,
-                   note="embedding local on CPU, reranking on NIM — for CPU-only hosting")
+# For CPU-only hosting: keep dense retrieval, drop the cross-encoder.
+#
+# This used to send reranking to NIM. That is not a real option — every NIM reranking endpoint
+# returns 410/404, so the profile silently degraded to fused RRF while still loading the
+# *uncalibrated* NIM thresholds, which is strictly worse than asking for no reranker at all.
+#
+# Measured on the gold set (42 questions), all four CPU-viable configurations:
+#
+#   embedder + cross-encoder, pool 24   Recall@5 100%    MRR 0.873   ~20 s   <- unusable on 2 vCPU
+#   embedder + cross-encoder, pool 12   Recall@5  95.2%  MRR 0.849   ~10 s   <- still too slow
+#   embedder, no cross-encoder (this)   Recall@5  93%    MRR 0.787   ~90 ms
+#   neither (`lite`)                    Recall@5  90.5%  MRR 0.769   ~60 ms
+#
+# The cross-encoder is worth 7 points of Recall@5 and it is the right default wherever there is
+# a GPU. On two shared vCPUs it costs 20 seconds a question, which no demo survives, so this
+# profile trades those 7 points for a response that arrives while somebody is still watching.
+CPU_LEAN = Profile("cpu_lean", "none", None, model_vram_mb=0, embed_batch=2, rerank_batch=25,
+                   note="dense + BM25 on CPU, no cross-encoder — Recall@5 93% in ~90 ms")
 
 # For a box too small to hold bge-m3 at all — a 1-2 GB free-tier instance. Never selected
 # automatically: it trades real retrieval quality for fitting, and that should be a decision
 # somebody makes, not something that quietly happens.
 LITE = Profile("lite", "none", None, model_vram_mb=0, embed_batch=1, rerank_batch=1,
                use_embedder=False,
-               note="BM25 only — no models, <1 GB RAM, Recall@5 95% at 37 ms")
+               note="BM25 only — no models, <1 GB RAM, Recall@5 90.5% at ~60 ms")
 
 PROFILES = PROFILES + (CPU_LEAN,)
 

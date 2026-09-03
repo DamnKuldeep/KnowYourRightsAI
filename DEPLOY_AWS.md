@@ -13,13 +13,18 @@ $100 / 182 days is about **$0.55 a day** of headroom, which is far more than thi
 
 | | |
 |---|---|
-| Instance | `t4g.medium` (ARM Graviton, 2 vCPU, 4 GB) — **stopped by default** |
+| Instance | `m7i-flex.large` (x86, 2 vCPU, 8 GB) — **stopped by default** |
+| AMI | Ubuntu Server 24.04 LTS (HVM), SSD Volume Type — 64-bit (x86) |
 | Wake | A Lambda Function URL that starts it when someone opens the link |
 | Sleep | A cron job on the box that stops it after 30 minutes with no questions |
-| Cost between demos | **~$2.40/month** (the EBS volume, nothing else) |
-| Cost during demos | **$0.034/hour** |
-| **A demo a week, over 182 days** | **≈ $16** — 16% of the credit |
-| Pausable to | **$0.60/month** (snapshot) or **$0** (delete and rebuild from the repo) |
+| Cost between demos | **~$1.60/month** (the EBS volume, nothing else) |
+| Cost during demos | **$0.0958/hour** |
+| **A demo a week, over 182 days** | **≈ $15** — 15% of the credit |
+| Pausable to | **$0.40/month** (snapshot) or **$0** (delete and rebuild from the repo) |
+
+Pick the region closest to you and stay in it — the AMI, instance, Lambda and security group all
+have to live in the same one, and the console silently shows you a different region's resources
+if you switch.
 
 You get a permanent URL. Visiting it when the box is asleep shows a "booting, ~2 minutes"
 page that refreshes itself and then hands over to the app.
@@ -62,15 +67,20 @@ resident. Wake-on-demand is the honest substitute: the *link* is always up, the 
 
 ## If you only have free-tier instances
 
-`t4g.small` (2 GB) and `t3.micro` (1 GB) are the free-tier-eligible sizes, and neither can hold
-`bge-m3` at ~2.3 GB. Rather than that being the end of it, run **`KYR_PROFILE=lite`**: no
-embedder, no reranker, BM25 keyword search alone, in **under 1 GB**.
+Check what your console actually offers before assuming. Accounts on the post-July-2025 free
+plan are typically offered **`c7i-flex.large`** (2 vCPU, 4 GB) and **`m7i-flex.large`**
+(2 vCPU, 8 GB) as free-tier eligible, and either holds the full pipeline comfortably. Take the
+8 GB one — the extra RAM costs $0.02/hour and removes the whole class of out-of-memory problems.
 
-| | Full pipeline (4 GB) | **`lite` (fits 1–2 GB)** |
+Only if you are stuck with `t4g.small` (2 GB) or `t3.micro` (1 GB) — neither of which can hold
+`bge-m3` at ~2.3 GB — reach for **`KYR_PROFILE=lite`**: no embedder, no reranker, BM25 keyword
+search alone, in **under 1 GB**.
+
+| | Full pipeline (4 GB+) | **`lite` (fits 1–2 GB)** |
 |---|---|---|
 | Recall@5 | 100% | **90.5%** |
 | MRR | 0.873 | 0.769 |
-| Retrieval latency | 399 ms | **51 ms** |
+| Retrieval latency | ~400 ms on GPU | **~60 ms** |
 | RAM needed | ~3 GB | **under 1 GB** |
 | Startup | 40–140 s | **a few seconds** |
 
@@ -95,8 +105,31 @@ threshold). Everything else in this guide is unchanged.
 
 ### Launch
 
-- **AMI** Ubuntu 22.04 **ARM64**, **type** `t4g.medium`, **storage** 30 GB gp3
-- **Security group** inbound 22 from your IP only, and 443. Do **not** open 8000.
+- **AMI** `Ubuntu Server 24.04 LTS (HVM), SSD Volume Type`, architecture **64-bit (x86)**
+- **Type** `m7i-flex.large` · **storage** 20 GB gp3
+- **Security group** inbound 22, and 443. Do **not** open 8000.
+
+> **"My IP" alone will lock you out of the browser terminal.** EC2 Instance Connect does not
+> connect from your laptop — it connects from an AWS-owned range, so a security group that only
+> admits your own address rejects it with *"Failed to connect… try again later"*, which reads
+> like a broken instance rather than a firewall rule. Add a second SSH rule whose source is the
+> `EC2_INSTANCE_CONNECT` range **for your region**: `13.233.177.0/29` in `ap-south-1`,
+> `18.206.107.24/29` in `us-east-1`, `18.202.216.48/29` in `eu-west-1`. The current list is
+> published at `https://ip-ranges.amazonaws.com/ip-ranges.json` — filter on
+> `"service": "EC2_INSTANCE_CONNECT"`. Keep the "My IP" rule; it is what lets your `.pem` key
+> work from a real terminal.
+>
+> Also give it 2–3 minutes after launch. Instance Connect fails against a box whose status
+> checks still say *Initializing*, with the same unhelpful message.
+
+> **Pick the AMI by its exact name.** Searching "Ubuntu" in the AMI list also surfaces
+> `Ubuntu Server 22.04 LTS with SQL Server 2022 Standard`, which is marked free-tier eligible for
+> the *instance* while the SQL Server licence bills separately at roughly $0.50/hour — it would
+> burn the whole $100 in about eight days of uptime. You want the plain
+> `Ubuntu Server 24.04 LTS (HVM), SSD Volume Type` with no product name after it.
+
+24.04 ships Python 3.12 with PEP 668 enforced, so a bare `pip install` is refused system-wide.
+Everything below installs into a virtualenv, which is unaffected.
 - **No Elastic IP.** It is free only while attached to a *running* instance and billed when
   stopped — exactly backwards for this design. Use a Cloudflare Tunnel for a stable address.
 
@@ -314,24 +347,26 @@ both.
 
 ## What it actually costs — for occasional demos
 
-`t4g.medium` is $0.0336/hour. 30 GB of gp3 is $2.40/month **whether the instance runs or not** —
-that is the only charge you cannot avoid while the project exists.
+`m7i-flex.large` is **$0.0958/hour** in `us-east-1`. 20 GB of gp3 is **$1.60/month** *whether the
+instance runs or not* — that is the only charge you cannot avoid while the project exists.
 
 Your $100 expires in 182 days, so the question is not "how long can this last" but "will I
 plausibly spend it". For occasional demos, the answer is no:
 
 | How you use it | Compute over 182 days | + storage | **Total** | % of $100 |
 |---|---:|---:|---:|---:|
-| **A demo every week (2 h each)** | $1.75 | $14.40 | **$16.15** | 16% |
-| A demo twice a week | $3.50 | $14.40 | **$17.90** | 18% |
-| ~1 hour a day | $6.11 | $14.40 | **$20.51** | 21% |
-| Weekdays 9–9 on a schedule | $35.28 | $14.40 | **$49.68** | 50% |
-| Always on | $146.75 | $14.40 | **$161.15** | ✗ over |
+| **A demo every week (2 h each)** | $4.98 | $9.60 | **$14.58** | 15% |
+| A demo twice a week | $9.96 | $9.60 | **$19.56** | 20% |
+| ~1 hour a day | $17.44 | $9.60 | **$27.04** | 27% |
+| Weekdays 9–9 on a schedule | $149.45 | $9.60 | **$159.05** | ✗ over |
+| Always on | $418.45 | $9.60 | **$428.05** | ✗ over |
 
-**At a demo a week you will spend about $16 of $100 across the whole six months**, and roughly
-90% of that is the disk sitting there. You are in no danger of exhausting the credit.
+**At a demo a week you will spend about $15 of $100 across the whole six months**, and two-thirds
+of that is the disk sitting there. You are in no danger of exhausting the credit — but note that
+the x86 instance is ~2.9× the hourly rate of an ARM one, so *leaving it running* is no longer a
+cheap mistake. The idle timer is what keeps this in the first row rather than the last.
 
-If even $2.40/month bothers you, see *Pausing completely* below — it takes that to near zero.
+If even $1.60/month bothers you, see *Pausing completely* below — it takes that to near zero.
 
 ---
 

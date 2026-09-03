@@ -380,8 +380,8 @@ The whole thing adapts to the machine it finds. On a 4 GB laptop GPU it runs bot
 locally; on a CPU-only box it keeps the embedder local, because the corpus is tied to it.
 
 And on a box too small for a 2.3 GB model — a free-tier `t4g.small`, say — `KYR_PROFILE=lite`
-loads **nothing at all** and runs on BM25 alone: **Recall@5 90.5% at 51 ms in under 1 GB**,
-against 100% at 399 ms for the full pipeline. It holds up because the keyword index covers the
+loads **nothing at all** and runs on BM25 alone: **Recall@5 90.5% at ~60 ms in under 1 GB**,
+against 100% at ~400 ms for the full pipeline. It holds up because the keyword index covers the
 LLM-generated *citizen questions* from the corpus build, so it is already searching the way
 people ask.
 
