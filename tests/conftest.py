@@ -25,6 +25,19 @@ def fast_retries(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def stub_provider_keys(monkeypatch):
+    """Give both providers a fake key so the suite runs without real credentials.
+
+    ``registry.candidates()`` filters out providers with no key configured, so on a machine
+    with no ``.env`` — CI, or anyone who just cloned the repo — every role resolves to nothing
+    and a third of the tests fail before reaching what they actually test. Every request is
+    served by ``httpx.MockTransport`` regardless, so these values are never sent anywhere.
+    """
+    monkeypatch.setattr(config, "NVIDIA_API_KEY", "nvapi-test-key-not-real")
+    monkeypatch.setattr(config, "OPENROUTER_API_KEY", "sk-or-v1-test-key-not-real")
+
+
+@pytest.fixture(autouse=True)
 def isolated_runtime(tmp_path, monkeypatch):
     """Keep tests off the developer's real ``.runtime`` directory.
 

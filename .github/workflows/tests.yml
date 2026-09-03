@@ -10,12 +10,18 @@ jobs:
   pytest:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 is what Ubuntu 24.04 ships, so it is the version the deployed box actually runs.
+        # Testing only 3.11 meant CI agreed with a machine nobody deploys on.
+        python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
           cache: pip
 
       # The suite mocks the network and never loads a model, so the CPU wheel is enough and
