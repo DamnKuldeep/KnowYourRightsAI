@@ -21,6 +21,8 @@
         <button data-depth="quick"    aria-pressed="false" title="One fast lookup">Quick</button>
         <button data-depth="deep"     aria-pressed="false" title="Multi-round research, reads official sites">Deep</button>
       </div>
+      <button class="icon-btn" id="pipelineBtn" aria-label="What each mode does"
+              title="What each mode does" aria-expanded="false" aria-controls="pipeline">?</button>
       <select id="state" aria-label="Your state">
         <option value="">All India</option>
       </select>
@@ -28,6 +30,82 @@
       <button class="icon-btn" id="reset" aria-label="New conversation" title="New conversation">✚</button>
     </div>
   </header>
+
+  <!-- What each depth actually runs. The numbers are the real budgets from config.DEPTHS, so
+       this panel and the orchestrator cannot drift apart silently. -->
+  <div class="pipeline" id="pipeline" hidden>
+    <div class="pipeline-inner">
+      <div class="pipeline-head">
+        <h2>What each mode does</h2>
+        <button class="icon-btn" id="pipelineClose" aria-label="Close">✕</button>
+      </div>
+
+      <p class="pipeline-lede">Every mode runs the same retrieval core — the difference is how
+        many times it searches, whether it reads the open web, and how long it is allowed to
+        take. Nothing is hidden: the stage timeline above each answer shows exactly what ran.</p>
+
+      <div class="pipeline-grid">
+        <section class="pl pl-quick">
+          <h3><span class="dot"></span>Quick</h3>
+          <p class="pl-when">One question, one answer. Best for “what does Article 21 say”.</p>
+          <ol class="pl-steps">
+            <li><b>Plan</b> — classify intent, detect language</li>
+            <li><b>Retrieve once</b> — dense vectors + BM25, fused, reranked</li>
+            <li><b>Grade</b> — drop sections that merely mention the Act</li>
+            <li><b>Write</b> — streamed, with [S1] citations</li>
+          </ol>
+          <dl class="pl-facts">
+            <div><dt>Search rounds</dt><dd>1</dd></div>
+            <div><dt>Reads the web</dt><dd>no</dd></div>
+            <div><dt>Model calls</dt><dd>up to 4</dd></div>
+            <div><dt>Time limit</dt><dd>25 s</dd></div>
+          </dl>
+        </section>
+
+        <section class="pl pl-standard">
+          <h3><span class="dot"></span>Auto <em>→ usually Standard</em></h3>
+          <p class="pl-when">The default. Picks Quick or Deep from the question itself.</p>
+          <ol class="pl-steps">
+            <li><b>Plan</b> — split into sub-questions</li>
+            <li><b>Reformulate</b> — up to 3 phrasings per sub-question</li>
+            <li><b>Retrieve + grade</b> — one round, all phrasings fused together</li>
+            <li><b>Fetch</b> — up to 3 official pages when a procedure is asked for</li>
+            <li><b>Write</b> — streamed, with a Procedure card if steps were found</li>
+          </ol>
+          <dl class="pl-facts">
+            <div><dt>Search rounds</dt><dd>1</dd></div>
+            <div><dt>Reads the web</dt><dd>up to 3 pages</dd></div>
+            <div><dt>Model calls</dt><dd>up to 8</dd></div>
+            <div><dt>Time limit</dt><dd>75 s</dd></div>
+          </dl>
+        </section>
+
+        <section class="pl pl-deep">
+          <h3><span class="dot"></span>Deep</h3>
+          <p class="pl-when">Procedures end to end — fees, deadlines, which office, how to appeal.</p>
+          <ol class="pl-steps">
+            <li><b>Plan</b> — split into sub-questions</li>
+            <li><b>Retrieve + grade</b> — repeats while gaps remain</li>
+            <li><b>Navigate</b> — follows links inside gov portals, 2 levels down</li>
+            <li><b>Gap analysis</b> — asks what is still unanswered, searches again</li>
+            <li><b>Self-verify</b> — re-checks claims it is unsure of against the web</li>
+            <li><b>Write, then revise</b> — rewrites if verification contradicts it</li>
+          </ol>
+          <dl class="pl-facts">
+            <div><dt>Search rounds</dt><dd>up to 4</dd></div>
+            <div><dt>Reads the web</dt><dd>up to 10 pages, 2 deep</dd></div>
+            <div><dt>Model calls</dt><dd>up to 20</dd></div>
+            <div><dt>Time limit</dt><dd>240 s</dd></div>
+          </dl>
+        </section>
+      </div>
+
+      <p class="pipeline-foot"><b>Always on, in every mode:</b> answers cite only retrieved text;
+        citations are checked to resolve before you see them; when nothing scores well enough the
+        assistant says so instead of guessing; and central law is labelled separately from state
+        law, because a state Act does not apply outside its state.</p>
+    </div>
+  </div>
 
   <main>
     <div class="thread" id="thread" role="log" aria-live="polite" aria-label="Conversation">

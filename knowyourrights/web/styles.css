@@ -362,3 +362,53 @@ textarea::placeholder { color: var(--text-faint); }
 .step.done .dot { background: var(--statute); }
 .timeline .step .label { white-space: nowrap; }
 @media (max-width: 900px) { .timeline .step .label { white-space: normal; } }
+
+/* ── pipeline explainer ───────────────────────────────────────────────────────────────
+   A question people reasonably ask before trusting an answer: what did you actually do?
+   Quick and Deep differ by an order of magnitude in work done, and that was invisible. */
+.pipeline {
+  position: fixed; inset: 0; z-index: 50;
+  background: rgba(35, 32, 28, .45);
+  display: grid; place-items: start center;
+  padding: 4vh 16px; overflow-y: auto;
+}
+.pipeline-inner {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: var(--shadow);
+  max-width: 1040px; width: 100%; padding: 22px 24px 20px;
+}
+.pipeline-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.pipeline-head h2 { font-size: 1.05rem; margin: 0; }
+.pipeline-lede { color: var(--text-dim); font-size: .87rem; margin: 8px 0 18px; max-width: 76ch; }
+
+.pipeline-grid { display: grid; gap: 14px; grid-template-columns: repeat(3, 1fr); }
+@media (max-width: 860px) { .pipeline-grid { grid-template-columns: 1fr; } }
+
+.pl {
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface-2); padding: 14px 15px;
+}
+.pl h3 { margin: 0 0 2px; font-size: .95rem; display: flex; align-items: center; gap: 7px; }
+.pl h3 em { font-style: normal; font-weight: 400; color: var(--text-faint); font-size: .8rem; }
+.pl .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+.pl-quick    .dot { background: var(--statute); }
+.pl-standard .dot { background: var(--official); }
+.pl-deep     .dot { background: var(--portal); }
+.pl-when { color: var(--text-dim); font-size: .8rem; margin: 0 0 10px; }
+
+.pl-steps { margin: 0 0 12px; padding-left: 18px; font-size: .82rem; line-height: 1.5; }
+.pl-steps li { margin-bottom: 3px; }
+.pl-steps b { font-weight: 600; }
+
+.pl-facts { margin: 0; display: grid; gap: 3px; font-size: .78rem; }
+.pl-facts > div { display: flex; justify-content: space-between; gap: 10px;
+                  border-top: 1px solid var(--border); padding-top: 3px; }
+.pl-facts dt { color: var(--text-faint); margin: 0; }
+.pl-facts dd { margin: 0; font-variant-numeric: tabular-nums; color: var(--text); }
+
+.pipeline-foot {
+  margin: 18px 0 0; padding: 11px 13px; font-size: .81rem; line-height: 1.55;
+  color: var(--text-dim); background: var(--accent-soft);
+  border-radius: var(--radius-sm);
+}
+.pipeline-foot b { color: var(--text); }

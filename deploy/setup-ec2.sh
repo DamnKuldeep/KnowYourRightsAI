@@ -195,6 +195,17 @@ EOF
 fi
 ok ".env written"
 
+# Everything under .runtime/cache is derived — query embeddings, search results, crawled pages.
+# On a re-run it is stale by definition: the profile may have changed, the reranker may have
+# changed, and a cached search result computed under the old settings would quietly survive and
+# make the new configuration look like the old one. Thresholds and the usage ledger are kept.
+if [ -d .runtime/cache ]; then
+  CACHE_MB=$(du -sm .runtime/cache 2>/dev/null | cut -f1 || echo 0)
+  rm -rf .runtime/cache
+  ok "cleared ${CACHE_MB} MB of stale cache (thresholds and usage ledger kept)"
+fi
+rm -rf .crawl4ai/cache 2>/dev/null || true
+
 # ── 7. prepare the index and thresholds ───────────────────────────────────────────────
 say "Building the vector index (~30 s) and downloading the embedding model (~10 min)"
 ./.venv/bin/python scripts/build_index.py
@@ -270,6 +281,11 @@ for _ in $(seq 1 36); do
     echo "  Check it:   curl -s localhost:8000/api/health | head -c 200"
     echo "  Logs:       journalctl -u kyr -f"
     echo "  Restart:    sudo systemctl restart kyr"
+    echo
+    echo "  Measure THIS machine (free — no API calls, ~15-25 min on 2 vCPU):"
+    echo "      ./.venv/bin/python scripts/benchmark.py --all"
+    echo "      ./.venv/bin/python scripts/deploy_report.py --out DEPLOYED.md"
+    echo "  Accuracy should match the published numbers exactly; only latency should move."
     echo "════════════════════════════════════════════════════════════════"
     exit 0
   fi

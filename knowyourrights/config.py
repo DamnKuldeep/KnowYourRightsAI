@@ -8,8 +8,14 @@ tuned for the machine described in the plan: RTX 3050 4 GB / 16 GB RAM with ~3 G
 from __future__ import annotations
 
 import os
+import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# Whole escape sequences, stripped before character filtering — removing the punctuation first
+# would leave the digits of ESC[200~ behind as a literal "200" glued to a pasted value.
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z~]")
 
 try:  # optional, but this is how the API key normally arrives
     from dotenv import load_dotenv
@@ -60,17 +66,39 @@ def env_bool(key: str, default: bool) -> bool:
     return v.strip().lower() in ("1", "true", "yes", "on")
 
 
+_KEY_ALLOWED = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def env_key(name: str) -> str:
+    """Read an API key, keeping only characters an API key can actually contain.
+
+    Keys arrive by paste, and a paste picks things up. A terminal with bracketed paste enabled
+    wraps the value in ESC[200~ … ESC[201~; a copy from a web page can carry a non-breaking
+    space or a smart dash. None of that is visible, and the failure it causes is not obviously
+    about the key: httpx encodes header values as ASCII, so one stray character makes *every*
+    call die with "'ascii' codec can't encode characters in position 9-10" while the key looks
+    perfectly fine in .env. This cost a deployment, so the value is cleaned on the way in.
+    """
+    raw = os.environ.get(name, "")
+    cleaned = _KEY_ALLOWED.sub("", _ANSI_ESCAPE.sub("", raw))
+    if raw.strip() and cleaned != raw.strip():
+        print(f"warning: {name} contained characters an API key cannot have; "
+              f"{len(raw.strip()) - len(cleaned)} removed. Re-paste it if authentication fails.",
+              file=sys.stderr)
+    return cleaned
+
+
 # ── providers ─────────────────────────────────────────────────────────────────────────
 # Two OpenAI-compatible endpoints, used together. NVIDIA has been unreliable in practice —
 # live 410s on healthy models, 503s, and calls swinging from 1s to 2.6s — so every role can
 # fail over to the other provider rather than to nothing.
 NIM_BASE_URL = env_str("NIM_BASE_URL", "https://integrate.api.nvidia.com/v1")
 NIM_RETRIEVAL_BASE = env_str("NIM_RETRIEVAL_BASE", "https://ai.api.nvidia.com/v1/retrieval")
-NVIDIA_API_KEY = env_str("NVIDIA_API_KEY", "")
+NVIDIA_API_KEY = env_key("NVIDIA_API_KEY")
 NIM_TIMEOUT_S = env_float("NIM_TIMEOUT_S", 90.0)
 
 OPENROUTER_BASE_URL = env_str("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-OPENROUTER_API_KEY = env_str("OPENROUTER_API_KEY", "")
+OPENROUTER_API_KEY = env_key("OPENROUTER_API_KEY")
 # Sent as HTTP-Referer/X-Title; OpenRouter uses them for attribution on free models.
 OPENROUTER_APP_URL = env_str("OPENROUTER_APP_URL", "https://github.com/DamnKuldeep/KnowYourRightsAI")
 OPENROUTER_APP_NAME = env_str("OPENROUTER_APP_NAME", "KnowYourRightsAI")

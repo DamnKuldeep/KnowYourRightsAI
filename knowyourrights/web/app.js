@@ -549,5 +549,25 @@ $('#reset').onclick = async () => {
     }
   }).catch(() => {});
 
+  // ── pipeline explainer ───────────────────────────────────────────────────────────────
+  // Opened from the "?" beside the depth buttons. Closes on the X, on the backdrop, and on
+  // Escape — a panel that traps you is worse than no panel.
+  const pipeline = $('#pipeline');
+  const pipelineBtn = $('#pipelineBtn');
+  if (pipeline && pipelineBtn) {
+    const setPipeline = (open) => {
+      pipeline.hidden = !open;
+      pipelineBtn.setAttribute('aria-expanded', String(open));
+      if (open) $('#pipelineClose').focus();
+      else pipelineBtn.focus();
+    };
+    pipelineBtn.addEventListener('click', () => setPipeline(pipeline.hidden));
+    $('#pipelineClose').addEventListener('click', () => setPipeline(false));
+    pipeline.addEventListener('click', (e) => { if (e.target === pipeline) setPipeline(false); });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !pipeline.hidden) setPipeline(false);
+    });
+  }
+
   input.focus();
 })();
