@@ -27,50 +27,12 @@ def _messages(system: str, user: str) -> list[dict]:
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
-# ── safety gate (no model call) ───────────────────────────────────────────────────────
-# Deterministic on purpose. Someone typing "he is hitting me right now" must get helpline
-# numbers immediately and reliably — not after a model round-trip that might be rate-limited.
-_URGENT_PATTERNS = (
-    # Match on the act and its object rather than on who is doing it. Requiring a specific
-    # subject ("he is hitting") missed "my husband is hitting me" — which is precisely the
-    # disclosure this gate exists for.
-    (re.compile(r"(?i)\b((hit|hitt|beat|beating|attack|assault|abus|threaten)\w*\s+"
-                r"(me|us|her|him|my \w+)|being\s+(beaten|hit|attacked|abused)|"
-                r"maar\s+(rahe|raha|rahi)|peet\s+(rahe|raha|rahi)|ghar\s+mein\s+maar)\b"),
-     "violence"),
-    (re.compile(r"(?i)\b(kill myself|suicide|end my life|khudkushi|atmahatya|"
-                r"want to die|self harm)\b"), "self_harm"),
-    (re.compile(r"(?i)\b(being (raped|molested)|sexual(ly)? assault(ed|ing)?|"
-                r"rape ho|chhed(chhad|khani))\b"), "sexual_violence"),
-    (re.compile(r"(?i)\b(kidnapp?ed|abducted|trafficked|held (captive|hostage)|"
-                r"forced (labour|labor|prostitution)|bandhak)\b"), "trafficking"),
-    (re.compile(r"(?i)\b(missing child|child is missing|bacha gum|child labour|"
-                r"child marriage|bal vivah)\b"), "child"),
-    (re.compile(r"(?i)\b(arrest(ing|ed)? (me|him|her) (right )?now|police (are|is) here|"
-                r"being detained|abhi arrest)\b"), "arrest_in_progress"),
-)
-
-_URGENT_ADVICE = {
-    "violence": "If you are in immediate danger, call 112 now, or 181 for the women's helpline.",
-    "self_harm": "If you are thinking about harming yourself, please call Tele-MANAS on 14416 — "
-                 "someone is there right now.",
-    "sexual_violence": "If this is happening now or just happened, call 112, or 1091 for the "
-                       "women's helpline. You can report at any police station regardless of "
-                       "where it happened.",
-    "trafficking": "Call 112 immediately. Childline is 1098 if a child is involved.",
-    "child": "Call Childline on 1098 — it operates 24 hours.",
-    "arrest_in_progress": "Call 112 if you need help now. You have the right to know the "
-                          "grounds of arrest, to inform someone, and to a lawyer — free legal "
-                          "aid is on 15100.",
-}
-
-
-def safety_check(message: str) -> SafetyCheck:
-    """Spot an emergency in the text itself, before any research begins."""
-    for pattern, kind in _URGENT_PATTERNS:
-        if pattern.search(message or ""):
-            return SafetyCheck(urgent=True, kind=kind, reason=_URGENT_ADVICE.get(kind, ""))
-    return SafetyCheck()
+# ── safety gate ───────────────────────────────────────────────────────────────────────
+# Moved to knowyourrights/safety.py, which adds a second, meaning-based tier on top of these
+# patterns. Re-exported here because this was the import site and the orchestrator's ordering
+# guarantee — gate before any model call — is what actually matters.
+from ..safety import check_patterns as safety_check   # noqa: E402,F401
+from ..safety import check as safety_check_async      # noqa: E402,F401
 
 
 # ── planner ───────────────────────────────────────────────────────────────────────────

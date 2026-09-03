@@ -19,7 +19,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
-from . import config, events, legal_terms
+from . import config, events, legal_terms, safety
 from .agents import prompts, stages
 from .agents.schemas import Plan, Procedure
 from .context import budget as ctx_budget
@@ -178,8 +178,10 @@ class Orchestrator:
         conversation = turn.conversation
         conversation.add_user(turn.message)
 
-        # 1 — emergencies come before research, and without a model call.
-        check = stages.safety_check(turn.message)
+        # 1 — emergencies come before research, and before any model call. Patterns decide
+        # instantly; the meaning tier adds one embedding, which retrieval then reads from cache,
+        # so the paraphrases that patterns cannot reach cost the turn nothing. Never raises.
+        check = await safety.check(turn.message)
         if check.urgent:
             emit(events.safety(list(config.HELPLINES), check.reason))
 
