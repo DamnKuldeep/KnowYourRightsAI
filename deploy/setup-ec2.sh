@@ -315,7 +315,10 @@ for _ in $(seq 1 36); do
     echo "  KnowYourRightsAI is running on this machine."
     echo
     echo "  Next: expose it with a public URL —"
-    echo "      cloudflared tunnel --url http://localhost:8000"
+    echo "      bash deploy/tunnel.sh start"
+    echo "  (a service, so the link survives closing this terminal — typing"
+    echo "   'cloudflared tunnel --url …' here does not: it dies with the session"
+    echo "   and every visitor then gets HTTP 530 while the app is still fine)"
     echo "  (cloudflared is already installed for this machine's architecture)"
     echo
     echo "  Check it:   curl -s localhost:8000/api/health | head -c 200"
