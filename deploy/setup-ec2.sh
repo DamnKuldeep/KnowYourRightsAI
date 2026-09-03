@@ -4,9 +4,15 @@
 # 24.04 ships Python 3.12 with PEP 668 enforced, so a bare `pip install` is refused. Every
 # install here goes through a venv, which is unaffected — verified on 24.04.4 / 3.12.3.
 #
-# Paste this into the EC2 browser terminal:
+# Paste this into the EC2 browser terminal — download first, then run:
 #
-#   curl -fsSL https://raw.githubusercontent.com/DamnKuldeep/KnowYourRightsAI/main/deploy/setup-ec2.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/DamnKuldeep/KnowYourRightsAI/main/deploy/setup-ec2.sh -o setup.sh
+#   bash setup.sh
+#
+# Not `curl … | bash`. Piping makes this script bash's stdin, so the `read` prompts below would
+# consume the script's own text instead of what you type. The prompts now read /dev/tty directly
+# so the pipe form works too, but downloading first is the form to prefer: it is one file you can
+# read before running, and it cannot be truncated halfway by a dropped connection.
 #
 # It asks for your two API keys, installs everything, builds the vector index, calibrates the
 # abstention thresholds, and leaves the app running as a service. Roughly 20 minutes, most of
@@ -73,14 +79,43 @@ else
       | tr -cd 'A-Za-z0-9._-'
   }
 
-  read -rsp "  NVIDIA_API_KEY (nvapi-…): " NVIDIA_KEY; echo
-  read -rsp "  OPENROUTER_API_KEY (sk-or-…, optional, Enter to skip): " OR_KEY; echo
+  # Read the keyboard, not stdin. Under `curl … | bash` the script *is* bash's stdin, so a bare
+  # `read` consumes the script's own bytes: the key silently became a fragment of this file
+  # ("10 chars, starts 2.package"), every API call failed 401, and the installer stopped early
+  # because the lines `read` had eaten never executed. /dev/tty is the terminal regardless of
+  # what stdin is piped from.
+  if [ -r /dev/tty ]; then
+    read -rsp "  NVIDIA_API_KEY (nvapi-…): " NVIDIA_KEY < /dev/tty; echo
+    read -rsp "  OPENROUTER_API_KEY (sk-or-…, optional, Enter to skip): " OR_KEY < /dev/tty; echo
+  else
+    # No terminal at all — a CI runner or `bash < script`. Take them from the environment
+    # rather than reading garbage and pretending it worked.
+    NVIDIA_KEY="${NVIDIA_API_KEY:-}"
+    OR_KEY="${OPENROUTER_API_KEY:-}"
+    [ -n "$NVIDIA_KEY$OR_KEY" ] || die "No terminal to read keys from. Either run this from a
+  terminal, or pass them in:
+      NVIDIA_API_KEY=nvapi-… OPENROUTER_API_KEY=sk-or-… bash setup-ec2.sh"
+  fi
   NVIDIA_KEY=$(clean_key "${NVIDIA_KEY:-}")
   OR_KEY=$(clean_key "${OR_KEY:-}")
   [ -n "$NVIDIA_KEY" ] || [ -n "$OR_KEY" ] || die "At least one key is required."
 
   # Say what was actually captured. A truncated or empty key is far cheaper to notice here than
   # twenty minutes later when every model probe fails.
+  # Shape check. Both providers use a fixed prefix, so a value that lacks it is not a key that
+  # will fail later — it is something else entirely, and saying so now costs one line instead of
+  # twenty minutes and a 401 for every model.
+  if [ -n "$NVIDIA_KEY" ] && [ "${NVIDIA_KEY#nvapi-}" = "$NVIDIA_KEY" ]; then
+    die "That NVIDIA key does not start with 'nvapi-' (got ${#NVIDIA_KEY} chars starting
+  '${NVIDIA_KEY:0:12}'). Nothing was written. Re-run and paste the key from
+  https://build.nvidia.com — or press Enter to skip NVIDIA and use OpenRouter alone."
+  fi
+  if [ -n "$OR_KEY" ] && [ "${OR_KEY#sk-or-}" = "$OR_KEY" ]; then
+    die "That OpenRouter key does not start with 'sk-or-' (got ${#OR_KEY} chars starting
+  '${OR_KEY:0:12}'). Nothing was written. Re-run and paste the key from
+  https://openrouter.ai/keys — or press Enter to skip OpenRouter and use NVIDIA alone."
+  fi
+
   [ -n "$NVIDIA_KEY" ] && ok "NVIDIA key: ${#NVIDIA_KEY} chars, starts ${NVIDIA_KEY:0:6}" \
                        || echo "  · no NVIDIA key — OpenRouter only"
   [ -n "$OR_KEY" ] && ok "OpenRouter key: ${#OR_KEY} chars, starts ${OR_KEY:0:9}" \

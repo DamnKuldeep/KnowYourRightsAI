@@ -215,7 +215,15 @@ class NimClient:
 
         # 401/403 and other client errors are configuration problems; retrying won't help.
         self._ledger.record_error(model, "error", session, stage, body)
-        raise NimError(f"{stage}: NIM returned HTTP {response.status_code}: {body[:300]}")
+        # Name the provider that actually answered. Reporting an OpenRouter 401 as "NIM returned
+        # HTTP 401" sent a real debugging session after the wrong key entirely.
+        who = spec.provider if spec is not None else "provider"
+        hint = ""
+        if response.status_code in (401, 403):
+            env = "NVIDIA_API_KEY" if who == "nim" else "OPENROUTER_API_KEY"
+            hint = f" — check {env} in .env; the key was rejected, not the model"
+        raise NimError(
+            f"{stage}: {who} returned HTTP {response.status_code}{hint}: {body[:300]}")
 
     async def _backoff(self, attempt: int, stage: str, deadline: float | None) -> None:
         delay = min(config.RETRY_MAX_DELAY,
