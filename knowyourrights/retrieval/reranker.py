@@ -112,7 +112,17 @@ class Reranker:
             # calibrating either one silently mis-thresholds the other, so they are kept apart.
             return "rrf" if self.plan.use_embedder else "rrf-bm25"
         if self.backend == "local":
-            return self.plan.rerank_model
+            # Quantisation and a shorter input both move the score distribution without changing
+            # the model's name, so a threshold calibrated for one is wrong for the other — and
+            # wrong in the direction that matters: measured, int8 under float32's threshold let
+            # off-topic questions through 6 times out of 11 instead of 1. Encode both in the key
+            # so a calibration can never be silently reused across them.
+            name = self.plan.rerank_model
+            if self.plan.rerank_device == "cpu" and config.RERANK_QUANTIZE_CPU:
+                name += "+int8"
+            if config.RERANK_MAX_LEN > 0:
+                name += f"@{config.RERANK_MAX_LEN}"
+            return name
         if self.backend == "nim":
             from ..llm import registry
 
@@ -135,7 +145,12 @@ class Reranker:
         limit = int(getattr(cfg, "max_position_embeddings", 512) or 512)
         if getattr(cfg, "model_type", "") in ("xlm-roberta", "roberta", "camembert"):
             limit -= 2
-        return max(8, min(limit, config.EMBED_MAX_SEQ))
+        limit = min(limit, config.EMBED_MAX_SEQ)
+        # An explicit cap is the CPU escape hatch: cost is ~linear in tokens, and relevance is
+        # usually decidable from the opening of a section rather than all 510 tokens of it.
+        if config.RERANK_MAX_LEN > 0:
+            limit = min(limit, config.RERANK_MAX_LEN)
+        return max(8, limit)
 
     def _load_sync(self):
         import torch
@@ -152,8 +167,24 @@ class Reranker:
             model = AutoModelForSequenceClassification.from_pretrained(
                 name, trust_remote_code=True, torch_dtype=getattr(torch, plan.rerank_dtype))
         model = model.to(plan.rerank_device).eval()
-        log.info("reranker loaded: %s on %s/%s in %.1fs",
-                 name, plan.rerank_device, plan.rerank_dtype, time.time() - started)
+
+        # Dynamic int8 on CPU. The cross-encoder is ~99% of CPU retrieval time, and quantising
+        # its Linear layers is the one change that moves that number without removing the model
+        # — which matters because the model is what makes the system able to refuse a question
+        # it cannot answer. Failure here is not fatal: an unquantised reranker is merely slower.
+        quantised = False
+        if plan.rerank_device == "cpu" and config.RERANK_QUANTIZE_CPU:
+            try:
+                model = torch.ao.quantization.quantize_dynamic(
+                    model, {torch.nn.Linear}, dtype=torch.qint8)
+                quantised = True
+            except Exception as exc:                      # noqa: BLE001 — optimisation only
+                log.info("int8 quantisation unavailable (%s) — running float", exc)
+
+        log.info("reranker loaded: %s on %s/%s%s in %.1fs", name, plan.rerank_device,
+                 "int8" if quantised else plan.rerank_dtype,
+                 f" max_len={config.RERANK_MAX_LEN}" if config.RERANK_MAX_LEN else "",
+                 time.time() - started)
         return tokenizer, model
 
     async def _ensure_local(self) -> bool:
