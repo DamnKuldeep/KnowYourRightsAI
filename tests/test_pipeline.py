@@ -397,3 +397,38 @@ def test_fusion_scoring_can_distinguish_relevance():
 
     strong = rrf([(["a", "b"], 1.0), (["a", "c"], 1.0)])
     assert strong["a"] > strong["b"], "agreement across lists must rank higher"
+
+
+def test_empty_completion_still_produces_an_answer():
+    """Regression: sources rendered, research log correct, answer blank.
+
+    The writer failing *loudly* was handled — a NimError falls back to a digest of the
+    provisions found. A writer that streams zero tokens and returns cleanly was not: no
+    exception meant the turn finished "successfully", citations verified against an empty
+    string, a verdict was emitted, and the user got a full research trail with no answer under
+    it. Both paths must reach the fallback.
+    """
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parent.parent / "knowyourrights" / "orchestrator.py"
+    text = src.read_text(encoding="utf-8")
+    guard = text.index("if not answer.strip():")
+    verify = text.index("cleaned, unsupported, verified = stages.verify_citations(answer")
+    assert guard < verify, "the empty-answer guard must run before citation verification"
+    assert text.count("_source_digest(packed.included, turn.message)") == 2, (
+        "the exception path and the empty-completion path must both fall back to a digest")
+
+
+def test_source_digest_is_never_blank_when_evidence_exists():
+    """The fallback is only worth having if it actually renders the provisions."""
+    from knowyourrights import orchestrator
+    from knowyourrights.evidence import Evidence
+
+    evidence = [Evidence(id="S1", kind="statute",
+                         title="Bharatiya Nagarik Suraksha Sanhita, 2023",
+                         citation="Section 35, BNSS",
+                         text="When police may arrest without a warrant.",
+                         score=0.9, url="", source_type="criminal_code")]
+    digest = orchestrator._source_digest(evidence, "can police arrest me without a warrant")
+    assert digest.strip()
+    assert "Section 35" in digest

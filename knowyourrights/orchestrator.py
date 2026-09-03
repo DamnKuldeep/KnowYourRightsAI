@@ -531,6 +531,27 @@ class Orchestrator:
                 return
 
         answer = "".join(collected)
+        if not answer.strip():
+            # The stream ended cleanly and produced nothing. No exception is raised for this, so
+            # without an explicit check the turn completes "successfully": citations verify
+            # against an empty string, a verdict is emitted, the stage is marked done, and the
+            # user is left with a full research trail, correct sources, and no answer. Seen in
+            # production. An empty completion is a writer failure like any other, so it takes
+            # the same path as one.
+            log.warning("writer returned an empty completion — falling back to a source digest")
+            emit(events.notice(
+                "The writing model returned nothing, so here are the provisions found for your "
+                "question, unedited.", level="warn"))
+            digest = _source_digest(packed.included, turn.message)
+            for line in digest.splitlines(keepends=True):
+                emit(events.token(line))
+            turn.answer = digest
+            conversation.add_assistant(digest, packed.included)
+            emit(events.verdict(len(packed.included), [],
+                                coverage="written without the model", degraded=True))
+            emit(events.stage("write", label, "done"))
+            return
+
         cleaned, unsupported, verified = stages.verify_citations(answer, packed.included)
         if cleaned != answer:
             # The prose already streamed; tell the UI to use the corrected text.
