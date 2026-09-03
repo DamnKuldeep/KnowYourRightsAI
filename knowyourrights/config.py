@@ -224,6 +224,23 @@ SESSION_CREDIT_BUDGET = env_int("KYR_SESSION_CREDIT_BUDGET", 0)  # 0 = unlimited
 EMBED_MODEL = env_str("KYR_EMBED_MODEL", "BAAI/bge-m3")
 EMBED_DIM = 1024
 EMBED_MAX_SEQ = env_int("KYR_EMBED_MAX_SEQ", 1024)
+
+# Cross-encoder cost is roughly linear in tokens and it dominates CPU retrieval — measured at
+# 6.6 s for 8 documents on one physical core, against 40 ms for the searches feeding it. These
+# two knobs exist for that case only; on a GPU the default 510 tokens in fp16 is already cheap.
+#   0 = use the model's own position limit.
+RERANK_MAX_LEN = env_int("KYR_RERANK_MAX_LEN", 0)
+# Dynamic int8 on the Linear layers, CPU only. Off by default, and that is a measured decision
+# rather than caution: quantising is roughly 2-3x faster but costs MRR 0.861 -> 0.829, top-1
+# 79% -> 76%, and one more stress question slipping past retrieval (10/11 -> 9/11). Turning it
+# on also invalidates the calibration — the thresholds are keyed by it, so scripts/calibrate.py
+# must be re-run afterwards or abstention degrades badly.
+#
+# Enable it, with the 256-token cap, when a box is too slow to demo:
+#     KYR_RERANK_QUANTIZE_CPU=true
+#     KYR_RERANK_MAX_LEN=256
+#     python scripts/calibrate.py          # required, not optional
+RERANK_QUANTIZE_CPU = env_bool("KYR_RERANK_QUANTIZE_CPU", False)
 EMBED_QUERY_PREFIX = ""  # bge-m3 encodes queries and passages symmetrically
 
 RERANK_QUALITY = env_str("KYR_RERANK_QUALITY", "BAAI/bge-reranker-v2-m3")
