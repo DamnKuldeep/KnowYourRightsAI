@@ -166,7 +166,8 @@ calibration shows the answerable and off-topic score populations *overlap* once 
 cut is 90% accurate. Reranking just 8 candidates is enough to keep that defence, which is why
 the deployed configuration keeps the model and shrinks the pool instead of the reverse.
 
-**Per-category Recall@5 is 100% across all 13 represented categories.** With 42 questions the
+**Per-category Recall@5 is 100% across all 13 represented categories, in the pool-24
+configuration measured above.** With 42 questions the
 per-category counts are small (1–10 each), so this says the system has no blind *domain*, not
 that each category is proven to three decimal places.
 
@@ -373,8 +374,8 @@ statutes are kept. Partial over-rejection remains the main open issue.
 
 ## 8. Test suite
 
-73 tests, fully mocked — no GPU, no network, no API credits, ~100 s. They run on Python 3.11 and
-3.12 in CI; 3.12 is what Ubuntu 24.04 ships, so it is the version the deployed box actually runs.
+100 tests, fully mocked — no GPU, no network, no API credits, ~100 s. They run on Python 3.11
+and 3.12 in CI; 3.12 is what Ubuntu 24.04 ships, so it is the version the deployed box runs.
 
 | Area | What is guarded |
 |---|---|

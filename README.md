@@ -10,7 +10,8 @@ English, Hindi, or Hinglish.
 [![tests](../../actions/workflows/tests.yml/badge.svg)](../../actions/workflows/tests.yml)
 ![python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
-![retrieval](https://img.shields.io/badge/Recall%405-100%25-brightgreen)
+![retrieval](https://img.shields.io/badge/Recall%405-100%25%20GPU%20%7C%2095.2%25%20deployed-brightgreen)
+![abstention](https://img.shields.io/badge/off--topic%20refused-8%2F8-brightgreen)
 ![providers](https://img.shields.io/badge/providers-NIM%20%2B%20OpenRouter-blueviolet)
 ![corpus](https://img.shields.io/badge/corpus-38%2C890%20chunks-informational)
 
@@ -119,7 +120,7 @@ Closing those is what the rest of this repo is.
 
 ```mermaid
 flowchart TD
-    A[User question] --> B{Safety gate<br/>plain regex, no model call}
+    A[User question] --> B{Safety gate<br/>patterns + meaning · never a model call}
     B -->|emergency| C[Helpline numbers first]
     B --> D[Planner<br/>intent · depth · sub-questions]
     C --> D
@@ -154,7 +155,8 @@ you can override it.
 fee, the BPL exemption, the 30-day deadline and the appeal route. Not a snippet.
 
 **It knows when to stop.** Below a calibrated confidence threshold it says so and searches the
-web instead of forcing a citation. Eight off-topic questions in a row get declined.
+web instead of forcing a citation. All eight off-topic stress questions are declined, on both
+the GPU and the deployed CPU configuration.
 
 **It checks its own work.** In deep mode it reads back its own draft and asks which claims it
 should not stand behind unverified — a fee, a deadline, anything supported by a single web page
@@ -220,63 +222,170 @@ never searched. Reading the stored vectors back instead is both correct and fast
 
 ## What the numbers say
 
-Measured against a 42-question gold set covering the corpus taxonomy, plus stress questions
-designed to *fail*. Full methodology, per-category results and latency breakdowns are in
+One gold set of 42 questions written the way citizens ask, a stress set of 11 the system should
+*refuse*, and 4 exact-lookup questions. Same sets everywhere below — every number on this page
+comes from those, and nothing is quoted from a different run. Full methodology in
 **[EVALUATION.md](EVALUATION.md)**.
 
-| | Notebook | Now |
+### The two configurations that matter
+
+| | Development laptop<br/><small>RTX 3050, rerank pool 24</small> | **Deployed box**<br/><small>1 CPU core, rerank pool 8</small> |
+|---|---:|---:|
+| Recall@1 | 78.6% | 76.2% |
+| Recall@3 | 95.2% | 92.9% |
+| **Recall@5** | **100%** | **95.2%** |
+| Recall@10 | 100% | 97.6% |
+| MRR | 0.873 | 0.854 |
+| Exact lookups | 4/4 | 4/4 |
+| **Off-topic answered anyway** | **0/8** | **0/8** |
+| Median retrieval | 399 ms | 6.6 s |
+
+Both are true. They are different machines running different pool sizes, and neither is "the"
+number. The honest summary: **the top 5 almost always contains the right provision, and the
+system refuses every off-topic question in both configurations.**
+
+### Why 5 results, not 3 or 10
+
+That Recall@10 column is the argument. On the laptop, Recall@5 and Recall@10 are *both* 100% —
+nothing correct sits at rank 6–10, so fetching ten would add five irrelevant sections to the
+writer's prompt for zero recall. Recall@3 drops to 95.2%, so cutting to three loses answers that
+were retrieved successfully.
+
+The deployed box has the same shape: 92.9% → 95.2% → 97.6%. Going from 5 to 10 buys 2.4 points
+for double the prompt.
+
+**`TOP_K = 5` is where recall stops improving faster than the prompt grows.** Recall@1 of ~78%
+is also why the interface shows sources rather than asserting one answer: about one question in
+five has its best hit at rank 2 or 3, and a person reading five cited sections finds it at once.
+
+### Every configuration, measured
+
+Free-tier hardware forces real trade-offs, so each was measured rather than argued:
+
+| Configuration | Recall@5 | MRR | Off-topic caught | Retrieval | Why you would pick it |
+|---|---:|---:|---:|---:|---|
+| `balanced` GPU, pool 24 | 100% | 0.873 | 11/11 | 0.4 s | a GPU is available |
+| `cpu`, pool 24 | 100% | 0.873 | 11/11 | 20 s | accuracy over speed |
+| `cpu`, pool 12 | 95.2% | 0.849 | 10/11 | 11 s | *never — dominated by pool 8* |
+| **`cpu`, pool 8** | **95.2%** | **0.861** | **10/11** | **6.6 s** | **the deployed default** |
+| `cpu_lean`, no reranker | 93% | 0.787 | 5/11 | 0.09 s | too slow to demo otherwise |
+| `lite`, BM25 only | 90.5% | 0.769 | 5/11 | 0.06 s | under 2 GB of RAM |
+
+Three decisions fell out of this table.
+
+**Pool 8, not 12.** Pool 12 was the deployed setting until it was measured against a control. It
+has the same Recall@5 as pool 8, worse MRR, worse Recall@1, and runs 1.75× slower. Nothing was
+bought with those four extra documents.
+
+**Keep the cross-encoder, shrink its pool.** Dropping it is 70× faster and costs 7 points of
+Recall@5 — survivable. It also takes off-topic rejection from 10/11 to 5/11, which is not:
+without it the answerable and off-topic score populations overlap, so *no* threshold separates
+them. Reranking 8 documents keeps the refusal at a third of the cost.
+
+**The 100% row is real but not free.** Reaching it on CPU costs 20 seconds a question. The
+deployed box trades 4.8 points of Recall@5 for a demo that responds — a deliberate choice made
+because the target is a free-tier instance with one physical core, reversible with one line of
+`.env`.
+
+### Where the time goes
+
+| Stage | Laptop (GPU) | Deployed (1 CPU core) |
+|---|---:|---:|
+| Embed the query | 61 ms | 331 ms |
+| Vector search | 23 ms | **12 ms** |
+| BM25 search | 23 ms | **8 ms** |
+| Fetch rows + stored vectors | 47 ms | 19 ms |
+| **Cross-encoder rerank** | **309 ms** | **6,625 ms** |
+| Cold start | 56.7 s | **16.0 s** |
+
+Vector search was **304 ms** before an ANN index existed — the corpus shipped without one and
+every query scanned 159 MB. Building it took dense search to 23 ms and *raised* MRR from 0.837
+to 0.849.
+
+The small cloud box beats the laptop at search, BM25 and cold start. All of the difference is
+the cross-encoder, and all of that is having one physical core.
+
+**Accuracy is a property of the system; latency is a property of the box.** Same models, same
+corpus, same ranking, so retrieval quality transferred exactly. The reverse held too: re-running
+the benchmark while the laptop's GPU sat pinned in its lowest power state reproduced every
+accuracy number and reported reranking at 2420 ms instead of 309. Nothing changed but a clock.
+
+**A full answer** takes 5–8 s (`quick`), 10–25 s (`standard`) or 17–60 s (`deep`) — dominated by
+the language model, not retrieval. When NVIDIA's endpoint degraded mid-evaluation the same turns
+took 18 s, 26–120 s and 227 s, and retrieval still contributed under half a second to each.
+
+---
+
+## The numbers behind the knobs
+
+Every constant was chosen against the gold set, and most are shaped by running on free tiers and
+free hardware. That constraint is not an excuse; it is the design brief.
+
+### Chunking and retrieval
+
+| | Value | Why |
 |---|---|---|
-| Recall@5 | 95.2% | **100%** (42/42) |
-| MRR | 0.783 | **0.873** |
-| Answer is the top hit | 66.7% | **78.6%** |
-| Exact "what does Article 21 say" lookups | — | **4/4** |
-| Off-topic questions it answers anyway | 1 in 2 | **0 in 8** |
-| Median retrieval latency | 674 ms | **399 ms** |
+| Chunk size | **480 words, 80-word overlap** | Fixed by the corpus build. Sections shorter than this stay whole, and most are |
+| Embedding | `BAAI/bge-m3`, 1024-d | **Cannot be changed** — the corpus is embedded with it, so a different model means re-embedding all 38,890 chunks |
+| Embedder max sequence | 1024 tokens | Comfortably above a 480-word chunk |
+| Reranker max sequence | 510 tokens | The cross-encoder's own position limit, not the embedder's. Exceeding it throws a CUDA index error rather than a clean one |
+| `FETCH_K` | **25** per query | Candidates taken from each of dense and BM25, before fusion |
+| `RERANK_POOL` | **8** deployed, 24 on GPU | Measured above |
+| `TOP_K` | **5** | Where Recall@10 stops beating Recall@5 |
+| `RRF_K` | 60 | Standard reciprocal-rank-fusion constant |
+| MMR λ | 0.6 · 0.85 focused · **0.97 no-reranker** | Without a reranker MMR over-diversified and cost 5 points of Recall@5 |
+| Act-filter weight | 2.5 | A named Act contributes an extra *weighted* ranked list, never a hard filter, which would kill recall |
+| General-code boost | 0.25 | The Essential Services Maintenance Act outranked the BNSS on a policing question until general codes were preferred |
 
-That "0 in 8" is the row I care about most, and it came entirely from calibration — see below.
+### Context and memory limits
 
-**Where the time goes in one retrieval:**
+Deliberately far below what the models accept. `nemotron-3-super` advertises a very large
+window, but latency, free-tier credits and lost-in-the-middle all degrade long before it fills.
 
-| | |
+| | Value | Why |
+|---|---|---|
+| Writer input budget | **14,000 tokens** | The whole packed prompt, history included |
+| Fast-stage input budget | **8,000 tokens** | Planner, grader, gap analyst — small calls kept small |
+| Safety margin | 512 tokens | Reserved so a long answer cannot overrun the window |
+| Conversation kept verbatim | **last 4 turns** | Older turns collapse into a cached running summary |
+| Summary regenerated after | 8 turns | Past a threshold, not on every turn |
+| Crawled page chunks | **1,400 chars**, top **3 kept** | Chunks are reranked against the sub-question before any reach a model |
+| Web result cap | 1,800 chars per source | |
+| Wikipedia cap | 1,200 chars | Background only — never cited as law |
+| Packer | statute always keeps a slot | One large government page cannot crowd out the actual provision |
+
+Follow-up questions reuse a cross-turn evidence pool keyed by section, so *"what about the
+appeal?"* does not re-run the search. Starting a new conversation clears it — memory is
+per-session and nothing is stored server-side between them.
+
+### Depth budgets
+
+| | Rounds | Web pages | Nav depth | Model calls | Deadline |
+|---|---:|---:|---:|---:|---:|
+| `quick` | 1 | 0 | — | 4 | 25 s |
+| `standard` | 1 | 3 | 1 | 8 | 75 s |
+| `deep` | 4 | 10 | 2 | 20 | 240 s |
+
+Every one is a **soft ceiling that degrades**, never a hard failure. When time runs out the loop
+stops gathering and writes with what it has. A shallower answer beats an error, and on a free
+tier it is the outcome users actually hit.
+
+### Working inside free tiers
+
+Provider limits drove architecture, not just configuration:
+
+| Constraint | What it forced |
 |---|---|
-| Embed the query | 61 ms |
-| Vector search | 23 ms *(was 304 ms — the corpus shipped with no vector index)* |
-| BM25 search | 23 ms |
-| Fetch rows + stored vectors | 47 ms |
-| **Cross-encoder rerank** | **309 ms** ← the dominant cost |
-| **Whole search** | **399 ms** |
+| NVIDIA: 40 rpm **per model** | Cheap stages routed to a different model than the writer, so they draw on separate buckets |
+| OpenRouter: ~20 rpm **shared** across all free models | Kept as failover rather than primary — measured, not assumed |
+| Hard daily caps on both | A client-side ledger that survives restarts, so bouncing the server cannot quietly spend the allowance |
+| Rate limits are normal, not exceptional | A 429 pauses and resumes with a countdown on screen; no turn is lost to one |
+| Every free reranking endpoint returns 410/404 | Reranking has to be local, which is what makes CPU cost the dominant latency |
+| 4 GB laptop GPU / 1-core cloud box | Five resource profiles, selected by probing the machine at startup |
 
-**A full answer** takes 5–8 s (`quick`), 10–25 s (`standard`) or 17–60 s (`deep`) — dominated
-by the language model, not by this system. When NVIDIA's endpoint degraded mid-evaluation those
-same turns took 18 s, 26–120 s and 227 s; retrieval still contributed under half a second to
-every one of them.
-
-### And what the numbers say on a machine you'd actually deploy on
-
-The table above is a laptop with a GPU. Running the identical suite on the free-tier cloud box
-this is deployed to — `m7i-flex.large`, 2 vCPU (**one physical core**), 8 GB, no GPU:
-
-| | Laptop (GPU) | EC2 (CPU) | |
-|---|---:|---:|---|
-| Recall@5 | 95.2%* | **95.2%** | identical |
-| Off-topic wrongly answered | 0/8 | **0/8** | identical |
-| Exact lookups | 4/4 | **4/4** | identical |
-| Cold start | 56.7 s | **16.0 s** | EC2 wins |
-| Dense search | 33 ms | **12 ms** | EC2 wins |
-| BM25 | 32 ms | **8 ms** | EC2 wins |
-| Cross-encoder | 309 ms | **6,625 ms** | one core, no GPU |
-
-\* both at `RERANK_POOL=8`, the deployed setting — the 100% row above is pool 24, which costs
-three times the reranking.
-
-**Accuracy is a property of the system; latency is a property of the box.** Same two models,
-same corpus, same ranking — so retrieval quality transferred exactly, and the small cloud
-instance is genuinely *faster* than the laptop at everything except the cross-encoder. Anyone
-can reproduce this: `python scripts/benchmark.py --all`, then `python scripts/deploy_report.py`.
-
-I learned this the hard way in the other direction too. Re-running the benchmark while the
-laptop's GPU sat pinned in its lowest power state reproduced every accuracy number exactly and
-reported reranking at 2420 ms instead of 309 ms. Nothing had changed but a clock.
+Bigger models are not automatically better either. The largest free model available,
+`nemotron-3-ultra-550b`, took **21.6 s** for a two-sentence answer against **2.8 s** for a 120B,
+so it is kept last as an availability backstop rather than a first choice.
 
 ---
 
@@ -310,6 +419,96 @@ for rape` and `child labour laws in India`, which must stay quiet.
 Both labelled sets are in [`knowyourrights/safety_eval.py`](knowyourrights/safety_eval.py), and
 `python scripts/calibrate_safety.py` re-measures the trade — weighting a miss four times a
 false alarm, because they are not equally bad.
+
+---
+
+## Every guardrail, in one place
+
+A tool that cites statute at people can be wrong in ways an ordinary chatbot cannot. These are
+all the checks, what each one prevents, and how you can see it working.
+
+| # | Guardrail | Prevents | Runs |
+|---|---|---|---|
+| 1 | **Emergency gate** | A person in danger reading about the law instead of calling 112 | Before any model call |
+| 2 | **Repealed-law block** | Citing the IPC or CrPC, repealed 2024-07-01 | Corpus + writer prompt |
+| 3 | **Jurisdiction labelling** | Implying a state Act applies nationwide | On every statute |
+| 4 | **Abstention threshold** | Inventing a section number when retrieval found nothing good | After reranking |
+| 5 | **Grader** | Citing a section that merely mentions the Act | After retrieval |
+| 6 | **Citation verifier** | A marker like `[S3]` pointing at nothing | After the answer streams |
+| 7 | **Quote check** | A quotation that is not a real substring of its source | After the answer streams |
+| 8 | **Diversity floor** | A government page crowding the statute out of the prompt | While packing |
+| 9 | **Prompt-injection isolation** | A crawled page instructing the model | Before web text reaches a model |
+| 10 | **Code-orchestrated tools** | A hallucinated or page-triggered tool call | By construction |
+| 11 | **Self-verification** | Standing behind a fee or deadline it is unsure of | Deep mode |
+| 12 | **Empty-answer fallback** | Sources and a research log with no answer under them | If the writer returns nothing |
+| 13 | **Currency stamps** | Presenting a snapshot as today's law | On every answer |
+
+### 1 — The emergency gate
+
+First in the pipeline, and it never makes a model call, so a rate limit cannot delay a helpline
+number. Two tiers: patterns for literal phrasings, and meaning for the paraphrases patterns
+cannot reach. **33/33 disclosures caught, 0/26 false alarms.** Detail and how to test it in the
+section above.
+
+### 2 — Repealed law
+
+The IPC, CrPC and Indian Evidence Act were repealed on **2024-07-01**. They are absent from the
+corpus entirely, so they cannot be retrieved — but a model can still recall them from training,
+so the writer prompt forbids citing them and the system substitutes BNS / BNSS / BSA with the
+substitution stated. This came from watching an early build cite CrPC §41 from memory.
+
+### 3 — Jurisdiction
+
+53 state Acts leaked into the corpus from the source dataset, and the corpus's own
+`jurisdiction` column says `central` for **every** row — so it cannot be trusted. The Act title
+is the signal used instead. A state Act is labelled `STATE LAW`, and when your selected state
+does not match, the answer says so outright rather than implying coverage. Verified live: a
+Mumbai deposit question asked from Kerala produced *"the Maharashtra Rent Control Act, 1999
+applies only in Maharashtra"*.
+
+### 4 — Abstention
+
+If the best hit scores below a **calibrated** threshold, the system says the corpus has no good
+answer and pivots to the web rather than manufacturing a section number. The threshold is
+derived per configuration, not chosen — see *Calibration* below. **0 of 8 off-topic questions
+are answered**, in both the GPU and deployed configurations.
+
+### 5–7 — Citations
+
+The grader drops sections that merely *mention* the right Act. After the answer streams, a code
+verifier confirms every `[S1]` resolves to packed evidence and that any quoted string is a real
+substring of its source; markers that fail are stripped and the count is reported in the panel.
+No model is involved in that check.
+
+### 8 — The diversity floor
+
+The packer guarantees at least one statute and one web source survive if both exist. Without it
+a single large government page can consume the whole budget and the actual provision never
+reaches the writer — which is the specific failure this system exists to prevent.
+
+### 9–10 — Hostile web content
+
+Crawled pages are stripped of scripts and hidden text, length-capped, and wrapped in a delimited
+block marked as data, never instructions. More fundamentally: **the model never chooses to call
+a tool.** It emits a validated plan and Python executes it. A model that cannot call tools
+cannot hallucinate a call, and a web page full of instructions cannot trigger one either.
+
+### 11 — Self-verification
+
+In deep mode the system asks itself which claims it would not want to be wrong about — fees,
+deadlines, thin support — runs up to two targeted web checks, and rewrites if what it finds
+contradicts the draft.
+
+### 12 — When the writer produces nothing
+
+A writer that fails *loudly* was always handled. A writer that returns cleanly with zero tokens
+was not: the turn completed "successfully" and left correct sources with no answer beneath them.
+It now falls back to a plain digest of the provisions found, with a notice.
+
+### 13 — Currency
+
+Answers are framed against the corpus snapshot date, `status` and `act_year` ride with every
+citation as badges, and deep mode runs an amendment check on cited Acts.
 
 ---
 
@@ -437,7 +636,7 @@ locally; on a CPU-only box it keeps the embedder local, because the corpus is ti
 
 And on a box too small for a 2.3 GB model — a free-tier `t4g.small`, say — `KYR_PROFILE=lite`
 loads **nothing at all** and runs on BM25 alone: **Recall@5 90.5% at ~60 ms in under 1 GB**,
-against 100% at ~400 ms for the full pipeline. It holds up because the keyword index covers the
+against 100% at ~400 ms for the full GPU pipeline. It holds up because the keyword index covers the
 LLM-generated *citizen questions* from the corpus build, so it is already searching the way
 people ask.
 
