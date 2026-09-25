@@ -266,6 +266,30 @@ async def main_async(args) -> int:
         print(f"  restored {config.TABLE} to version {args.restore}")
         return 0
 
+    if args.remove:
+        # For an Act that should not be in the corpus at all. Recorded with its reason in
+        # data/repair/removed.json, so the corpus's provenance stays explainable.
+        n = table.count_rows(f"act_title = '{args.remove}'")
+        if not n:
+            print(f"  no rows for {args.remove!r}")
+            return 1
+        if not args.reason:
+            print("  --remove needs --reason: a removal nobody can explain later is a bug")
+            return 1
+        before = table.version
+        table.delete(f"act_title = '{args.remove}'")
+        table.create_fts_index("embed_text", use_tantivy=False, replace=True)
+        log_path = Path("data/repair/removed.json")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        entries = json.loads(log_path.read_text(encoding="utf-8")) if log_path.exists() else []
+        entries.append({"act_title": args.remove, "rows": n, "reason": args.reason,
+                        "table_version_before": before, "date": time.strftime("%Y-%m-%d")})
+        log_path.write_text(json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"  removed {n} row(s) of {args.remove!r}; version {before} -> {table.version}")
+        print(f"  logged in {log_path}; undo with --restore {before}")
+        print("  next: python scripts/build_index.py --rebuild")
+        return 0
+
     rule(f"parse — {act_title}")
     pdf = Path(spec["pdf"])
     if not pdf.exists():
@@ -325,6 +349,8 @@ def main() -> int:
     ap.add_argument("--act", default="Right to Information Act, 2005", choices=list(ACTS))
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--restore", type=int, metavar="VERSION")
+    ap.add_argument("--remove", metavar="ACT_TITLE", help="delete an Act that should not be here")
+    ap.add_argument("--reason", help="why, recorded in data/repair/removed.json")
     return asyncio.run(main_async(ap.parse_args()))
 
 
