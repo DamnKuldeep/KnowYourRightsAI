@@ -529,6 +529,10 @@ RECALL_MIN_SHARE = env_float("KYR_RECALL_MIN_SHARE", 0.34)
 # ── web search & crawling ─────────────────────────────────────────────────────────────
 WEB_MAX_RESULTS = env_int("KYR_WEB_MAX_RESULTS", 5)
 WEB_TIMEOUT = env_float("KYR_WEB_TIMEOUT", 8.0)
+# Keyless search engines, tried in this order. ddgs's "auto" picks at random and falls through
+# slowly when one rate-limits: Brave returned 429 all afternoon and each search cost 6-8 s
+# before giving up, against 1-2 s for this list (measured, same queries).
+WEB_BACKENDS = os.environ.get("KYR_WEB_BACKENDS", "duckduckgo,yahoo,yandex")
 WEB_CACHE_TTL = env_int("KYR_WEB_CACHE_TTL", 1800)
 WEB_MAX_PER_MIN = env_int("KYR_WEB_MAX_PER_MIN", 10)
 
@@ -540,6 +544,9 @@ WIKI_TIMEOUT = env_float("KYR_WIKI_TIMEOUT", 10.0)
 # token where the same question normally takes 16. A page that has not answered in 10 s is
 # dropped, and the answer is written from the pages that did.
 CRAWL_TIMEOUT_S = env_float("KYR_CRAWL_TIMEOUT_S", 10.0)
+# The whole batch — several pages fetched together — gets this long, and keeps whatever has
+# arrived by then. A slow page costs only itself; it no longer takes the fast ones with it.
+CRAWL_BATCH_BUDGET_S = env_float("KYR_CRAWL_BATCH_BUDGET_S", 14.0)
 CRAWL_CACHE_TTL = env_int("KYR_CRAWL_CACHE_TTL", 86_400)
 CRAWL_MAX_CONCURRENT = env_int("KYR_CRAWL_MAX_CONCURRENT", 3)
 CRAWL_USE_BROWSER = env_bool("KYR_CRAWL_USE_BROWSER", True)   # escalate to Chromium when needed

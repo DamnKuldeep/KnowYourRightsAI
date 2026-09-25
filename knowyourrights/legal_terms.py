@@ -311,22 +311,156 @@ def _clean_label(raw: str) -> str:
     return f"{digits.group(1)}{digits.group(2)}" if digits else label
 
 
+@dataclass(frozen=True)
+class SectionMapping:
+    """One section of a repealed code and where its content now lives."""
+
+    code: str            # "IPC" | "CrPC" | "IEA"
+    old: str             # "420"
+    new_act: str         # "Bharatiya Nyaya Sanhita, 2023"
+    new: str             # "318"   — the section, for lookup
+    new_ref: str         # "318(4)" — what to cite, where the content is one sub-section
+    subject: str
+
+    @property
+    def note(self) -> str:
+        return (f"Section {self.old} of the {_OLD_CODE_NAMES[self.code]} is now Section "
+                f"{self.new_ref} of the {self.new_act} ({self.subject}).")
+
+
+_OLD_CODE_NAMES = {"IPC": "Indian Penal Code", "CrPC": "Code of Criminal Procedure",
+                   "IEA": "Indian Evidence Act"}
+_NEW_CODE_SHORT = {"Bharatiya Nyaya Sanhita, 2023": "BNS",
+                   "Bharatiya Nagarik Suraksha Sanhita, 2023": "BNSS",
+                   "Bharatiya Sakshya Adhiniyam, 2023": "BSA"}
+_BNS, _BNSS, _BSA = ("Bharatiya Nyaya Sanhita, 2023", "Bharatiya Nagarik Suraksha Sanhita, 2023",
+                     "Bharatiya Sakshya Adhiniyam, 2023")
+
+# The sections people actually ask about by their old number. Every entry was checked against
+# the corpus's own heading for the new section — BNS 318 is "Cheating", BNSS 482 is "Direction
+# for grant of bail to person apprehending arrest" — and tests/test_jurisdiction.py re-checks
+# them against the database, so a wrong row fails the build rather than reaching a user.
+#
+# Without this, "Section 420 IPC" was looked up as BNS Section 420 — carrying the old number
+# into the new code. That section does not exist, so the writer improvised "Section 420 of the
+# BNS", which is false. Where an old number *does* exist in the new code, the same bug would
+# have silently returned a different offence.
+_MAP_ROWS = [
+    ("IPC", "34", _BNS, "3", "3(5)", "acts done by several persons in furtherance of common intention"),
+    ("IPC", "120B", _BNS, "61", "61(2)", "criminal conspiracy"),
+    ("IPC", "153A", _BNS, "196", "196", "promoting enmity between groups"),
+    ("IPC", "279", _BNS, "281", "281", "rash driving on a public way"),
+    ("IPC", "295A", _BNS, "299", "299", "outraging religious feelings"),
+    ("IPC", "302", _BNS, "103", "103", "punishment for murder"),
+    ("IPC", "304A", _BNS, "106", "106(1)", "causing death by negligence"),
+    ("IPC", "304B", _BNS, "80", "80", "dowry death"),
+    ("IPC", "307", _BNS, "109", "109", "attempt to murder"),
+    ("IPC", "323", _BNS, "115", "115(2)", "voluntarily causing hurt"),
+    ("IPC", "354", _BNS, "74", "74", "assault to outrage a woman's modesty"),
+    ("IPC", "363", _BNS, "137", "137(2)", "kidnapping"),
+    ("IPC", "376", _BNS, "64", "64", "punishment for rape"),
+    ("IPC", "379", _BNS, "303", "303(2)", "theft"),
+    ("IPC", "406", _BNS, "316", "316(2)", "criminal breach of trust"),
+    ("IPC", "420", _BNS, "318", "318(4)", "cheating and dishonestly inducing delivery of property"),
+    ("IPC", "498A", _BNS, "85", "85", "cruelty by husband or his relatives"),
+    ("IPC", "499", _BNS, "356", "356", "defamation"),
+    ("IPC", "500", _BNS, "356", "356(2)", "punishment for defamation"),
+    ("IPC", "506", _BNS, "351", "351(2)", "criminal intimidation"),
+    ("IPC", "509", _BNS, "79", "79", "word, gesture or act to insult a woman's modesty"),
+    ("CrPC", "41", _BNSS, "35", "35", "when police may arrest without warrant"),
+    ("CrPC", "50", _BNSS, "47", "47", "grounds of arrest and right to bail"),
+    ("CrPC", "57", _BNSS, "58", "58", "not to be detained more than twenty-four hours"),
+    ("CrPC", "125", _BNSS, "144", "144", "maintenance of wives, children and parents"),
+    ("CrPC", "144", _BNSS, "163", "163", "orders in urgent cases of nuisance or apprehended danger"),
+    ("CrPC", "154", _BNSS, "173", "173", "information in cognizable cases (FIR)"),
+    ("CrPC", "156", _BNSS, "175", "175", "police power to investigate cognizable cases"),
+    ("CrPC", "167", _BNSS, "187", "187", "procedure when investigation exceeds twenty-four hours"),
+    ("CrPC", "200", _BNSS, "223", "223", "examination of complainant"),
+    ("CrPC", "436", _BNSS, "478", "478", "bail in bailable offences"),
+    ("CrPC", "437", _BNSS, "480", "480", "bail in non-bailable offences"),
+    ("CrPC", "438", _BNSS, "482", "482", "anticipatory bail"),
+    ("CrPC", "439", _BNSS, "483", "483", "special powers of High Court or Sessions Court on bail"),
+    ("CrPC", "482", _BNSS, "528", "528", "inherent powers of the High Court"),
+    ("IEA", "24", _BSA, "22", "22", "confession caused by inducement, threat or promise"),
+    ("IEA", "25", _BSA, "23", "23", "confession to a police officer"),
+    ("IEA", "32", _BSA, "26", "26", "statements of persons who are dead (dying declarations)"),
+    ("IEA", "65B", _BSA, "63", "63", "admissibility of electronic records"),
+]
+SECTION_MAP: dict[tuple[str, str], SectionMapping] = {
+    (code, old.upper()): SectionMapping(code, old, act, new, ref, subject)
+    for code, old, act, new, ref, subject in _MAP_ROWS
+}
+
+_CODE_ALIAS = (r"(?P<code>i\.?\s?p\.?\s?c\.?|indian\s+penal\s+code|cr\.?\s?p\.?\s?c\.?|"
+               r"code\s+of\s+criminal\s+procedure|i\.?e\.?a\.?|(?:indian\s+)?evidence\s+act)")
+_OLD_NUM = r"(?P<num>\d{1,3}\s?[a-z]{0,2})"
+_OLD_SECTION_RES = (
+    # "Section 420 IPC", "sec 420 of the IPC", "420 IPC", "s. 498A of the Indian Penal Code"
+    re.compile(rf"(?:\b(?:section|sec\.?|s\.)\s*)?{_OLD_NUM}\s*(?:of\s+(?:the\s+)?)?{_CODE_ALIAS}\b",
+               re.I),
+    # "IPC 420", "IPC section 302", "CrPC s. 438"
+    re.compile(rf"\b{_CODE_ALIAS}\s*(?:(?:section|sec\.?|s\.)\s*)?{_OLD_NUM}\b", re.I),
+)
+
+
+def _code_of(alias: str) -> str:
+    a = alias.lower().replace(" ", "").replace(".", "")
+    if a in ("ipc", "indianpenalcode"):
+        return "IPC"
+    if a in ("crpc", "codeofcriminalprocedure"):
+        return "CrPC"
+    return "IEA"
+
+
+def map_repealed_sections(text: str) -> tuple[list[SectionMapping], list[tuple[str, str]]]:
+    """Old-code sections named in the text: ``(mapped, unmapped)``.
+
+    ``unmapped`` lists (code, section) pairs we have no verified mapping for. Those must NOT
+    be looked up by their old number in the new code; the caller searches instead and the
+    writer is told the number is unknown.
+    """
+    mapped: list[SectionMapping] = []
+    unmapped: list[tuple[str, str]] = []
+    for pattern in _OLD_SECTION_RES:
+        for m in pattern.finditer(text or ""):
+            code = _code_of(m.group("code"))
+            num = re.sub(r"\s+", "", m.group("num")).upper()
+            hit = SECTION_MAP.get((code, num))
+            if hit and hit not in mapped:
+                mapped.append(hit)
+            elif not hit and (code, num) not in unmapped:
+                unmapped.append((code, num))
+    return mapped, unmapped
+
+
 def detect_section_refs(text: str) -> list[SectionRef]:
     """Find "Section 6 of the RTI Act" / "Article 21" style references.
 
     These get answered by exact lookup rather than similarity search — asking what a named
     provision says deserves the provision, not its nearest neighbour.
+
+    A section of a *repealed* code is translated through SECTION_MAP, never carried across by
+    number: "Section 420 IPC" is BNS 318, not BNS 420.
     """
     if not text:
         return []
-    acts = detect_acts(text)
-    act = acts[0] if acts else None
     refs: list[SectionRef] = []
+    mapped, unmapped = map_repealed_sections(text)
+    for m in mapped:
+        refs.append(SectionRef("section", m.new, m.new_act))
+    old_numbers = {m.old.upper() for m in mapped} | {num for _, num in unmapped}
+
+    acts = [a for a in detect_acts(text)
+            if not (mapped or unmapped) or a not in _NEW_CODE_SHORT]
+    act = acts[0] if acts else None
 
     for match in _ARTICLE_RE.finditer(text):
         refs.append(SectionRef("article", _clean_label(match.group(1)), "Constitution of India"))
     for match in _SECTION_RE.finditer(text):
-        refs.append(SectionRef("section", _clean_label(match.group(1)), act))
+        label = _clean_label(match.group(1))
+        if label.upper() in old_numbers:
+            continue            # an old-code number: handled above, or deliberately not guessed
+        refs.append(SectionRef("section", label, act))
 
     deduped: list[SectionRef] = []
     for ref in refs:
@@ -407,4 +541,40 @@ def territory_of(act_title: str, territory_prefixes) -> str | None:
     for prefix, place in territory_prefixes:
         if title.startswith(prefix):
             return place
+    return None
+
+
+# Cities people name instead of their state. Only the unambiguous large ones: a wrong guess
+# here would send someone to the wrong state's law.
+CITY_STATE = {
+    "mumbai": "Maharashtra", "bombay": "Maharashtra", "pune": "Maharashtra",
+    "nagpur": "Maharashtra", "thane": "Maharashtra", "new delhi": "Delhi",
+    "bengaluru": "Karnataka", "bangalore": "Karnataka", "mysuru": "Karnataka",
+    "chennai": "Tamil Nadu", "madras": "Tamil Nadu", "coimbatore": "Tamil Nadu",
+    "kolkata": "West Bengal", "calcutta": "West Bengal", "hyderabad": "Telangana",
+    "ahmedabad": "Gujarat", "surat": "Gujarat", "jaipur": "Rajasthan", "lucknow": "Uttar Pradesh",
+    "noida": "Uttar Pradesh", "ghaziabad": "Uttar Pradesh", "gurgaon": "Haryana",
+    "gurugram": "Haryana", "kochi": "Kerala", "thiruvananthapuram": "Kerala",
+    "bhopal": "Madhya Pradesh", "indore": "Madhya Pradesh", "patna": "Bihar",
+    "bhubaneswar": "Odisha", "guwahati": "Assam", "srinagar": "Jammu & Kashmir",
+    "मुंबई": "Maharashtra", "दिल्ली": "Delhi", "बेंगलुरु": "Karnataka", "कोलकाता": "West Bengal",
+    "चेन्नई": "Tamil Nadu", "लखनऊ": "Uttar Pradesh", "जयपुर": "Rajasthan", "पटना": "Bihar",
+}
+
+
+def place_named(text: str, states) -> str | None:
+    """The state or UT a message is about, if it names one or one of its big cities.
+
+    The planner flags "this depends on your state" from the topic alone, so "What does the
+    Delhi Rent Control Act say about eviction?" was answered and then asked which state the
+    user was in.
+    """
+    lowered = (text or "").lower()
+    for state in sorted(states, key=len, reverse=True):
+        names = {state.lower(), state.lower().replace("&", "and")}
+        if any(re.search(rf"(?<!\w){re.escape(n)}(?!\w)", lowered) for n in names):
+            return state
+    for city, state in CITY_STATE.items():
+        if re.search(rf"(?<!\w){re.escape(city)}(?!\w)", lowered):
+            return state
     return None

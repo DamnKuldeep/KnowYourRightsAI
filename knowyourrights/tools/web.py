@@ -55,7 +55,8 @@ def _ddg_search(query: str, n: int) -> list[dict]:
     from ddgs import DDGS
 
     with DDGS(timeout=int(config.WEB_TIMEOUT)) as client:
-        raw = client.text(query, max_results=n, region="in-en", safesearch="moderate")
+        raw = client.text(query, max_results=n, region="in-en", safesearch="moderate",
+                          backend=config.WEB_BACKENDS)
     return [
         {"title": r.get("title") or "", "url": r.get("href") or r.get("url") or "",
          "snippet": r.get("body") or ""}

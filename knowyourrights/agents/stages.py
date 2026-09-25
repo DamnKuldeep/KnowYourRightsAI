@@ -118,6 +118,10 @@ async def make_plan(message: str, history: str = "", *, forced_depth: str | None
     plan.language = legal_terms.detect_language(message)
     if not plan.normalized_query and plan.kind == "legal_question":
         plan.normalized_query = legal_terms.expand(message)
+    # A question that names its place has already answered "which state?".
+    if plan.needs_state and legal_terms.place_named(f"{message} {plan.normalized_query}",
+                                                    config.INDIAN_STATES):
+        plan.needs_state = False
     plan.steps = _clean_steps(plan.steps)
     if plan.kind == "legal_question" and not plan.sub_questions:
         plan.sub_questions = [SubQuestion(id=1, text=plan.normalized_query or message)]
@@ -135,6 +139,21 @@ async def make_plan(message: str, history: str = "", *, forced_depth: str | None
             tool="legal_db", query=plan.normalized_query or message, sub_question=1,
             reason="what the statute itself says"))
         plan.steps = plan.steps[:6]
+
+    # A how-to about a named Act always searches that Act for its deadline and its appeal.
+    # The planner is asked to, and does so only some of the time: one run of "how do I file an
+    # RTI" cited Section 7's 30-day rule, the next said "the sources do not state the response
+    # time" — with Section 7 sitting in the corpus. A portal explains the form; the Act says
+    # how long they have and what to do when they miss it, which is the part a reader needs.
+    if plan.kind == "legal_question" and plan.answer_kind in ("procedure", "mixed"):
+        acts = legal_terms.detect_acts(f"{message} {plan.normalized_query}")
+        if acts:
+            query = f"{acts[0]} time limit to decide the request and appeal if refused or no reply"
+            if not any(s.tool == "legal_db" and "appeal" in s.query.lower() for s in plan.steps):
+                plan.steps.insert(1, ResearchStep(
+                    tool="legal_db", query=query, sub_question=1,
+                    reason="the deadline and the appeal route, from the Act itself"))
+                plan.steps = plan.steps[:6]
 
     # A named provision is a lookup, not a research project — don't spend a deep budget on it.
     if plan.kind == "legal_question" and legal_terms.detect_section_refs(message) \
@@ -283,6 +302,8 @@ async def extract_procedure(question: str, items: list[Evidence], *,
     # nothing and reads as a contradiction beside an answer that names the amount.
     result.fees = result.fees if _states_a_value(result.fees, money=True) else ""
     result.timeline = result.timeline if _states_a_value(result.timeline) else ""
+    result.appeal_to = "" if _NOT_GIVEN.search(result.appeal_to or "") else result.appeal_to
+    result.documents = [d for d in result.documents if not _NOT_GIVEN.search(d)]
     return result
 
 
@@ -293,11 +314,18 @@ _NO_CHARGE = re.compile(r"\b(free|no fee|nil|no charge|exempt(ed)?)\b", re.I)
 _DURATION = re.compile(r"\d+\s*(working\s+)?(hours?|days?|weeks?|months?|years?)\b", re.I)
 
 
+# A field that says it has no value. Checked first, because the words that make a value look
+# real can sit inside one: "amount not specified in sources; free for BPL applicants is not
+# mentioned" contains "free", and was shown on the card as the fee.
+_NOT_GIVEN = re.compile(r"\bnot\s+(specified|mentioned|stated|given|provided|available|"
+                        r"found|clear)\b|\bunknown\b|\bN/A\b|उल्लेख नहीं|नहीं (दी|बताई)", re.I)
+
+
 def _states_a_value(text: str, money: bool = False) -> bool:
     """Does this field actually say something — an amount or "free" for a fee, a duration for
     a time limit — rather than pointing somewhere else for the answer?"""
     text = (text or "").strip()
-    if not text:
+    if not text or _NOT_GIVEN.search(text):
         return False
     if money:
         return bool(_AMOUNT.search(text) or _NO_CHARGE.search(text))
@@ -354,7 +382,13 @@ def normalize_markers(text: str) -> str:
                 seen.append(marker)
         return "".join(f"[{m}]" for m in seen)
 
-    return _COMPOUND_RE.sub(fix, text or "")
+    return _BLOCK_LABEL_RE.sub("", _COMPOUND_RE.sub(fix, text or ""))
+
+
+# The prompt's own block names, which the writer sometimes cites as if they were sources:
+# "…summary suit [EXTRACTED PROCEDURE][W2]" was shown to a reader verbatim.
+_BLOCK_LABEL_RE = re.compile(
+    r"\s?\[(?:EXTRACTED PROCEDURE|PROCEDURE|SOURCES?|VERIFICATION|HISTORY|CONTEXT)\]")
 
 
 _MD_LINK = re.compile(r"\[([^\[\]\n]{2,160})\]\((https?://[^\s)]+)\)")
@@ -381,8 +415,13 @@ def tidy_link_labels(text: str) -> str:
 
 
 _UNSTATED = re.compile(
-    r"\b(not|isn't|is not|are not)\s+(explicitly\s+|clearly\s+)?"
-    r"(stated|mentioned|specified|given|provided|available|found)\b.{0,40}\b(sources?|documents?)\b",
+    # "not stated in the sources" and "the sources do not state" — the model uses both, and the
+    # first version of this only knew the first, so the second came straight back.
+    r"(\b(not|isn't|is not|are not)\s+(explicitly\s+|clearly\s+)?"
+    r"(stated|mentioned|specified|given|provided|available|found)\b.{0,40}\b(sources?|documents?)\b"
+    r"|\b(sources?|documents?)\b.{0,30}\b(do|does|did)\s+not\s+"
+    r"(state|mention|specify|say|provide|include|cover|give)\b"
+    r"|स्रोत\S*\s.{0,90}नहीं)",
     re.I)
 
 
@@ -394,14 +433,68 @@ def drop_unstated_lines(text: str) -> str:
     when the reader's actual problem is that we did not find it. Only short labelled or list
     lines are removed; a sentence of real prose that happens to mention sources is kept.
     """
-    kept = []
+    kept: list[str] = []
+    heading_at = None            # index in `kept` of the current section's heading
+    listed = dropped = 0         # list lines seen / removed in that section
+    emptied: set[int] = set()    # headings whose every list line was removed
+
+    def close_section():
+        if heading_at is not None and listed and dropped == listed:
+            emptied.add(heading_at)
+
     for line in (text or "").splitlines():
         stripped = line.strip()
-        is_list_or_label = bool(re.match(r"^([-*•]|\d+[.)])\s+|^\*\*[^*]{1,40}:?\*\*", stripped))
-        if is_list_or_label and len(stripped) < 180 and _UNSTATED.search(stripped):
+        if _HEADING.match(stripped):
+            close_section()
+            heading_at, listed, dropped = len(kept), 0, 0
+            kept.append(line)
             continue
+        is_list_or_label = bool(re.match(r"^([-*•]|\d+[.)])\s+|^\*\*[^*]{1,40}:?\*\*", stripped))
+        if is_list_or_label:
+            listed += 1
+            if len(stripped) < 180 and _UNSTATED.search(stripped):
+                dropped += 1
+                continue
         kept.append(line)
-    return "\n".join(kept)
+    close_section()
+    # Dropping every "Fee: not stated in the sources" line left a Mumbai deposit answer ending
+    # on a bare "What it costs and how long" heading with nothing under it.
+    out = "\n".join(line for i, line in enumerate(kept) if i not in emptied)
+    return re.sub(r"\n{3,}", "\n\n", out) if emptied else out
+
+
+_HEADING = re.compile(r"^(#{1,6}\s+\S.*|\*\*[^*]{1,80}\*\*:?)$")
+
+
+_STATE_QUESTION = {
+    "en": "Which state is this in? The rules here differ from state to state — tell me, or set "
+          "your state above, and I can point you to the exact law and authority.",
+    "hi": "यह मामला किस राज्य का है? इस विषय के नियम हर राज्य में अलग हैं — राज्य बताइए या ऊपर "
+          "चुनिए, तो मैं सही कानून और प्राधिकरण बता सकूँगा।",
+    "hinglish": "Yeh kis state ka mamla hai? Is par rules har state mein alag hain — state "
+                "bataiye ya upar select kijiye, toh main sahi law aur authority bata sakta hoon.",
+}
+
+# The answer already asks for the state if its closing lines mention one and end in a question.
+# Markdown and citation markers may follow the "?": "**आप किस राज्य में रहते हैं?**" was missed,
+# and the reader was asked twice.
+_ASKS_STATE = re.compile(r"(state|राज्य|rajya)[^\n]{0,160}\?(\s*\[[SGW]\d+\])*[\s*_)]*$", re.I)
+
+
+def state_question(answer: str, plan, state: str | None) -> str:
+    """The follow-up to append when the answer depends on a state nobody has named.
+
+    The writer is told to ask, and asks only some of the time: a Hindi deposit question with
+    "All India" selected came back routed to the National Consumer Helpline, with no word that
+    tenancy law is made by each state. Returns "" when no question is needed.
+    """
+    if state or not getattr(plan, "needs_state", False):
+        return ""
+    tail = (answer or "").rstrip()[-400:]
+    if _ASKS_STATE.search(tail):
+        return ""
+    language = getattr(plan, "language", "en")
+    return "\n\n" + _STATE_QUESTION.get(language, _STATE_QUESTION["en"])
 
 
 def verify_citations(answer: str, items: list[Evidence]) -> tuple[str, list[str], int]:

@@ -270,7 +270,16 @@ class Crawler:
         crawler = await (self._get_browser() if browser else self._get_http())
         if crawler is None:
             return []
-        run_config = self._run_config(query)
+        # Streamed, and whatever has arrived when the budget runs out is kept.
+        #
+        # This used to wait for the whole batch and return nothing on a timeout. With a 70 s
+        # backstop that meant slow answers; cut to 18 s it meant *empty* ones — in a 15-question
+        # UI run the batch timed out 27 times, each time discarding the pages that had loaded
+        # in the first few seconds, and a turn then waited again for the browser pass to do the
+        # same. Collecting results as they complete makes a slow page cost only itself.
+        run_config = self._run_config(query, stream=True)
+        via = "browser" if browser else "http"
+        pages: list[Page] = []
         try:
             from crawl4ai import MemoryAdaptiveDispatcher
 
@@ -278,29 +287,22 @@ class Crawler:
                 memory_threshold_percent=88.0,
                 max_session_permit=config.CRAWL_MAX_CONCURRENT,
             )
-            # Each page already carries its own page_timeout, so this is only a backstop for a
-            # hung dispatcher. It was CRAWL_TIMEOUT_S * 2 + 20 — seventy seconds — and because a
-            # batch timeout returns nothing, one stuck page discarded every page that had
-            # already loaded. A small margin over the per-page limit is all it needs.
-            results = await asyncio.wait_for(
-                crawler.arun_many(urls=urls, config=run_config, dispatcher=dispatcher),
-                timeout=config.CRAWL_TIMEOUT_S + 8,
-            )
-        except asyncio.TimeoutError:
-            self.failures += len(urls)
-            log.warning("crawl timed out for %d url(s)", len(urls))
-            return []
+            async with asyncio.timeout(config.CRAWL_BATCH_BUDGET_S):
+                stream = await crawler.arun_many(urls=urls, config=run_config,
+                                                 dispatcher=dispatcher)
+                async for result in stream:
+                    page = self._to_page(result, via=via)
+                    if page:
+                        pages.append(page)
+        except TimeoutError:
+            missed = len(urls) - len(pages)
+            self.failures += missed
+            log.info("crawl budget of %.0fs reached: kept %d page(s), gave up on %d",
+                     config.CRAWL_BATCH_BUDGET_S, len(pages), missed)
         except Exception as exc:
-            self.failures += len(urls)
-            log.warning("crawl failed (%s): %s", "browser" if browser else "http", str(exc)[:160])
-            return []
-
-        via = "browser" if browser else "http"
-        pages = []
-        for result in results or []:
-            page = self._to_page(result, via=via)
-            if page:
-                pages.append(page)
+            self.failures += len(urls) - len(pages)
+            log.warning("crawl failed (%s): %s — keeping %d page(s) already read",
+                        via, str(exc)[:160], len(pages))
         return pages
 
     # ── navigation ───────────────────────────────────────────────────────────────────

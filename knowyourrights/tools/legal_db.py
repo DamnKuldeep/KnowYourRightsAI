@@ -11,6 +11,7 @@ Three entry points, because three different questions deserve three different me
 from __future__ import annotations
 
 import logging
+import re
 
 from .. import config, legal_terms
 from ..evidence import Evidence, from_hit
@@ -125,7 +126,42 @@ def corpus_notes(question: str) -> list[str]:
     notes = list(legal_terms.detect_gaps(question))
     for repeal in legal_terms.detect_repeals(question):
         notes.append(repeal.note)
+    # The section-level translation, stated outright. Knowing the IPC became the BNS is not
+    # enough — the writer then assumed Section 420 kept its number and cited a BNS section that
+    # does not exist.
+    mapped, unmapped = legal_terms.map_repealed_sections(question)
+    for m in mapped:
+        notes.append(m.note)
+    for code, num in unmapped:
+        notes.append(f"Section {num} of the old {code} has no verified equivalent here. The "
+                     f"numbering changed in the new code, so the matching section could not be "
+                     f"confirmed.")
+    if _TENANCY.search(question or ""):
+        notes.append(TENANCY_NOTE)
     return notes
+
+
+# Notes are shown to the reader, so they state facts, not instructions to the writer: an
+# "IPC 420 is BNS 318 — never cite the old number" note was copied into the answer verbatim.
+TENANCY_NOTE = ("Tenancy is governed by each state's own rent law. The Model Tenancy Act, 2021 "
+                "is a template the Centre issued for states to adopt; it is not in force in a "
+                "state unless that state has enacted it.")
+# The writer gets the same fact as an instruction: given the reader's wording, it pasted the
+# note into a Delhi eviction answer word for word.
+WRITER_VERSION = {
+    TENANCY_NOTE: ("The Model Tenancy Act, 2021 is a model law, in force only where a state has "
+                   "enacted it. Never say it applies centrally or in a state unless a source "
+                   "shows that state enacted it. Mention it only if the answer relies on it."),
+}
+
+
+def for_writer(notes: list[str]) -> list[str]:
+    return [WRITER_VERSION.get(n, n) for n in notes]
+
+
+# A Mumbai deposit answer said the Model Tenancy Act "applies centrally", from a web page.
+_TENANCY = re.compile(r"\b(landlord|tenant|tenancy|rent(ed|al)?|lease|security deposit|"
+                      r"kiraye?dar|makaan malik|model tenancy)\b|किराय|मकान मालिक", re.I)
 
 
 def snapshot() -> dict:

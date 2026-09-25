@@ -288,3 +288,124 @@ def test_the_2019_jk_change_travels_with_the_source():
                   text="It extends to the whole of India except the State of Jammu and Kashmir.")
     assert ev.caveats and "2019" in ev.caveats[0]
     assert ev.to_public()["caveats"] == ev.caveats
+
+
+# ── rules the model follows only sometimes, moved into code ───────────────────────────
+def test_procedure_about_an_act_always_searches_its_deadline_and_appeal(monkeypatch):
+    """Regression: one RTI how-to cited the 30-day rule; the next, with the planner skipping
+    the statute, said "the sources do not state the response time"."""
+    from knowyourrights.agents import stages
+    from knowyourrights.agents.schemas import Plan, ResearchStep
+
+    planned = Plan(kind="legal_question", answer_kind="procedure",
+                   normalized_query="how to file an RTI application",
+                   steps=[ResearchStep(tool="web", query="rti online portal")])
+
+    class Client:
+        async def chat_json(self, *args, **kwargs):
+            return planned.model_copy(deep=True)
+
+    monkeypatch.setattr(stages, "get_client", lambda: Client())
+    plan = asyncio.run(stages.make_plan("How do I file an RTI?"))
+    statute = [s.query for s in plan.steps if s.tool == "legal_db"]
+    assert any("appeal" in q and "Right to Information" in q for q in statute), statute
+
+    planned.answer_kind = "rights"
+    plan = asyncio.run(stages.make_plan("Can police arrest me at night?"))
+    assert not any("appeal" in s.query for s in plan.steps)
+
+
+def test_state_question_is_appended_when_the_answer_depends_on_it():
+    """Regression: a Hindi deposit question with All India selected was routed to the National
+    Consumer Helpline with no word that tenancy law is made by each state."""
+    from knowyourrights.agents.stages import state_question
+    from knowyourrights.agents.schemas import Plan
+
+    plan = Plan(needs_state=True, language="hi")
+    assert "राज्य" in state_question("जमा राशि वापस पाने के लिए…", plan, None)
+    assert state_question("…", plan, "Kerala") == ""
+    plan.language = "en"
+    assert state_question("Which state is your flat in?", plan, None) == ""
+    assert state_question("**Which state is your flat in?**", plan, None) == ""
+    assert state_question("Which state are you in? [S1]\n", plan, None) == ""
+    assert "Which state" in state_question("Send a legal notice.", plan, None)
+    plan.needs_state = False
+    assert state_question("Send a legal notice.", plan, None) == ""
+
+
+def test_unstated_lines_are_dropped_but_real_lines_kept():
+    from knowyourrights.agents.stages import drop_unstated_lines
+    text = ("- **Fee:** ₹10\n"
+            "- **Response time:** The sources do not state the response time.\n"
+            "- Your sources do not state the fee.\n"
+            "- The PIO must reply within 30 days [2].")
+    kept = drop_unstated_lines(text)
+    assert "₹10" in kept and "30 days" in kept
+    assert "do not state" not in kept
+
+
+def test_a_heading_left_empty_by_the_filter_is_removed():
+    from knowyourrights.agents.stages import drop_unstated_lines
+    text = ("Send a legal notice first [W1].\n\n**What it costs and how long**\n\n"
+            "- **Fee:** The sources do not state the court fee.\n"
+            "- **Response time:** Not stated in the provided sources.")
+    assert "What it costs" not in drop_unstated_lines(text)
+    kept = drop_unstated_lines("**Steps**\n\n- File online [G1].")
+    assert "**Steps**" in kept
+
+
+def test_a_named_place_answers_which_state():
+    """Regression: the Delhi Rent Control Act question was answered and then asked which
+    state the user was in."""
+    from knowyourrights import config, legal_terms
+    place = lambda t: legal_terms.place_named(t, config.INDIAN_STATES)   # noqa: E731
+    assert place("What does the Delhi Rent Control Act say about eviction?") == "Delhi"
+    assert place("My landlord in Mumbai won't return my deposit") == "Maharashtra"
+    assert place("Jammu and Kashmir land law") == "Jammu & Kashmir"
+    assert place("How do I file an RTI?") is None
+    assert place("goals for a legal notice") is None
+
+
+def test_hindi_unstated_line_is_dropped():
+    from knowyourrights.agents.stages import drop_unstated_lines
+    text = ("- **शुल्क:** ₹10\n"
+            "- **प्रतिक्रिया समय:** स्रोतों में अधिकारी द्वारा प्रतिक्रिया देने की कोई विशिष्ट "
+            "समय सीमा नहीं बताई गई है।")
+    kept = drop_unstated_lines(text)
+    assert "₹10" in kept and "स्रोतों" not in kept
+
+
+def test_prompt_block_names_are_not_left_as_citations():
+    from knowyourrights.agents.stages import normalize_markers
+    out = normalize_markers("File a summary suit [EXTRACTED PROCEDURE][W2]. Pay ₹10 [G1].")
+    assert "EXTRACTED" not in out and "[W2]" in out and "[G1]" in out
+
+
+def test_source_card_does_not_show_writer_notes():
+    """Regression: Delhi Act cards read "[DELHI ONLY — … Do not present it as all-India law.]"."""
+    from knowyourrights.evidence import Evidence
+    e = Evidence(kind="statute", title="Section 14", text=(
+        "[DELHI ONLY — Parliament passed this for Delhi. Do not present it as all-India law.]\n"
+        "14. Protection of tenant against eviction."))
+    assert e.to_public()["snippet"].startswith("14. Protection")
+
+
+def test_reference_to_a_repealed_code_is_corrected():
+    """Regression: a domestic-violence answer said its proceedings "are governed by the Code of
+    Criminal Procedure, 1973", quoting Section 28 of the PWDVA."""
+    from knowyourrights.evidence import Evidence
+    e = Evidence(kind="statute", title="Section 28", act_title="Protection of Women from "
+                 "Domestic Violence Act, 2005", text="governed by the provisions of the Code of "
+                 "Criminal Procedure, 1973 (2 of 1974)")
+    assert any("Bharatiya Nagarik Suraksha Sanhita" in c for c in e.caveats)
+
+
+def test_card_fields_that_say_they_are_empty_are_dropped():
+    """Regression: the deep-mode card read "Fee: amount not specified in sources; free for BPL
+    applicants is not mentioned" (it contains "free") and "Appeal to: Not specified"."""
+    from knowyourrights.agents.stages import _states_a_value, _NOT_GIVEN
+    assert not _states_a_value("Application fee (amount not specified in sources); free for "
+                               "BPL applicants is not mentioned.", money=True)
+    assert _states_a_value("₹10; free for BPL applicants", money=True)
+    assert _NOT_GIVEN.search("Not specified in the provided sources.")
+    assert not _NOT_GIVEN.search("First Appellate Authority, National Consumer Commission")

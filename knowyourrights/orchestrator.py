@@ -323,8 +323,15 @@ class Orchestrator:
             elif turn.evidence:
                 emit(events.stage("grade", "Checking which sources are actually relevant"))
                 before = len(turn.evidence)
+                # A how-to answer always has a fee / response-time / if-refused section, so
+                # its sources are graded against that too. Graded against "how do I file an
+                # RTI" alone, Section 19 (the appeal) was retrieved and then thrown out.
+                graded_for = plan.normalized_query or turn.message
+                if plan.answer_kind in ("procedure", "mixed"):
+                    graded_for += (" (the answer also covers the fee, the deadline to reply, "
+                                   "and the appeal if refused or not answered)")
                 turn.evidence = await stages.grade(
-                    plan.normalized_query or turn.message, turn.evidence,
+                    graded_for, turn.evidence,
                     deadline=turn.budget.deadline, on_pause=on_pause, session=turn.session_id)
                 assign_ids(turn.evidence)
                 emit(events.stage("grade", "Checking which sources are actually relevant",
@@ -525,7 +532,8 @@ class Orchestrator:
         items = assign_ids(dedupe(turn.evidence))
 
         history = conversation.history_block(600)
-        context = prompts.writer_context(plan, conversation.state, turn.notes,
+        context = prompts.writer_context(plan, conversation.state,
+                                         legal_db.for_writer(turn.notes),
                                          stages.today_str())
         reserved = ctx_budget.estimate_tokens(history + context + turn.message) + 200
         packed = packer.pack(items, ctx_budget.Budget.for_writer(), reserved_tokens=reserved)
@@ -550,7 +558,8 @@ class Orchestrator:
         sources_block = packed.text or packer.render_empty_note(turn.notes)
         procedure_block = ""
         if turn.procedure is not None:
-            procedure_block = ("\n\nEXTRACTED PROCEDURE (from the official sources above):\n"
+            procedure_block = ("\n\nEXTRACTED PROCEDURE (a summary of the sources above, not a "
+                               "source itself — cite the ids it came from, never this block):\n"
                                + turn.procedure.model_dump_json(indent=None))
 
         # On a revision pass the fact-check results ride along, so the model corrects its own
@@ -646,6 +655,12 @@ class Orchestrator:
             return
 
         cleaned, unsupported, verified = stages.verify_citations(answer, packed.included)
+        follow_up = stages.state_question(cleaned, plan, conversation.state)
+        if follow_up:
+            if not revision and cleaned == answer:
+                emit_token(follow_up)
+            cleaned += follow_up
+            answer += follow_up
         if revision:
             # Sources first, so every chip in the new text resolves the moment it appears.
             emit(events.sources_final(packed.included))

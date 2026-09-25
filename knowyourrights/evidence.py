@@ -60,6 +60,20 @@ def tier_for_url(url: str) -> int:
 # "extends to the whole of India except the State of Jammu and Kashmir" — true of many central
 # Acts as enacted, and repealed as to that exception in 2019.
 _JK_EXCEPTION = re.compile(r"except\s+the\s+State\s+of\s+Jammu\s+and\s+Kashmir", re.I)
+_REPEALED_CODES = (
+    (re.compile("Code of Criminal Procedure, 1973"), "Bharatiya Nagarik Suraksha Sanhita, 2023"),
+    (re.compile("Indian Penal Code"), "Bharatiya Nyaya Sanhita, 2023"),
+    (re.compile("Indian Evidence Act, 1872"), "Bharatiya Sakshya Adhiniyam, 2023"),
+)
+# Acts that were passed but never brought into force, which the corpus lists as "in force".
+_NEVER_NOTIFIED = {
+    "Delhi Rent Act, 1995": ("Not in force: this Act received assent in 1995 but was never "
+                             "notified. Tenancies in Delhi are still governed by the Delhi Rent "
+                             "Control Act, 1958."),
+}
+# Notes that search() prefixes to a section's text for the writer ("[DELHI ONLY — … Do not
+# present it as all-India law.]"). They are instructions, and the card already carries a badge.
+_WRITER_NOTE = re.compile(r"^(\[[A-Z][^\]\n]{3,300}\]\s*\n?)+")
 
 
 @dataclass
@@ -177,6 +191,16 @@ class Evidence:
             notes.append("Out of date: the \"except the State of Jammu and Kashmir\" wording was "
                          "removed by the Jammu and Kashmir Reorganisation Act, 2019. Central "
                          "Acts now apply in Jammu & Kashmir and Ladakh.")
+        # A domestic-violence answer said its proceedings "are governed by the Code of Criminal
+        # Procedure, 1973", because Section 28 of that Act still says so. The old codes are
+        # repealed, and a reference to one now reads as a reference to its replacement.
+        for old_code, new_code in _REPEALED_CODES:
+            if old_code.search(self.text or "") and old_code.pattern not in (self.act_title or ""):
+                notes.append(f"Out of date: this section refers to the {old_code.pattern}, "
+                             f"which was repealed on 1 July 2024. The reference now reads as "
+                             f"the {new_code}.")
+        if self.act_title in _NEVER_NOTIFIED:
+            notes.append(_NEVER_NOTIFIED[self.act_title])
         return notes
 
     def to_public(self) -> dict:
@@ -189,10 +213,10 @@ class Evidence:
             "title": self.label(),
             "url": self.url,
             "domain": self.domain,
-            "snippet": self.text[:320].strip(),
+            "snippet": _WRITER_NOTE.sub("", self.text or "")[:320].strip(),
             "score": round(self.score, 3),
             "citation": self.citation,
-            "status": self.status,
+            "status": "not_in_force" if self.act_title in _NEVER_NOTIFIED else self.status,
             "effective_date": self.effective_date,
             "state": self.state,
             "union_territory": self.union_territory,

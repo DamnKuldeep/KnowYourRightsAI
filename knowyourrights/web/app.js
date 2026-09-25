@@ -245,6 +245,7 @@ function renderSources() {
 
     if (s.status === 'in_force') badges.push('<span class="badge force">in force</span>');
     if (s.status === 'omitted') badges.push('<span class="badge omitted">omitted</span>');
+    if (s.status === 'not_in_force') badges.push('<span class="badge omitted">not in force</span>');
     if (s.effective_date) badges.push(`<span class="badge">from ${esc(s.effective_date)}</span>`);
     if (s.category) badges.push(`<span class="badge">${esc(s.category)}</span>`);
 

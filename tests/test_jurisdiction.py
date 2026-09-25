@@ -136,3 +136,50 @@ def test_rerank_calibration_is_keyed_to_the_document_format(monkeypatch):
     with_q = r.model_name
     monkeypatch.setattr(config, "RERANK_WITH_QUESTIONS", False)
     assert with_q != r.model_name, "a threshold must not be shared across document formats"
+
+
+# ── old-code section numbers ──────────────────────────────────────────────────────────
+@pytest.mark.parametrize("question,new_act,new_section", [
+    ("What is the punishment under Section 420 IPC?", "Bharatiya Nyaya Sanhita, 2023", "318"),
+    ("IPC 302 kya hai", "Bharatiya Nyaya Sanhita, 2023", "103"),
+    ("section 498A of the Indian Penal Code", "Bharatiya Nyaya Sanhita, 2023", "85"),
+    ("anticipatory bail under 438 CrPC", "Bharatiya Nagarik Suraksha Sanhita, 2023", "482"),
+    ("Section 65B Evidence Act certificate", "Bharatiya Sakshya Adhiniyam, 2023", "63"),
+])
+def test_repealed_sections_map_to_their_new_numbers(question, new_act, new_section):
+    """Regression: "Section 420 IPC" was looked up as BNS 420, and the writer then invented
+    "Section 420 of the BNS". The number changes; it must be translated, not carried."""
+    refs = legal_terms.detect_section_refs(question)
+    assert [(r.act, r.label) for r in refs] == [(new_act, new_section)]
+
+
+def test_an_unmapped_old_section_is_never_guessed():
+    refs = legal_terms.detect_section_refs("what is section 999 IPC")
+    assert refs == [], "no verified mapping means no lookup — not BNS 999"
+    _, unmapped = legal_terms.map_repealed_sections("what is section 999 IPC")
+    assert unmapped == [("IPC", "999")]
+
+
+def test_every_mapping_matches_the_corpus_heading():
+    """Each row was checked by hand against the new section's heading; this re-checks it
+    against the live database so a wrong row fails the build instead of reaching a user."""
+    import lancedb
+    db = lancedb.connect(str(config.DB_PATH)).open_table(config.TABLE)
+    df = db.search().where("source_type = 'criminal_code'").limit(5000).select(
+        ["act_title", "section_label", "section_name"]).to_pandas()
+    headings = {(r.act_title.split(" (")[0].strip(), str(r.section_label)): str(r.section_name).lower()
+                for r in df.itertuples()}
+    # a word from the subject that must appear in the corpus heading of the new section
+    must = {"318": "cheat", "103": "murder", "64": "rape", "85": "cruelty", "80": "dowry",
+            "482": "apprehending arrest", "173": "cognizable", "63": "electronic", "58": "twenty-four",
+            "35": "without warrant", "109": "attempt to murder", "316": "breach of trust"}
+    for m in legal_terms.SECTION_MAP.values():
+        key = (m.new_act, m.new)
+        assert key in headings, f"{m.code} {m.old} -> {m.new_act} {m.new}: not in corpus"
+        if m.new in must:
+            assert must[m.new] in headings[key], f"{m.new}: heading is {headings[key]!r}"
+
+
+def test_old_section_numbers_never_become_new_code_citations():
+    from knowyourrights.agents import prompts
+    assert "Section 420 IPC is Section 318 BNS" in " ".join(prompts.WRITER.split())

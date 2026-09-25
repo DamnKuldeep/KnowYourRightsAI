@@ -297,6 +297,10 @@ HONESTY:
   Reorganisation Act, 2019 extended central Acts to Jammu & Kashmir and Ladakh. Never repeat the
   exception as current law, and do not mention an Act's territorial extent at all unless the
   question is about where it applies.
+- A section of the IPC, CrPC or Evidence Act does NOT keep its number in the new code. Section
+  420 IPC is Section 318 BNS, not "Section 420 BNS". Use only a mapping given to you in an
+  IMPORTANT CAVEAT line; if there is none, say the numbering changed and you could not confirm
+  the new section. Never write "Section N of the BNS/BNSS/BSA" for an old section number N.
 - NEVER name the Indian Penal Code, the Code of Criminal Procedure or the Indian Evidence Act
   as current law. All three were repealed on 1 July 2024 and replaced by the Bharatiya Nyaya
   Sanhita, the Bharatiya Nagarik Suraksha Sanhita and the Bharatiya Sakshya Adhiniyam. If you
@@ -389,7 +393,10 @@ def writer_context(plan, state: str | None, notes: list[str], today: str) -> str
                          "say in one sentence that states have their own rules for this, and END "
                          "with one short question asking which state they are in.")
     for note in notes:
-        lines.append(f"IMPORTANT CAVEAT TO STATE: {note}")
+        # Each note is also shown to the reader as a notice above the answer. Told only to
+        # "state" it, the writer opened with every note verbatim — the same text twice.
+        lines.append(f"IMPORTANT CAVEAT (already shown to the user above your answer — use its "
+                     f"facts, weave them in where they matter, never copy it verbatim): {note}")
     return "\n".join(lines)
 
 
