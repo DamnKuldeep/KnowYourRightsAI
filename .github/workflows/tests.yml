@@ -17,9 +17,9 @@ jobs:
     steps:
       # The corpus is stored with Git LFS and is not fetched here: the suite needs no network,
       # no API key and no corpus. The one test that checks the live corpus skips itself.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
