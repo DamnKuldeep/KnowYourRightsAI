@@ -1,0 +1,120 @@
+# Changelog
+
+All notable changes, newest first. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+## [1.0.0] — 2026-09-26
+
+A codebase audit and restructure for public deployment. Retrieval quality is unchanged
+(Recall@5 100%, MRR 0.929, 11/11 stress, 4/4 exact), re-measured after the restructure.
+
+### Added
+- **Admission control.** At most five answers are researched at once; later questions wait in
+  a first-come queue and the reader sees their place in line. The queue, each wait and each
+  client's share are bounded.
+- **Usage limits.** A $1 allowance per client (IP address, stored only as a salted hash), a
+  per-client rate limit and a $5 daily ceiling for the whole service. When an allowance is used
+  up the reader gets a popup and the input is disabled. Remaining allowance shows in the footer.
+- **Per-turn cost tracking.** Every billed call charges the turn that made it, so concurrent
+  turns each report their own exact cost.
+- **Degradation notices.** The reader is told when search ran without embeddings or without the
+  reranker, when the planner or grader was unavailable, and when the writer could not be reached.
+- **Clear fatal errors.** A rejected API key or a missing provider ends the turn with a message
+  saying so; unexpected failures show a reference instead of internals.
+- Endpoints: `/api/config`, `/api/quota`, and `/api/status` (diagnostics, admin only).
+- Security headers on every response, including a Content-Security-Policy.
+- `scripts/ask.py` (terminal client), `scripts/evaluate.py --degraded` (outage modes),
+  `scripts/calibrate.py --method fusion|keywords|rerank --ship`, `scripts/verify_embeddings.py`,
+  and `scripts/build_index.py --prune` (removes superseded corpus versions).
+- Calibrated thresholds ship in the package (`knowyourrights/thresholds.json`).
+- `pyproject.toml` with ruff and pytest configuration; `requirements-dev.txt`; lint in CI.
+- `ARCHITECTURE.md`, `EVALUATION.md` and this changelog, rewritten or new.
+
+### Changed
+- **API-only models.** Local embedding and reranking, GPU profiles and resource probing are
+  removed. No torch, transformers or GPU dependency remains, no model weights are downloaded
+  (previously ~2.3 GB at first start), and the container's memory limit drops from 3.5 GB to
+  1.5 GB. The image is 1.9 GB without Chromium and 3.4 GB with it.
+- The orchestrator, server, LLM client, crawler, agent stages and search were split into focused
+  modules (`orchestrator/`, `server/`, `llm/failures.py`, `llm/streaming.py`, `tools/navigate.py`,
+  `agents/planning.py`, `agents/answer_text.py`, `retrieval/ranking.py`, …). No function is longer
+  than 30 lines.
+- Error types are provider-neutral: `LLMClient`, `LLMError`, `DeadlineExceeded`,
+  `ModelUnavailable`, `ProviderAuthError`.
+- Stages raise model failures instead of silently returning defaults; the orchestrator decides
+  which stages the turn can survive without.
+- Real environment variables now take precedence over `.env`.
+- Scripts consolidated: benchmark, report, probe and `try_*` scripts replaced by `ask.py` and
+  `evaluate.py`; `race_openrouter.py` renamed `race_models.py`.
+- Tests reorganised by module (221 tests, ~10 s, down from ~75 s).
+
+### Fixed
+- Choosing **All India** after a state was ignored; the old state stayed in effect.
+- A writer failure on a model shared by two roles fell back to the other role's next model.
+- Calibrated thresholds lived only in the uncommitted runtime directory, so fresh deployments
+  used defaults that dropped valid citations.
+- Keyword-only retrieval had no calibration and refused no off-topic question on its own scores.
+- The context packer trimmed shared sources in place, shortening them for later turns, and could
+  pack a trimmed copy alongside its original; its trim ignored the block header and could fail.
+- Each conversation's source pool grew without bound.
+- The free tier's daily count was never restored on restart.
+- The usage log was written to the real runtime directory by the test suite, and never rotated.
+- Expired cache entries were never deleted; the cache is now purged hourly.
+- Two turns in one conversation could interleave; a new question now stops the running one.
+- Background tasks were not held or cancelled at shutdown; the retrieval client and cache were
+  never closed. Startup and shutdown now use a lifespan handler.
+- Rate-limit buckets carried over between tests, slowing the suite.
+- The mode explainer described a query-rewriting step that only deep mode runs.
+- Duplicate dictionary keys, unused imports and dead functions removed.
+
+### Security
+- **Server-side request forgery:** the crawler now fetches only public http(s) addresses,
+  checking every resolved IP and each page's final URL after redirects. A URL in a question could
+  previously make the server fetch cloud metadata or its own endpoints.
+- The selected state is validated against the known list (it is written into the prompt); every
+  request field is length-bounded; session ids are restricted to safe characters.
+- Feedback submissions are bounded and rate-limited.
+- Source and portal links in the UI must be http(s).
+- Diagnostics moved off the public health endpoint.
+- The Act-repair script quotes SQL values and verifies TLS unless explicitly told otherwise.
+
+### Removed
+- AWS deployment scripts and guide (`deploy/`, `DEPLOY_AWS.md`).
+- Superseded corpus versions (old indices and manifests, ~108 MB), pruned without rewriting
+  the data files; retrieval re-measured identical afterwards.
+- The `02_The_Chatbot` prototype notebook, and two unused corpus build artefacts
+  (`chunks_metadata.parquet`, `enrichment_cache.json`) that notebook 01 regenerates.
+
+## [0.3.0] — 2026-09-25
+
+### Changed
+- Chat, embeddings and reranking moved to OpenRouter; NVIDIA NIM kept as chat failover.
+- Model routing measured on the real prompts; a reliable paid model leads the writer role.
+
+### Added
+- Deterministic rules for what the planner did only sometimes: always search the statute, search
+  a named Act's deadline and appeal, and ask which state when the answer depends on it.
+- Old criminal-code sections mapped to the 2023 codes through a verified table.
+- Corrections carried with sources: the 2019 Jammu & Kashmir change, references to repealed
+  codes, an Act never brought into force.
+- A 15-question browser sweep with screenshots (`scripts/ui_check.py`).
+
+### Fixed
+- Answers cutting off, repeating, or assuming a state when All India was selected.
+- The deep-mode rewrite streaming over the draft.
+- The RTI Act rebuilt from its official text; a foreign Act filed as Indian law removed.
+
+## [0.2.0] — 2026-09-04
+
+### Added
+- Vector index, two model providers with failover, deep-mode self-verification, jurisdiction
+  labels, a two-tier safety gate, Docker, and a published evaluation.
+
+### Security
+- An SSH private key committed by mistake was removed and the history rewritten.
+
+## [0.1.0] — 2026-08-23
+
+### Added
+- The first version: a legal research agent over the corpus of Indian central law, with the
+  corpus shipped through Git LFS.

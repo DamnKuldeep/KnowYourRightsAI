@@ -8,10 +8,9 @@ is rate-limited. High precision by construction: the phrasings are literal.
 
 **Tier 2 — meaning.** Patterns cannot generalise, and paraphrase is exactly what people produce
 under stress: *"my partner keeps hurting me and I'm scared to go home"* matches nothing in tier
-one. So the message is compared against curated exemplars of each kind of crisis using the
-embedder that is already loaded — the corpus is embedded with bge-m3, it is multilingual, and
-the query is embedded again moments later for retrieval where the cache serves it for free. The
-practical added cost of this tier is one cache miss, once per turn.
+one. So the message is compared against curated exemplars of each kind of crisis with the same
+multilingual bge-m3 embeddings retrieval uses. The added cost is one embedding call per turn,
+run alongside the planner rather than in front of it.
 
 **The guard that makes tier 2 usable.** *"what is the punishment for rape"* is semantically very
 close to a report of rape, and firing a helpline card at someone reading about the law is not a
@@ -187,26 +186,40 @@ def check_patterns(message: str) -> SafetyCheck:
 
 
 async def _exemplar_matrix(embedder):
-    """Embed the exemplars once. ~30 short strings, so this is a one-off of well under a second."""
+    """Embed the exemplars once: ~30 short strings. None if the embedder cannot answer."""
     global _exemplar_cache
     if _exemplar_cache is not None:
         return _exemplar_cache
+    kinds = [kind for kind, examples in CRISIS_EXEMPLARS.items() for _ in examples]
+    texts = [text for examples in CRISIS_EXEMPLARS.values() for text in examples]
+    vectors = await embedder.encode(texts)
+    if vectors is None:
+        return None
+    _exemplar_cache = (kinds, _unit_rows(vectors))
+    return _exemplar_cache
+
+
+def _unit_rows(vectors):
+    """Rows scaled to unit length, so a dot product is the cosine for any embedder."""
     import numpy as np
 
-    kinds: list[str] = []
-    texts: list[str] = []
-    for kind, examples in CRISIS_EXEMPLARS.items():
-        for text in examples:
-            kinds.append(kind)
-            texts.append(text)
-    vectors = await embedder.encode(texts)
-    matrix = np.asarray(vectors, dtype="float32")
-    # bge-m3 output is L2-normalised, so a dot product is already the cosine. Normalise anyway:
-    # it costs nothing here and makes the function correct for any embedder.
-    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-    matrix = matrix / np.clip(norms, 1e-9, None)
-    _exemplar_cache = (kinds, texts, matrix)
-    return _exemplar_cache
+    matrix = np.atleast_2d(np.asarray(vectors, dtype="float32"))
+    return matrix / np.clip(np.linalg.norm(matrix, axis=1, keepdims=True), 1e-9, None)
+
+
+async def _semantic_match(message: str, embedder) -> SafetyCheck | None:
+    """Tier 2: the closest crisis exemplar, if it is close enough. None when unavailable."""
+    exemplars = await _exemplar_matrix(embedder)
+    vector = await embedder.encode_one(message)
+    if exemplars is None or vector is None:
+        return None
+    kinds, matrix = exemplars
+    scores = matrix @ _unit_rows(vector)[0]
+    best = int(scores.argmax())
+    if float(scores[best]) < SEMANTIC_THRESHOLD:
+        return None
+    log.info("safety gate fired semantically (%s, %.3f)", kinds[best], float(scores[best]))
+    return SafetyCheck(urgent=True, kind=kinds[best], reason=URGENT_ADVICE.get(kinds[best], ""))
 
 
 async def check(message: str, embedder=None, *, allow_semantic: bool = True) -> SafetyCheck:
@@ -220,33 +233,15 @@ async def check(message: str, embedder=None, *, allow_semantic: bool = True) -> 
         return literal
     if not (message or "").strip() or looks_informational(message):
         return literal
+    if embedder is None:
+        from .retrieval.embedder import get_embedder
 
+        embedder = get_embedder()
     try:
-        import numpy as np
-
-        if embedder is None:
-            from .retrieval.embedder import get_embedder
-
-            embedder = get_embedder()
-        if not getattr(embedder.plan, "use_embedder", True):
-            return literal                      # `lite` has no embedder; tier 1 still applies
-
-        kinds, texts, matrix = await _exemplar_matrix(embedder)
-        # encode_one is cached, and retrieval embeds this same string moments later, so in the
-        # normal path this costs one embedding for the whole turn rather than one extra.
-        vector = np.asarray(await embedder.encode_one(message), dtype="float32")
-        vector = vector / max(float(np.linalg.norm(vector)), 1e-9)
-        scores = matrix @ vector
-        best = int(scores.argmax())
-        if float(scores[best]) >= SEMANTIC_THRESHOLD:
-            kind = kinds[best]
-            log.info("safety gate fired semantically (%s, %.3f) on %r",
-                     kind, float(scores[best]), message[:80])
-            return SafetyCheck(urgent=True, kind=kind, reason=URGENT_ADVICE.get(kind, ""))
-    except Exception as exc:                    # noqa: BLE001 — never let this path fail a turn
+        return await _semantic_match(message, embedder) or literal
+    except Exception as exc:
         log.warning("semantic safety tier unavailable (%s) — patterns only", exc)
-
-    return literal
+        return literal
 
 
 def reset_cache() -> None:

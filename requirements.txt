@@ -1,28 +1,20 @@
-# Core runtime
-fastapi>=0.110
-uvicorn[standard]>=0.27
+# Runtime. Every model runs behind an API, so there is no torch or GPU dependency.
+
+# Web server and HTTP
+fastapi>=0.115
+uvicorn[standard]>=0.30
 httpx>=0.27
 pydantic>=2.6
 python-dotenv>=1.0
-psutil>=5.9
 
-# Retrieval — the embedder is locked to the corpus (see data/KnowYourRights_DB_README.md §8)
+# The statute corpus: LanceDB, with pandas for its query results
 lancedb>=0.13
 pandas>=2.1
-pyarrow>=15
 numpy>=1.26
-sentence-transformers>=3.0
-transformers>=4.44
-torch>=2.2          # install the CUDA build for your machine from pytorch.org
 
-# Evidence gathering
+# Reading the web
 crawl4ai>=0.9
 ddgs>=9.0
-requests>=2.31
 
-# Optional but recommended
-tiktoken>=0.7       # exact token counting; a heuristic is used when absent
-
-# Development
-pytest>=8.0
-pytest-asyncio>=0.23
+# Exact token counts for prompt budgets (a character heuristic is used without it)
+tiktoken>=0.7

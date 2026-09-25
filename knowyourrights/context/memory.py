@@ -24,7 +24,6 @@ class Turn:
     role: str                       # "user" | "assistant"
     content: str
     at: float = field(default_factory=time.time)
-    evidence_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -36,7 +35,6 @@ class Conversation:
     summary: str = ""
     state: str = ""                 # the user's Indian state, if they told us
     pool: dict[str, Evidence] = field(default_factory=dict)
-    topic: str = ""
     _summarised_upto: int = 0
 
     # ── turns ────────────────────────────────────────────────────────────────────────
@@ -44,8 +42,7 @@ class Conversation:
         self.turns.append(Turn("user", text.strip()))
 
     def add_assistant(self, text: str, evidence: list[Evidence] | None = None) -> None:
-        self.turns.append(Turn("assistant", text.strip(),
-                               evidence_ids=[e.id for e in evidence or []]))
+        self.turns.append(Turn("assistant", text.strip()))
         for item in evidence or []:
             self.remember(item)
 
@@ -53,8 +50,10 @@ class Conversation:
     def needs_summary(self) -> bool:
         return len(self.turns) > config.HISTORY_SUMMARY_TRIGGER
 
-    def recent(self, n: int | None = None) -> list[Turn]:
-        return self.turns[-(n or config.HISTORY_TURNS_VERBATIM * 2):]
+    @property
+    def summarised_upto(self) -> int:
+        """How many turns, from the start, the rolling summary already covers."""
+        return self._summarised_upto
 
     def pending_for_summary(self) -> list[Turn]:
         """Turns old enough to fold into the summary but not yet folded."""
@@ -92,31 +91,9 @@ class Conversation:
         turns = list(self.turns[self._summarised_upto:])
         if turns and turns[-1].role == "user":
             turns = turns[:-1]                      # the question being answered right now
-        turns = turns[-config.HISTORY_TURNS_VERBATIM * 2:]
-
         head = f"USER'S STATE: {self.state}" if self.state else ""
         budget = max(0, max_tokens - estimate_tokens(head))
-
-        # Walk backwards, keeping whole turns while they fit. Each past answer is capped on its
-        # own first: what a follow-up needs is what was answered, not all 3,000 characters of it,
-        # and one long answer should not be able to evict every turn before it.
-        kept: list[str] = []
-        for turn in reversed(turns):
-            if not turn.content:
-                continue
-            body = _strip_markers(turn.content)
-            if turn.role == "assistant":
-                body = fit_to_tokens(body, config.HISTORY_ANSWER_CAP_TOKENS)
-            line = f"{turn.role.upper()}: {body}"
-            cost = estimate_tokens(line) + 1
-            if cost > budget:
-                if not kept:
-                    # Always keep *something* of the latest exchange, trimmed to fit.
-                    kept.append(fit_to_tokens(line, budget))
-                break
-            kept.append(line)
-            budget -= cost
-        kept.reverse()
+        kept, budget = _recent_lines(turns[-config.HISTORY_TURNS_VERBATIM * 2:], budget)
 
         parts: list[str] = [head] if head else []
         if self.summary and budget > 40:
@@ -128,10 +105,16 @@ class Conversation:
 
     # ── evidence pool ────────────────────────────────────────────────────────────────
     def remember(self, item: Evidence) -> None:
+        """Keep a vetted source for follow-ups. The pool is bounded: the oldest go first.
+
+        Unbounded, it held every section and crawled page of a long conversation in memory
+        for the whole six-hour session lifetime.
+        """
         key = "|".join(item.dedupe_key())
-        existing = self.pool.get(key)
-        if existing is None or item.score > existing.score:
-            self.pool[key] = item
+        existing = self.pool.pop(key, None)
+        self.pool[key] = item if existing is None or item.score > existing.score else existing
+        while len(self.pool) > config.SESSION_POOL_MAX:
+            self.pool.pop(next(iter(self.pool)))
 
     def recall(self, question: str, limit: int = 6) -> list[Evidence]:
         """Previously-vetted sources that still look relevant to a follow-up.
@@ -156,17 +139,10 @@ class Conversation:
         scored.sort(key=lambda pair: -pair[0])
         return [item for _, item in scored[:limit]]
 
-    def cited_so_far(self) -> list[str]:
-        return sorted({e.citation for e in self.pool.values() if e.citation})
-
-    def tokens(self) -> int:
-        return estimate_tokens(self.history_block(10_000))
-
     def reset(self) -> None:
         self.turns.clear()
         self.pool.clear()
         self.summary = ""
-        self.topic = ""
         self._summarised_upto = 0
 
 
@@ -177,6 +153,32 @@ _STOPWORDS = frozenset({
     "indian", "right", "rights", "can", "will", "would", "should", "must", "been", "into",
     "section", "act", "person", "provision", "case", "file", "make", "take", "also",
 })
+
+
+def _recent_lines(turns: list[Turn], budget: int) -> tuple[list[str], int]:
+    """The newest turns that fit in ``budget``, oldest first, and the budget left over.
+
+    Walks backwards keeping whole turns. Each past answer is capped on its own first: a
+    follow-up needs what was answered, not all 3,000 characters of it, and one long answer must
+    not evict every turn before it. Something of the latest exchange is always kept.
+    """
+    kept: list[str] = []
+    for turn in reversed(turns):
+        if not turn.content:
+            continue
+        body = _strip_markers(turn.content)
+        if turn.role == "assistant":
+            body = fit_to_tokens(body, config.HISTORY_ANSWER_CAP_TOKENS)
+        line = f"{turn.role.upper()}: {body}"
+        cost = estimate_tokens(line) + 1
+        if cost > budget:
+            if not kept:
+                kept.append(fit_to_tokens(line, budget))
+            break
+        kept.append(line)
+        budget -= cost
+    kept.reverse()
+    return kept, budget
 
 
 def _words(text: str) -> set[str]:

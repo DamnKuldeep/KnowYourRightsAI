@@ -24,10 +24,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from knowyourrights import safety                        # noqa: E402
-from knowyourrights.retrieval.embedder import get_embedder  # noqa: E402
-from knowyourrights.runtime.console import bold, rule, setup_console  # noqa: E402
-from knowyourrights.safety_eval import DISCLOSURES, QUESTIONS  # noqa: E402
+from knowyourrights import safety
+from knowyourrights.retrieval.embedder import get_embedder
+from knowyourrights.runtime.console import bold, rule, setup_console
+from knowyourrights.safety_eval import DISCLOSURES, QUESTIONS
 
 setup_console()
 
@@ -35,77 +35,75 @@ setup_console()
 MISS_WEIGHT = 4.0
 
 
-async def main_async(verbose: bool) -> int:
-    embedder = get_embedder()
-    await embedder.warmup()
-
-    rule("tier 1 — patterns only")
-    t1_fire = [d for d in DISCLOSURES if safety.check_patterns(d.text).urgent]
-    t1_false = [q for q in QUESTIONS if safety.check_patterns(q).urgent]
-    print(f"  disclosures caught : {len(t1_fire)}/{len(DISCLOSURES)}")
-    print(f"  false alarms       : {len(t1_false)}/{len(QUESTIONS)}")
+def pattern_tier(verbose: bool) -> tuple[int, int]:
+    """(disclosures caught, false alarms) for the pattern tier alone."""
+    caught = [d for d in DISCLOSURES if safety.check_patterns(d.text).urgent]
+    false = [q for q in QUESTIONS if safety.check_patterns(q).urgent]
+    print(f"  disclosures caught : {len(caught)}/{len(DISCLOSURES)}")
+    print(f"  false alarms       : {len(false)}/{len(QUESTIONS)}")
     if verbose:
         for case in DISCLOSURES:
-            if not safety.check_patterns(case.text).urgent:
+            if case not in caught:
                 print(f"    missed: {case.text!r}")
+    return len(caught), len(false)
 
-    rule("tier 2 — scoring every case")
-    kinds, _texts, matrix = await safety._exemplar_matrix(embedder)
 
-    import numpy as np
+async def meaning_scores(embedder) -> tuple[list[float], list[float]]:
+    """Best exemplar similarity for every case the pattern tier left open.
 
-    async def best_score(text: str) -> tuple[float, str]:
-        vec = np.asarray(await embedder.encode_one(text), dtype="float32")
-        vec = vec / max(float(np.linalg.norm(vec)), 1e-9)
-        scores = matrix @ vec
-        i = int(scores.argmax())
-        return float(scores[i]), kinds[i]
+    Questions the informational guard suppresses can never be false alarms whatever the cut,
+    so only the ones that get past it are scored.
+    """
+    exemplars = await safety._exemplar_matrix(embedder)
+    if exemplars is None:
+        raise SystemExit("the embedding API did not answer; check OPENROUTER_API_KEY")
+    _, matrix = exemplars
 
-    # Only cases tier 1 did not already decide are in play for the threshold.
-    open_disclosures = [d for d in DISCLOSURES if not safety.check_patterns(d.text).urgent]
-    open_questions = [q for q in QUESTIONS if not safety.check_patterns(q).urgent]
+    async def best(text: str) -> float:
+        return float((matrix @ safety._unit_rows(await embedder.encode_one(text))[0]).max())
 
-    dis_scores = [(await best_score(d.text))[0] for d in open_disclosures]
-    # The informational guard suppresses tier 2 entirely for these, so a question it catches can
-    # never be a false alarm no matter the threshold. Score only the ones that get through.
-    guarded = [q for q in open_questions if not safety.looks_informational(q)]
-    q_scores = [(await best_score(q))[0] for q in guarded]
+    disclosures = [d.text for d in DISCLOSURES if not safety.check_patterns(d.text).urgent]
+    questions = [q for q in QUESTIONS if not safety.check_patterns(q).urgent
+                 and not safety.looks_informational(q)]
+    return [await best(t) for t in disclosures], [await best(q) for q in questions]
 
-    print(f"  disclosures still open after tier 1 : {len(open_disclosures)}")
-    print(f"  questions not caught by the guard   : {len(guarded)}/{len(open_questions)}")
-    if dis_scores:
-        print(f"  disclosure similarity  min {min(dis_scores):.3f} / "
-              f"median {sorted(dis_scores)[len(dis_scores) // 2]:.3f} / max {max(dis_scores):.3f}")
-    if q_scores:
-        print(f"  question similarity    max {max(q_scores):.3f}")
 
-    rule("threshold sweep")
+def sweep(disclosure_scores: list[float], question_scores: list[float]) -> float:
+    """Print the trade-off at every cut and return the cheapest, a miss weighted heavier."""
     print(f"  {'cut':>6}  {'caught':>10}  {'false':>8}  {'cost':>7}")
     best_cut, best_cost = safety.SEMANTIC_THRESHOLD, float("inf")
     for cut in [x / 100 for x in range(40, 91, 2)]:
-        caught = sum(1 for s in dis_scores if s >= cut)
-        false = sum(1 for s in q_scores if s >= cut)
-        missed = len(dis_scores) - caught
-        cost = MISS_WEIGHT * missed + false
+        caught = sum(s >= cut for s in disclosure_scores)
+        false = sum(s >= cut for s in question_scores)
+        cost = MISS_WEIGHT * (len(disclosure_scores) - caught) + false
         if cost < best_cost:
             best_cut, best_cost = cut, cost
-        flag = " <-" if cost == best_cost else ""
-        print(f"  {cut:>6.2f}  {caught:>4}/{len(dis_scores):<5}  {false:>4}/{len(q_scores):<3}"
-              f"  {cost:>7.1f}{flag}")
+        print(f"  {cut:>6.2f}  {caught:>4}/{len(disclosure_scores):<5}  "
+              f"{false:>4}/{len(question_scores):<3}  {cost:>7.1f}"
+              f"{' <-' if cost == best_cost else ''}")
+    return best_cut
+
+
+async def main_async(verbose: bool) -> int:
+    embedder = get_embedder()
+    await embedder.warmup()
+    rule("tier 1 — patterns only")
+    t1_caught, t1_false = pattern_tier(verbose)
+    rule("tier 2 — meaning, on the cases tier 1 left open")
+    disclosure_scores, question_scores = await meaning_scores(embedder)
+    rule("threshold sweep")
+    best_cut = sweep(disclosure_scores, question_scores)
 
     rule("verdict")
-    total_caught = len(t1_fire) + sum(1 for s in dis_scores if s >= best_cut)
-    total_false = len(t1_false) + sum(1 for s in q_scores if s >= best_cut)
-    print(f"  best cut by cost (miss weighted {MISS_WEIGHT:g}x): {bold(f'{best_cut:.2f}')}")
-    print(f"  currently configured                    : {safety.SEMANTIC_THRESHOLD:.2f}")
-    print()
-    print(f"  both tiers at that cut:")
-    print(f"    disclosures caught : {total_caught}/{len(DISCLOSURES)} "
-          f"({total_caught / len(DISCLOSURES):.0%})")
-    print(f"    false alarms       : {total_false}/{len(QUESTIONS)} "
-          f"({total_false / len(QUESTIONS):.0%})")
+    caught = t1_caught + sum(s >= best_cut for s in disclosure_scores)
+    false = t1_false + sum(s >= best_cut for s in question_scores)
+    print(f"  best cut (a miss weighted {MISS_WEIGHT:g}x): {bold(f'{best_cut:.2f}')}; "
+          f"configured: {safety.SEMANTIC_THRESHOLD:.2f}")
+    print(f"  both tiers at that cut: {caught}/{len(DISCLOSURES)} disclosures caught, "
+          f"{false}/{len(QUESTIONS)} false alarms")
     if abs(best_cut - safety.SEMANTIC_THRESHOLD) > 0.005:
-        print(f"\n  To adopt it, set SEMANTIC_THRESHOLD = {best_cut:.2f} in knowyourrights/safety.py")
+        print(f"\n  To adopt it, set SEMANTIC_THRESHOLD = {best_cut:.2f} "
+              f"in knowyourrights/safety.py")
     return 0
 
 

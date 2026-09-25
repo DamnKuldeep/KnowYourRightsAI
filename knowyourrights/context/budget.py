@@ -93,13 +93,7 @@ class Budget:
         return max(256, self.total_tokens - self.reserved_output - self.safety)
 
     @classmethod
-    def for_writer(cls) -> "Budget":
+    def for_writer(cls) -> Budget:
         return cls("writer", config.WRITER_INPUT_BUDGET_TOKENS,
-                   reserved_output=config.WRITER_MODEL.max_out,
-                   safety=config.CONTEXT_SAFETY_TOKENS)
-
-    @classmethod
-    def for_fast(cls) -> "Budget":
-        return cls("fast", config.FAST_INPUT_BUDGET_TOKENS,
-                   reserved_output=config.FAST_MODEL.max_out,
+                   reserved_output=config.WRITER_MODELS[0].max_out,
                    safety=config.CONTEXT_SAFETY_TOKENS)

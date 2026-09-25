@@ -98,8 +98,7 @@ class Evidence:
     union_territory: bool = False     # Parliament enacted it for that territory
     category: str = ""
     # grading
-    relevant: bool | None = None
-    grade_note: str = ""
+    relevant: bool | None = None       # None: kept without a grade (grader skipped it)
     meta: dict = field(default_factory=dict)
 
     @property

@@ -49,15 +49,14 @@
           <h3><span class="dot"></span>Quick</h3>
           <p class="pl-when">One question, one answer. Best for “what does Article 21 say”.</p>
           <ol class="pl-steps">
-            <li><b>Plan</b> — classify intent, detect language</li>
-            <li><b>Retrieve once</b> — dense vectors + BM25, fused, reranked</li>
+            <li><b>Plan</b> — classify the question, detect its language</li>
+            <li><b>Retrieve once</b> — semantic + keyword search, fused, reranked</li>
             <li><b>Grade</b> — drop sections that merely mention the Act</li>
             <li><b>Write</b> — streamed, with [S1] citations</li>
           </ol>
           <dl class="pl-facts">
             <div><dt>Search rounds</dt><dd>1</dd></div>
             <div><dt>Reads the web</dt><dd>no</dd></div>
-            <div><dt>Model calls</dt><dd>up to 4</dd></div>
             <div><dt>Time limit</dt><dd>25 s</dd></div>
           </dl>
         </section>
@@ -66,16 +65,14 @@
           <h3><span class="dot"></span>Auto <em>→ usually Standard</em></h3>
           <p class="pl-when">The default. Picks Quick or Deep from the question itself.</p>
           <ol class="pl-steps">
-            <li><b>Plan</b> — split into sub-questions</li>
-            <li><b>Reformulate</b> — up to 3 phrasings per sub-question</li>
-            <li><b>Retrieve + grade</b> — one round, all phrasings fused together</li>
-            <li><b>Fetch</b> — up to 3 official pages when a procedure is asked for</li>
-            <li><b>Write</b> — streamed, with a Procedure card if steps were found</li>
+            <li><b>Plan</b> — split into sub-questions, choose the sources</li>
+            <li><b>Retrieve + grade</b> — the statute, plus official web pages</li>
+            <li><b>Read</b> — up to 3 official pages when a procedure is asked for</li>
+            <li><b>Write</b> — streamed, with an at-a-glance card for procedures</li>
           </ol>
           <dl class="pl-facts">
             <div><dt>Search rounds</dt><dd>1</dd></div>
             <div><dt>Reads the web</dt><dd>up to 3 pages</dd></div>
-            <div><dt>Model calls</dt><dd>up to 8</dd></div>
             <div><dt>Time limit</dt><dd>75 s</dd></div>
           </dl>
         </section>
@@ -84,9 +81,9 @@
           <h3><span class="dot"></span>Deep</h3>
           <p class="pl-when">Procedures end to end — fees, deadlines, which office, how to appeal.</p>
           <ol class="pl-steps">
-            <li><b>Plan</b> — split into sub-questions</li>
+            <li><b>Plan</b> — split into sub-questions, rephrase each several ways</li>
             <li><b>Retrieve + grade</b> — repeats while gaps remain</li>
-            <li><b>Navigate</b> — follows links inside gov portals, 2 levels down</li>
+            <li><b>Navigate</b> — follows links inside government portals, 2 levels down</li>
             <li><b>Gap analysis</b> — asks what is still unanswered, searches again</li>
             <li><b>Self-verify</b> — re-checks claims it is unsure of against the web</li>
             <li><b>Write, then revise</b> — rewrites if verification contradicts it</li>
@@ -94,7 +91,6 @@
           <dl class="pl-facts">
             <div><dt>Search rounds</dt><dd>up to 4</dd></div>
             <div><dt>Reads the web</dt><dd>up to 10 pages, 2 deep</dd></div>
-            <div><dt>Model calls</dt><dd>up to 20</dd></div>
             <div><dt>Time limit</dt><dd>240 s</dd></div>
           </dl>
         </section>
@@ -104,6 +100,18 @@
         citations are checked to resolve before you see them; when nothing scores well enough the
         assistant says so instead of guessing; and central law is labelled separately from state
         law, because a state Act does not apply outside its state.</p>
+    </div>
+  </div>
+
+  <!-- Shown when this connection's free allowance, or the service's daily limit, is used up. -->
+  <div class="modal" id="limit" role="alertdialog" aria-modal="true"
+       aria-labelledby="limitTitle" aria-describedby="limitText" hidden>
+    <div class="modal-inner">
+      <h2 id="limitTitle">Free usage limit reached</h2>
+      <p id="limitText"></p>
+      <p class="modal-foot">For help with your situation, free legal aid is available from
+        NALSA on <b>15100</b>.</p>
+      <button class="primary" id="limitClose">OK</button>
     </div>
   </div>
 
@@ -149,6 +157,7 @@
       <div class="footer">
         <span class="disclaimer" id="disclaimer">General information about Indian law, not legal advice. For your situation, consult a lawyer — free legal aid is on 15100.</span>
         <span class="stat" id="stat"></span>
+        <span class="stat quota" id="quota"></span>
       </div>
     </div>
   </div>

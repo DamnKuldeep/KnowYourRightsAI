@@ -1,6 +1,6 @@
 """Run real questions through the whole pipeline and report what a user would experience.
 
-Not a benchmark of retrieval — that is ``benchmark.py``. This drives the actual orchestrator,
+Not a measure of retrieval — that is ``evaluate.py``. This drives the actual orchestrator,
 turn by turn, over one conversation, and measures the things a person notices:
 
 * **time to first token** — when the answer starts appearing, which is what "fast" feels like;
@@ -29,12 +29,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from knowyourrights import config                                     # noqa: E402
-from knowyourrights.context.memory import Conversation                # noqa: E402
-from knowyourrights.llm import retrieval_api                          # noqa: E402
-from knowyourrights.orchestrator import get_orchestrator              # noqa: E402
-from knowyourrights.retrieval.search import get_engine                # noqa: E402
-from knowyourrights.runtime.console import bold, dim, rule, setup_console  # noqa: E402
+from knowyourrights import config
+from knowyourrights.context.memory import Conversation
+from knowyourrights.llm import retrieval_api
+from knowyourrights.orchestrator import get_orchestrator
+from knowyourrights.retrieval.search import get_engine
+from knowyourrights.runtime.console import bold, dim, rule, setup_console
 
 setup_console()
 
@@ -60,49 +60,68 @@ def account_usage() -> float | None:
     """Total dollars this key has spent, straight from OpenRouter."""
     try:
         req = urllib.request.Request(f"{config.OPENROUTER_BASE_URL}/key",
-                                     headers={"Authorization": f"Bearer {config.OPENROUTER_API_KEY}"})
+                                     headers={"Authorization":
+                                              f"Bearer {config.OPENROUTER_API_KEY}"})
         data = json.load(urllib.request.urlopen(req, timeout=30)).get("data") or {}
         return float(data.get("usage") or 0.0)
-    except Exception:                                        # noqa: BLE001
+    except Exception:
         return None
 
 
-async def run_turn(orch, conversation, message, depth, state) -> dict:
-    t0 = time.perf_counter()
-    first_token = None
-    answer: list[str] = []
-    stages: dict[str, float] = {}
-    stage_started: dict[str, float] = {}
-    notices, sources, safety, errors = [], [], None, []
-    usage = {}
+class TurnRecord:
+    """Everything a reader would notice about one turn, collected from its events."""
 
-    async for ev in orch.stream(message, conversation, depth=depth, state=state):
-        kind, data = ev.type, ev.data
+    def __init__(self, message: str) -> None:
+        self.message, self.started = message, time.perf_counter()
+        self.first_token: float | None = None
+        self.answer: list[str] = []
+        self.stages: dict[str, float] = {}
+        self._stage_started: dict[str, float] = {}
+        self.notices: list[str] = []
+        self.sources: list = []
+        self.errors: list[str] = []
+        self.safety: str | None = None
+        self.usage: dict = {}
+
+    def add(self, kind: str, data: dict) -> None:
         now = time.perf_counter()
         if kind == "stage":
-            if data.get("status") == "running":
-                stage_started[data["id"]] = now
-            elif data.get("status") == "done" and data["id"] in stage_started:
-                stages[data["id"]] = stages.get(data["id"], 0.0) + (now - stage_started[data["id"]])
+            self._stage(data, now)
         elif kind == "token":
-            if first_token is None:
-                first_token = now - t0
-            answer.append(data.get("delta", ""))
+            self.first_token = self.first_token or now - self.started
+            self.answer.append(data.get("delta", ""))
         elif kind == "answer_revised":
-            answer = [data.get("text", "")]
-        elif kind in ("sources", "sources_final"):
-            sources = data.get("sources", []) or sources
+            self.answer = [data.get("text", "")]
+        elif kind == "sources_final":
+            self.sources = data.get("sources", []) or self.sources
         elif kind == "notice":
-            notices.append(f"[{data.get('level')}] {data.get('text')}")
+            self.notices.append(f"[{data.get('level')}] {data.get('text')}")
         elif kind == "safety":
-            safety = data.get("text") or "shown"
+            self.safety = data.get("text") or "shown"
         elif kind == "error":
-            errors.append(data.get("message"))
+            self.errors.append(data.get("message"))
         elif kind == "usage":
-            usage = data
-    return {"message": message, "first_token": first_token, "total": time.perf_counter() - t0,
-            "answer": "".join(answer), "stages": stages, "notices": notices,
-            "sources": sources, "safety": safety, "errors": errors, "usage": usage}
+            self.usage = data
+
+    def _stage(self, data: dict, now: float) -> None:
+        if data.get("status") == "running":
+            self._stage_started[data["id"]] = now
+        elif data.get("status") == "done" and data["id"] in self._stage_started:
+            spent = now - self._stage_started[data["id"]]
+            self.stages[data["id"]] = self.stages.get(data["id"], 0.0) + spent
+
+    def result(self) -> dict:
+        return {"message": self.message, "first_token": self.first_token,
+                "total": time.perf_counter() - self.started, "answer": "".join(self.answer),
+                "stages": self.stages, "notices": self.notices, "sources": self.sources,
+                "safety": self.safety, "errors": self.errors, "usage": self.usage}
+
+
+async def run_turn(orch, conversation, message, depth, state) -> dict:
+    record = TurnRecord(message)
+    async for event in orch.stream(message, conversation, depth=depth, state=state or ""):
+        record.add(event.type, event.data)
+    return record.result()
 
 
 def report(row: dict, expect: str) -> None:
@@ -130,42 +149,37 @@ def report(row: dict, expect: str) -> None:
         print(f"  │ {line}")
 
 
-async def main_async(args) -> int:
-    get_engine()
-    status = await get_engine().warmup()
-    print(f"  embedder {status['embedder'].get('backend')} · reranker "
-          f"{status['reranker'].get('backend')} {status['reranker'].get('model')}")
-
-    if args.messages:
-        cases = [(m, args.depth, args.state, "") for m in args.messages]
-    else:
-        cases = CASES + ([] if args.quick else [DEEP_CASE])
-
-    before = account_usage()
-    orch = get_orchestrator()
-    conversation = Conversation(session_id="e2e-check")
-    rows = []
-    for message, depth, state, expect in cases:
-        row = await run_turn(orch, conversation, message, depth, state)
-        rows.append(row)
-        report(row, expect)
-    await asyncio.sleep(3)          # let a background summary settle before reading the bill
-    after = account_usage()
-
+def summarise(rows: list[dict], before: float | None, after: float | None) -> None:
     rule("summary")
-    answered = [r for r in rows if r["first_token"] is not None]
-    if answered:
-        fts = sorted(r["first_token"] for r in answered)
-        print(f"  first token  median {fts[len(fts)//2]:.1f}s   worst {fts[-1]:.1f}s")
-        tots = sorted(r["total"] for r in rows)
-        print(f"  total        median {tots[len(tots)//2]:.1f}s   worst {tots[-1]:.1f}s")
+    firsts = sorted(r["first_token"] for r in rows if r["first_token"] is not None)
+    totals = sorted(r["total"] for r in rows)
+    if firsts:
+        print(f"  first token  median {firsts[len(firsts) // 2]:.1f}s   worst {firsts[-1]:.1f}s")
+        print(f"  total        median {totals[len(totals) // 2]:.1f}s   worst {totals[-1]:.1f}s")
     print(f"  retrieval API {retrieval_api.session().stats()}")
     measured = sum(r["usage"].get("cost_usd", 0.0) for r in rows)
     print(f"  {bold('spent')} ${measured:.4f} across {len(rows)} turns "
-          f"(${measured / max(1, len(rows)):.4f} per turn) — summed from each response's "
-          f"own usage.cost")
+          f"(${measured / max(1, len(rows)):.4f} per turn), summed from each response's own "
+          f"usage.cost")
     if before is not None and after is not None:
-        print(f"  {dim(f'account endpoint says ${after - before:.4f}; it lags, so trust the line above')}")
+        lag_note = f"account endpoint says ${after - before:.4f}; it lags, so trust the line above"
+        print(f"  {dim(lag_note)}")
+
+
+async def main_async(args) -> int:
+    status = await get_engine().warmup()
+    print(f"  embeddings {status['embedder']['model']} · reranker "
+          f"{status['reranker']['model']} [{status['reranker']['thresholds_source']}]")
+    cases = ([(m, args.depth, args.state, "") for m in args.messages] if args.messages
+             else CASES + ([] if args.quick else [DEEP_CASE]))
+    before = account_usage()
+    conversation = Conversation(session_id="e2e-check")
+    rows = []
+    for message, depth, state, expect in cases:
+        rows.append(await run_turn(get_orchestrator(), conversation, message, depth, state))
+        report(rows[-1], expect)
+    await asyncio.sleep(3)          # let a background summary settle before reading the bill
+    summarise(rows, before, account_usage())
     return 1 if any(r["errors"] for r in rows) else 0
 
 

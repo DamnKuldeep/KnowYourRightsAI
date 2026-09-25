@@ -7,6 +7,7 @@ raise ``UnicodeEncodeError`` before anything useful reaches the user. Call
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 
@@ -14,10 +15,8 @@ import sys
 def setup_console() -> None:
     """Force UTF-8 on stdout/stderr and enable ANSI escapes where possible."""
     for stream in (sys.stdout, sys.stderr):
-        try:
+        with contextlib.suppress(AttributeError, ValueError):
             stream.reconfigure(encoding="utf-8", errors="replace")
-        except (AttributeError, ValueError):
-            pass
 
     if os.name == "nt":
         try:  # opt conhost into VT processing; Windows Terminal already does this

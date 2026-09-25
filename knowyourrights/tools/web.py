@@ -113,33 +113,29 @@ async def search(query: str, *, n: int | None = None, official_only: bool = Fals
     name, provider = active_provider()
     cache = get_cache() if use_cache else None
     cache_key = key_of("web", name, query, n)
+    rows = cache.get_json("web", cache_key) if cache is not None else None
+    if rows is None:
+        rows = await _ask_provider(name, provider, query, n)
+        if cache is not None and rows:
+            cache.set_json("web", cache_key, rows, ttl=config.WEB_CACHE_TTL)
+    return [_to_evidence(r, query) for r in rows]
 
-    if cache is not None:
-        hit = cache.get_json("web", cache_key)
-        if hit is not None:
-            return [_to_evidence(r, query) for r in hit]
 
+async def _ask_provider(name: str, provider, query: str, n: int) -> list[dict]:
+    """Results with a URL, or [] when the provider fails, times out or is over its budget."""
     if not await _limiter.allow():
         log.warning("web search skipped: %d/min budget spent", config.WEB_MAX_PER_MIN)
         return []
-
-    loop = asyncio.get_running_loop()
     try:
-        rows = await asyncio.wait_for(
-            loop.run_in_executor(None, provider, query, n),
-            timeout=config.WEB_TIMEOUT + 5,
-        )
-    except asyncio.TimeoutError:
+        rows = await asyncio.wait_for(asyncio.to_thread(provider, query, n),
+                                      timeout=config.WEB_TIMEOUT + 5)
+    except TimeoutError:
         log.warning("web search timed out for %r", query[:60])
         return []
     except Exception as exc:
         log.warning("web search (%s) failed for %r: %s", name, query[:60], str(exc)[:140])
         return []
-
-    rows = [r for r in rows if r.get("url")]
-    if cache is not None and rows:
-        cache.set_json("web", cache_key, rows, ttl=config.WEB_CACHE_TTL)
-    return [_to_evidence(r, query) for r in rows]
+    return [r for r in rows if r.get("url")]
 
 
 async def search_official(query: str, n: int | None = None) -> list[Evidence]:

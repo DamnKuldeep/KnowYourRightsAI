@@ -1,24 +1,21 @@
-"""The pipeline stages. Each is one focused model call (or none at all).
+"""The smaller model stages: query writing, gap analysis, procedure extraction, fact-checking
+and conversation summaries. Planning and grading have their own modules.
 
-Every stage degrades rather than raises: a planner that fails still produces a workable plan, a
-grader that fails keeps everything, a gap analyst that fails ends the loop. The turn always
-reaches the writer.
+Each stage is one focused model call with a safe default for a reply that will not parse.
+Provider failures raise :class:`~knowyourrights.llm.errors.LLMError`, and the orchestrator
+decides whether that stage can be skipped.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from datetime import date
 
-from .. import config, legal_terms
+from .. import legal_terms
 from ..evidence import Evidence
 from ..llm.client import get_client
 from . import prompts
-from .schemas import (
-    FactCheck,
-    Coverage, Grades, Plan, Procedure, ResearchStep, SafetyCheck, SearchQueries, SubQuestion,
-)
+from .schemas import Coverage, FactCheck, Procedure, SearchQueries, SubQuestion
 
 log = logging.getLogger(__name__)
 
@@ -27,151 +24,14 @@ def _messages(system: str, user: str) -> list[dict]:
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
-# ── safety gate ───────────────────────────────────────────────────────────────────────
-# Moved to knowyourrights/safety.py, which adds a second, meaning-based tier on top of these
-# patterns. Re-exported here because this was the import site and the orchestrator's ordering
-# guarantee — gate before any model call — is what actually matters.
-from ..safety import check_patterns as safety_check   # noqa: E402,F401
-from ..safety import check as safety_check_async      # noqa: E402,F401
-
-
-# ── planner ───────────────────────────────────────────────────────────────────────────
-def _fallback_plan(message: str) -> Plan:
-    """What we use when the planner is unavailable: research it as a normal legal question."""
-    return Plan(
-        kind="legal_question", depth="standard", answer_kind="mixed",
-        normalized_query=legal_terms.expand(message),
-        sub_questions=[SubQuestion(id=1, text=message)],
-        steps=[ResearchStep(tool="legal_db", query=message, reason="fallback", sub_question=1)],
-    )
-
-
-_URL_RE = re.compile(r"^https?://\S+$", re.I)
-
-
-def _dedupe_sub_questions(subs: list[SubQuestion]) -> list[SubQuestion]:
-    """Drop restatements of the same sub-question.
-
-    Planners split "how do I file an RTI" into two near-identical parts often enough that it
-    is worth catching: each duplicate costs a research step and a slot in the gap analysis
-    without adding anything. Compared on content words, so wording differences don't hide it.
-    """
-    seen: list[set[str]] = []
-    out: list[SubQuestion] = []
-    for sub in subs:
-        words = {w for w in re.findall(r"[a-z]{4,}", (sub.text or "").lower())}
-        if not words:
-            continue
-        if any(len(words & prior) / max(1, min(len(words), len(prior))) > 0.7 for prior in seen):
-            continue
-        seen.append(words)
-        out.append(SubQuestion(id=len(out) + 1, text=sub.text))
-    return out[:4]
-
-
-def _clean_steps(steps: list[ResearchStep]) -> list[ResearchStep]:
-    """Repair the two things planners reliably get wrong about steps.
-
-    A URL in a search query makes us *search the web for a URL string* and then crawl whatever
-    junk comes back — 30 wasted seconds per step, observed repeatedly. And duplicate steps
-    burn the round's budget re-asking the same thing.
-    """
-    cleaned: list[ResearchStep] = []
-    seen: set[str] = set()
-    for step in list(steps):
-        query = (step.query or "").strip()
-        if not query:
-            continue
-        if _URL_RE.match(query) and step.tool != "navigate":
-            # The planner clearly means "read this site" — treat it as navigation.
-            step = ResearchStep(tool="navigate", query=query, reason=step.reason,
-                                sub_question=step.sub_question)
-        key = f"{step.tool}:{query.lower()}"
-        if key in seen:
-            continue
-        seen.add(key)
-        cleaned.append(step)
-
-    # Cap statute searches. Planners routinely emit three near-identical ones, and each is a
-    # full hybrid search whose multi-query fusion already covers several phrasings.
-    statute_steps = [s for s in cleaned if s.tool == "legal_db"]
-    if len(statute_steps) > 2:
-        keep = set(id(s) for s in statute_steps[:2])
-        cleaned = [s for s in cleaned if s.tool != "legal_db" or id(s) in keep]
-    return cleaned[:6]
-
-
-async def make_plan(message: str, history: str = "", *, forced_depth: str | None = None,
-                    deadline: float | None = None, on_pause=None,
-                    session: str = "") -> Plan:
-    client = get_client()
-    user = f"{history}\n\nUSER MESSAGE: {message}".strip()
-    plan = await client.chat_json(
-        _messages(prompts.PLANNER, user), Plan, _fallback_plan(message),
-        role="fast", stage="plan", deadline=deadline, on_pause=on_pause, session=session,
-    )
-
-    if forced_depth in ("quick", "standard", "deep"):
-        plan.depth = forced_depth
-    # Language is decided in code, not by the planner — it labelled plainly English questions
-    # "hi" and the answer came back in Hindi.
-    plan.language = legal_terms.detect_language(message)
-    if not plan.normalized_query and plan.kind == "legal_question":
-        plan.normalized_query = legal_terms.expand(message)
-    # A question that names its place has already answered "which state?".
-    if plan.needs_state and legal_terms.place_named(f"{message} {plan.normalized_query}",
-                                                    config.INDIAN_STATES):
-        plan.needs_state = False
-    plan.steps = _clean_steps(plan.steps)
-    if plan.kind == "legal_question" and not plan.sub_questions:
-        plan.sub_questions = [SubQuestion(id=1, text=plan.normalized_query or message)]
-    plan.sub_questions = _dedupe_sub_questions(plan.sub_questions)
-    if plan.kind == "legal_question" and not plan.steps:
-        plan.steps = [ResearchStep(tool="legal_db", query=plan.normalized_query or message,
-                                   sub_question=1, reason="default")]
-
-    # Always consult the statute for a legal question. Planners asked for a *procedure* will
-    # happily plan three web searches and no law at all — which produced a genuinely useful
-    # RTI walkthrough that cited nine government pages and not one section of the RTI Act.
-    # For a tool whose whole promise is "here is the actual provision", that is a miss.
-    if plan.kind == "legal_question" and not any(s.tool == "legal_db" for s in plan.steps):
-        plan.steps.insert(0, ResearchStep(
-            tool="legal_db", query=plan.normalized_query or message, sub_question=1,
-            reason="what the statute itself says"))
-        plan.steps = plan.steps[:6]
-
-    # A how-to about a named Act always searches that Act for its deadline and its appeal.
-    # The planner is asked to, and does so only some of the time: one run of "how do I file an
-    # RTI" cited Section 7's 30-day rule, the next said "the sources do not state the response
-    # time" — with Section 7 sitting in the corpus. A portal explains the form; the Act says
-    # how long they have and what to do when they miss it, which is the part a reader needs.
-    if plan.kind == "legal_question" and plan.answer_kind in ("procedure", "mixed"):
-        acts = legal_terms.detect_acts(f"{message} {plan.normalized_query}")
-        if acts:
-            query = f"{acts[0]} time limit to decide the request and appeal if refused or no reply"
-            if not any(s.tool == "legal_db" and "appeal" in s.query.lower() for s in plan.steps):
-                plan.steps.insert(1, ResearchStep(
-                    tool="legal_db", query=query, sub_question=1,
-                    reason="the deadline and the appeal route, from the Act itself"))
-                plan.steps = plan.steps[:6]
-
-    # A named provision is a lookup, not a research project — don't spend a deep budget on it.
-    if plan.kind == "legal_question" and legal_terms.detect_section_refs(message) \
-            and len(plan.sub_questions) <= 1 and forced_depth is None:
-        plan.depth = "quick" if plan.depth == "standard" else plan.depth
-    return plan
-
-
 # ── query writer ──────────────────────────────────────────────────────────────────────
 async def write_queries(question: str, *, deadline: float | None = None, on_pause=None,
                         session: str = "") -> SearchQueries:
-    """Reformulations aimed at each source. Acronyms are expanded before the model sees it."""
+    """Reformulations aimed at each source. Acronyms are expanded before the model sees them."""
     expanded = legal_terms.expand(question)
     default = SearchQueries(statute_queries=[expanded] if expanded != question else [],
-                            web_queries=[f"{expanded} India official procedure"],
-                            wikipedia_query="")
-    client = get_client()
-    result = await client.chat_json(
+                            web_queries=[f"{expanded} India official procedure"])
+    result = await get_client().chat_json(
         _messages(prompts.QUERY_WRITER, f"QUESTION: {question}\nEXPANDED: {expanded}"),
         SearchQueries, default, role="fast", stage="queries",
         deadline=deadline, on_pause=on_pause, session=session,
@@ -181,92 +41,16 @@ async def write_queries(question: str, *, deadline: float | None = None, on_paus
     return result
 
 
-# ── grader ────────────────────────────────────────────────────────────────────────────
-async def grade(question: str, items: list[Evidence], *, deadline: float | None = None,
-                on_pause=None, session: str = "") -> list[Evidence]:
-    """Keep only genuinely relevant sources.
-
-    This is what stops "power to arrest without warrant" in the Indian Forest Act from being
-    cited at someone asking about their own arrest. A rerank score cannot tell topical
-    relevance from vocabulary overlap; a reader can.
-    """
-    if not items:
-        return []
-    listing = "\n\n".join(
-        f"[{item.id}] ({item.kind}) {item.label()}\n{item.text[:420]}" for item in items
-    )
-    default = Grades(grades=[])          # only reached if parsing fails entirely
-    client = get_client()
-    result = await client.chat_json(
-        _messages(prompts.GRADER, f"QUESTION: {question}\n\nCANDIDATES:\n{listing}"),
-        Grades, default, role="fast", stage="grade",
-        deadline=deadline, on_pause=on_pause, session=session,
-        max_tokens=min(1400, 120 + 60 * len(items)),
-    )
-
-    if not result.grades:
-        # Grading failed. Keeping everything is the safer failure: the writer still has to
-        # cite, and dropping every source would produce a needlessly empty answer.
-        log.warning("grader returned nothing for %d candidate(s); keeping all", len(items))
-        for item in items:
-            item.relevant = None
-        return items
-
-    verdicts = {g.id.strip(): g for g in result.grades}
-    kept: list[Evidence] = []
-    for item in items:
-        verdict = verdicts.get(item.id)
-        if verdict is None:
-            item.relevant = None      # ungraded: keep, but mark it as unvetted
-            kept.append(item)
-            continue
-        item.relevant = verdict.relevant
-        item.grade_note = verdict.note
-        if verdict.relevant:
-            kept.append(item)
-
-    if not kept:
-        kept = _rescue(items)
-    return kept
-
-
-# Retrieval scoring above this is confident enough that a blanket rejection is more likely a
-# grader misfire than a genuine absence of relevant law.
-RESCUE_SCORE = 0.55
-
-
-def _rescue(items: list[Evidence]) -> list[Evidence]:
-    """Keep the strongest sources when the grader rejects every single one.
-
-    Observed live: a well-retrieved arrest question returned the correct BNSS sections and the
-    grader marked all six false, so the writer had nothing and produced an answer that helped
-    nobody. Rejecting everything is occasionally right, but an empty answer built on top of
-    *confident* retrieval is never the better outcome — so high-scoring statutes survive, and
-    the writer is still free to say they are not quite on point.
-    """
-    confident = [i for i in items if i.is_statute and i.score >= RESCUE_SCORE]
-    if not confident:
-        return []
-    confident.sort(key=lambda i: -i.score)
-    rescued = confident[:2]
-    for item in rescued:
-        item.relevant = None
-        item.grade_note = "kept despite grading: retrieval confidence was high"
-    log.warning("grader rejected all %d candidate(s); rescuing %d high-confidence statute(s)",
-                len(items), len(rescued))
-    return rescued
-
-
 # ── gap analyst ───────────────────────────────────────────────────────────────────────
 async def find_gaps(question: str, sub_questions: list[SubQuestion], items: list[Evidence],
                     *, deadline: float | None = None, on_pause=None,
                     session: str = "") -> Coverage:
+    """Whether another research round is worth its time, and what it should look for."""
     if not sub_questions:
         return Coverage(enough=True)
     subs = "\n".join(f"{s.id}. {s.text}" for s in sub_questions)
     evidence = "\n".join(f"[{i.id}] ({i.kind}) {i.label()}: {i.text[:200]}" for i in items[:14])
-    client = get_client()
-    return await client.chat_json(
+    return await get_client().chat_json(
         _messages(prompts.GAP_ANALYST,
                   f"QUESTION: {question}\n\nSUB-QUESTIONS:\n{subs}\n\nEVIDENCE:\n{evidence}"),
         Coverage, Coverage(enough=True, note="gap analysis unavailable"),
@@ -275,55 +59,51 @@ async def find_gaps(question: str, sub_questions: list[SubQuestion], items: list
 
 
 # ── procedure extractor ───────────────────────────────────────────────────────────────
+# An amount is a currency marker next to a number. A bare digit is not enough: "as prescribed in
+# the RTI Rules, 2012" contains one, and is exactly the text this exists to reject.
+_AMOUNT = re.compile(r"(₹|\brs\.?|\binr)\s*\d|\d[\d,]*\s*(/-|rupees?\b)", re.I)
+_NO_CHARGE = re.compile(r"\b(free|no fee|nil|no charge|exempt(ed)?)\b", re.I)
+_DURATION = re.compile(r"\d+\s*(working\s+)?(hours?|days?|weeks?|months?|years?)\b", re.I)
+# A field that says it has no value. Checked first: "amount not specified; free for BPL
+# applicants is not mentioned" contains "free", and was shown on the card as the fee.
+_NOT_GIVEN = re.compile(r"\bnot\s+(specified|mentioned|stated|given|provided|available|"
+                        r"found|clear)\b|\bunknown\b|\bN/A\b|उल्लेख नहीं|नहीं (दी|बताई)", re.I)
+
+
 async def extract_procedure(question: str, items: list[Evidence], *,
                             deadline: float | None = None, on_pause=None,
                             session: str = "") -> Procedure:
+    """The at-a-glance facts of a procedure — fee, time limit, appeal, documents, portal."""
     sources = [i for i in items if i.kind in ("official", "web") and i.text]
     if not sources:
         return Procedure()
-    # Up to 8 pages at 1,400 characters, rather than 4 at 2,200. The card and the answer have to
-    # be read from the same evidence or they disagree: the extractor used to stop at the fourth
-    # page, the RTI fee was on the fifth and sixth, and the card said "as prescribed in the RTI
-    # Rules" beside an answer that said ₹10. The fee is almost always near the top of a page, so
-    # breadth is worth more here than depth.
+    # Eight pages at 1,400 characters rather than four at 2,200: the card and the answer must be
+    # read from the same evidence or they disagree, and a fee sits near the top of its page.
     blocks = "\n\n".join(f"URL: {i.url}\n{i.text[:1400]}" for i in sources[:8])
-    client = get_client()
-    result = await client.chat_json(
+    result = await get_client().chat_json(
         _messages(prompts.PROCEDURE_EXTRACTOR, f"QUESTION: {question}\n\nSOURCES:\n{blocks}"),
         Procedure, Procedure(), role="fast", stage="procedure",
         deadline=deadline, on_pause=on_pause, session=session, max_tokens=1200,
     )
-    known = {i.url for i in sources}
-    result.source_urls = [u for u in result.source_urls if u in known] or list(known)[:3]
-    if result.portal_url and result.portal_url not in known:
-        # Only offer a link we actually read — a plausible-looking invented URL is a real harm.
-        result.portal_url = ""
-    # A fact without its value is worse than no fact: "Fee: as prescribed" tells the reader
-    # nothing and reads as a contradiction beside an answer that names the amount.
-    result.fees = result.fees if _states_a_value(result.fees, money=True) else ""
-    result.timeline = result.timeline if _states_a_value(result.timeline) else ""
+    return keep_stated_facts(result, {i.url for i in sources})
+
+
+def keep_stated_facts(result: Procedure, known_urls: set[str]) -> Procedure:
+    """Drop anything the card should not show: unread links and facts without a value."""
+    result.source_urls = [u for u in result.source_urls if u in known_urls] \
+        or sorted(known_urls)[:3]
+    if result.portal_url not in known_urls:
+        result.portal_url = ""      # only a link we actually read; an invented URL is a harm
+    # "Fee: as prescribed" tells the reader nothing and contradicts an answer naming the amount.
+    result.fees = result.fees if states_a_value(result.fees, money=True) else ""
+    result.timeline = result.timeline if states_a_value(result.timeline) else ""
     result.appeal_to = "" if _NOT_GIVEN.search(result.appeal_to or "") else result.appeal_to
     result.documents = [d for d in result.documents if not _NOT_GIVEN.search(d)]
     return result
 
 
-# An amount is a currency marker *next to* a number. A bare digit is not enough: "as prescribed
-# in the RTI Rules, 2012" contains one, and it is precisely the text this exists to reject.
-_AMOUNT = re.compile(r"(₹|\brs\.?|\binr)\s*\d|\d[\d,]*\s*(/-|rupees?\b)", re.I)
-_NO_CHARGE = re.compile(r"\b(free|no fee|nil|no charge|exempt(ed)?)\b", re.I)
-_DURATION = re.compile(r"\d+\s*(working\s+)?(hours?|days?|weeks?|months?|years?)\b", re.I)
-
-
-# A field that says it has no value. Checked first, because the words that make a value look
-# real can sit inside one: "amount not specified in sources; free for BPL applicants is not
-# mentioned" contains "free", and was shown on the card as the fee.
-_NOT_GIVEN = re.compile(r"\bnot\s+(specified|mentioned|stated|given|provided|available|"
-                        r"found|clear)\b|\bunknown\b|\bN/A\b|उल्लेख नहीं|नहीं (दी|बताई)", re.I)
-
-
-def _states_a_value(text: str, money: bool = False) -> bool:
-    """Does this field actually say something — an amount or "free" for a fee, a duration for
-    a time limit — rather than pointing somewhere else for the answer?"""
+def states_a_value(text: str, money: bool = False) -> bool:
+    """Does this field state an amount (or "free") for a fee, or a duration for a time limit?"""
     text = (text or "").strip()
     if not text or _NOT_GIVEN.search(text):
         return False
@@ -333,227 +113,34 @@ def _states_a_value(text: str, money: bool = False) -> bool:
 
 
 # ── summariser ────────────────────────────────────────────────────────────────────────
-async def summarise(turns_text: str, *, deadline: float | None = None,
-                    session: str = "") -> str:
+async def summarise(turns_text: str, *, session: str = "") -> str:
+    """A rolling summary of older turns. Returns "" on any failure: memory is optional."""
     if not turns_text.strip():
         return ""
-    client = get_client()
     try:
-        return await client.chat(_messages(prompts.SUMMARISER, turns_text),
-                                 role="fast", stage="summarise", max_tokens=280,
-                                 deadline=deadline, session=session)
+        return await get_client().chat(_messages(prompts.SUMMARISER, turns_text), role="fast",
+                                       stage="summarise", max_tokens=280, session=session)
     except Exception as exc:
         log.debug("summarisation failed: %s", exc)
         return ""
-
-
-# ── citation verification (no model call) ─────────────────────────────────────────────
-_MARKER_RE = re.compile(r"\[([A-Z]{1,2}\d{1,2})\]")
-
-
-# Anything bracketed that *starts* with a source id — "[S1(a)]", "[S3(1)]", "[S1(c)-(h)]",
-# "[S1, S2]" — but not a markdown link, whose "]" is followed by "(".
-_COMPOUND_RE = re.compile(r"\[([A-Z]{1,2}\d{1,2}[^\[\]\n]{0,40})\](?!\()")
-_ID_RE = re.compile(r"[A-Z]{1,2}\d{1,2}")
-_CLAUSE_RE = re.compile(r"\([^()]{1,8}\)")
-_JOINERS = re.compile(r"^[\s,;&\-–—/]*(?:and[\s,;&\-–—/]*)*$", re.I)
-
-
-def normalize_markers(text: str) -> str:
-    """Rewrite the citation shapes models invent into the one shape we can verify and link.
-
-    Seen live from the Hinglish writer: ``[S1(a)]``, ``[S3(1)]``, ``[S1(c)-(h)]``. The verifier
-    and the UI's chip renderer both only understand ``[S1]``, so those were neither checked nor
-    clickable — they rendered as raw text. The clause is dropped from the marker; the sentence
-    around it already names the section. ``[S1, S2]`` becomes ``[S1][S2]``.
-
-    Conservative: a bracket is only rewritten when, once the ids and short clause groups are
-    removed, nothing but separators is left. Anything with real words inside is left alone.
-    """
-    def fix(match: re.Match) -> str:
-        inner = match.group(1)
-        ids = _ID_RE.findall(inner)
-        rest = _CLAUSE_RE.sub("", _ID_RE.sub("", inner))
-        if not ids or not _JOINERS.match(rest):
-            return match.group(0)
-        seen: list[str] = []
-        for marker in ids:
-            if marker not in seen:
-                seen.append(marker)
-        return "".join(f"[{m}]" for m in seen)
-
-    return _BLOCK_LABEL_RE.sub("", _COMPOUND_RE.sub(fix, text or ""))
-
-
-# The prompt's own block names, which the writer sometimes cites as if they were sources:
-# "…summary suit [EXTRACTED PROCEDURE][W2]" was shown to a reader verbatim.
-_BLOCK_LABEL_RE = re.compile(
-    r"\s?\[(?:EXTRACTED PROCEDURE|PROCEDURE|SOURCES?|VERIFICATION|HISTORY|CONTEXT)\]")
-
-
-_MD_LINK = re.compile(r"\[([^\[\]\n]{2,160})\]\((https?://[^\s)]+)\)")
-_TITLE_SPLIT = re.compile(r"\s*(?:::|\s\|\s|\s[-–—]\s)\s*")
-
-
-def tidy_link_labels(text: str) -> str:
-    """Shorten link text that is really a page's <title>.
-
-    Writers copy the source title straight into the link: "[RTI Online:: Home | Submit RTI
-    Request | Submit RTI First A](…)" — navigation breadcrumbs, cut off mid-word. The first
-    segment of such a title is the site's own name, which is what a reader wants to click.
-    """
-    def fix(m: re.Match) -> str:
-        label, url = m.group(1).strip(), m.group(2)
-        if not (_TITLE_SPLIT.search(label) or len(label) > 60):
-            return m.group(0)
-        short = _TITLE_SPLIT.split(label)[0].strip() or label
-        if len(short) > 60:
-            short = " ".join(short[:60].split()[:-1]) or short[:60]
-        return f"[{short}]({url})"
-
-    return _MD_LINK.sub(fix, text or "")
-
-
-_UNSTATED = re.compile(
-    # "not stated in the sources" and "the sources do not state" — the model uses both, and the
-    # first version of this only knew the first, so the second came straight back.
-    r"(\b(not|isn't|is not|are not)\s+(explicitly\s+|clearly\s+)?"
-    r"(stated|mentioned|specified|given|provided|available|found)\b.{0,40}\b(sources?|documents?)\b"
-    r"|\b(sources?|documents?)\b.{0,30}\b(do|does|did)\s+not\s+"
-    r"(state|mention|specify|say|provide|include|cover|give)\b"
-    r"|स्रोत\S*\s.{0,90}नहीं)",
-    re.I)
-
-
-def drop_unstated_lines(text: str) -> str:
-    """Remove "Response time: Not stated in the provided sources." lines.
-
-    The writer is told to leave out anything its sources do not state, and still writes a line
-    saying so. That is noise at best, and at worst it reads as "the law says nothing about this"
-    when the reader's actual problem is that we did not find it. Only short labelled or list
-    lines are removed; a sentence of real prose that happens to mention sources is kept.
-    """
-    kept: list[str] = []
-    heading_at = None            # index in `kept` of the current section's heading
-    listed = dropped = 0         # list lines seen / removed in that section
-    emptied: set[int] = set()    # headings whose every list line was removed
-
-    def close_section():
-        if heading_at is not None and listed and dropped == listed:
-            emptied.add(heading_at)
-
-    for line in (text or "").splitlines():
-        stripped = line.strip()
-        if _HEADING.match(stripped):
-            close_section()
-            heading_at, listed, dropped = len(kept), 0, 0
-            kept.append(line)
-            continue
-        is_list_or_label = bool(re.match(r"^([-*•]|\d+[.)])\s+|^\*\*[^*]{1,40}:?\*\*", stripped))
-        if is_list_or_label:
-            listed += 1
-            if len(stripped) < 180 and _UNSTATED.search(stripped):
-                dropped += 1
-                continue
-        kept.append(line)
-    close_section()
-    # Dropping every "Fee: not stated in the sources" line left a Mumbai deposit answer ending
-    # on a bare "What it costs and how long" heading with nothing under it.
-    out = "\n".join(line for i, line in enumerate(kept) if i not in emptied)
-    return re.sub(r"\n{3,}", "\n\n", out) if emptied else out
-
-
-_HEADING = re.compile(r"^(#{1,6}\s+\S.*|\*\*[^*]{1,80}\*\*:?)$")
-
-
-_STATE_QUESTION = {
-    "en": "Which state is this in? The rules here differ from state to state — tell me, or set "
-          "your state above, and I can point you to the exact law and authority.",
-    "hi": "यह मामला किस राज्य का है? इस विषय के नियम हर राज्य में अलग हैं — राज्य बताइए या ऊपर "
-          "चुनिए, तो मैं सही कानून और प्राधिकरण बता सकूँगा।",
-    "hinglish": "Yeh kis state ka mamla hai? Is par rules har state mein alag hain — state "
-                "bataiye ya upar select kijiye, toh main sahi law aur authority bata sakta hoon.",
-}
-
-# The answer already asks for the state if its closing lines mention one and end in a question.
-# Markdown and citation markers may follow the "?": "**आप किस राज्य में रहते हैं?**" was missed,
-# and the reader was asked twice.
-_ASKS_STATE = re.compile(r"(state|राज्य|rajya)[^\n]{0,160}\?(\s*\[[SGW]\d+\])*[\s*_)]*$", re.I)
-
-
-def state_question(answer: str, plan, state: str | None) -> str:
-    """The follow-up to append when the answer depends on a state nobody has named.
-
-    The writer is told to ask, and asks only some of the time: a Hindi deposit question with
-    "All India" selected came back routed to the National Consumer Helpline, with no word that
-    tenancy law is made by each state. Returns "" when no question is needed.
-    """
-    if state or not getattr(plan, "needs_state", False):
-        return ""
-    tail = (answer or "").rstrip()[-400:]
-    if _ASKS_STATE.search(tail):
-        return ""
-    language = getattr(plan, "language", "en")
-    return "\n\n" + _STATE_QUESTION.get(language, _STATE_QUESTION["en"])
-
-
-def verify_citations(answer: str, items: list[Evidence]) -> tuple[str, list[str], int]:
-    """Check every ``[S1]`` marker resolves to a source we actually supplied.
-
-    Returns ``(cleaned_answer, unsupported_markers, verified_count)``. Unresolvable markers are
-    removed rather than shown: a citation the user cannot click is worse than no marker, and
-    silently leaving it implies support that does not exist.
-    """
-    answer = drop_unstated_lines(tidy_link_labels(normalize_markers(answer)))
-    known = {item.id for item in items}
-    found = _MARKER_RE.findall(answer or "")
-    unsupported = sorted({m for m in found if m not in known})
-
-    cleaned = answer or ""
-    for marker in unsupported:
-        cleaned = cleaned.replace(f"[{marker}]", "")
-    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
-    cleaned = re.sub(r" +([.,;:])", r"\1", cleaned)
-
-    verified = len({m for m in found if m in known})
-    return cleaned.strip(), unsupported, verified
-
-
-def used_evidence(answer: str, items: list[Evidence]) -> list[Evidence]:
-    """The sources the answer actually cited, in the order they first appear."""
-    order = [m for m in _MARKER_RE.findall(answer or "")]
-    by_id = {item.id: item for item in items}
-    seen: set[str] = set()
-    used: list[Evidence] = []
-    for marker in order:
-        item = by_id.get(marker)
-        if item is not None and marker not in seen:
-            seen.add(marker)
-            used.append(item)
-    return used
-
-
-def today_str() -> str:
-    return date.today().isoformat()
 
 
 # ── self-verification ─────────────────────────────────────────────────────────────────
 async def find_risky_claims(question: str, draft: str, items: list[Evidence], *,
                             deadline: float | None = None, on_pause=None,
                             session: str = "") -> FactCheck:
-    """Ask the agent what in its own draft it is not sure enough about.
+    """Ask what in its own draft the agent is not sure enough about.
 
-    Deliberately run against a *written draft* rather than raw evidence. A model is much better
-    at spotting "I asserted the fee is Rs 10 and only one blog says so" than at predicting in
-    advance which retrieved facts will end up load-bearing.
+    Run against a written draft rather than raw evidence: a model is far better at spotting "I
+    asserted the fee is Rs 10 and only one blog says so" than at predicting in advance which
+    retrieved facts will end up load-bearing.
     """
     if not draft.strip():
         return FactCheck(confident=True)
     evidence = "\n".join(
         f"[{i.id}] ({i.kind}{'/' + i.jurisdiction if i.jurisdiction else ''}) "
         f"{i.label()}: {i.text[:180]}" for i in items[:12])
-    client = get_client()
-    return await client.chat_json(
+    return await get_client().chat_json(
         _messages(prompts.FACT_CHECKER,
                   f"QUESTION: {question}\n\nEVIDENCE:\n{evidence}\n\nDRAFT:\n{draft[:2500]}"),
         FactCheck, FactCheck(confident=True), role="fast", stage="factcheck",
@@ -561,8 +148,8 @@ async def find_risky_claims(question: str, draft: str, items: list[Evidence], *,
     )
 
 
-def summarise_verification(claims: list, findings: dict[str, list[Evidence]]) -> str:
-    """Render check results for the writer's second pass."""
+def verification_note(claims: list, findings: dict[str, list[Evidence]]) -> str:
+    """The fact-check results, rendered for the writer's second pass."""
     if not findings:
         return ""
     lines = ["VERIFICATION PASS — these claims were checked against fresh web sources.",
@@ -573,7 +160,5 @@ def summarise_verification(claims: list, findings: dict[str, list[Evidence]]) ->
         lines.append(f"\nCLAIM: {claim.claim}")
         if not found:
             lines.append("  no confirming source found — soften this or drop it")
-            continue
-        for item in found[:2]:
-            lines.append(f"  [{item.id}] {item.label()}: {item.text[:220]}")
+        lines.extend(f"  [{item.id}] {item.label()}: {item.text[:220]}" for item in found[:2])
     return "\n".join(lines)

@@ -6,8 +6,6 @@ than one 600-word rulebook, and when an answer goes wrong it is obvious which pr
 
 from __future__ import annotations
 
-from .. import config
-
 CORPUS_DESCRIPTION = (
     "a database of CENTRAL Indian law: the Constitution, about 1,000 central Acts, and the "
     "2024 criminal codes (Bharatiya Nyaya Sanhita, Bharatiya Nagarik Suraksha Sanhita and "
@@ -24,7 +22,8 @@ Return ONLY this JSON object — no prose, no markdown fences:
   "kind": "smalltalk" | "capability" | "legal_question" | "out_of_scope",
   "depth": "quick" | "standard" | "deep",
   "answer_kind": "definition" | "procedure" | "rights" | "punishment" | "mixed" | "none",
-  "normalized_query": "<the question as a STANDALONE sentence in clear legal English; empty if not legal>",
+  "normalized_query": "<the question as a STANDALONE sentence in clear legal English;
+                        empty if not legal>",
   "language": "<ISO code of the language to REPLY in: en, hi, ...>",
   "needs_state": true | false,
   "sub_questions": [{{"id": 1, "text": "..."}}],
@@ -191,7 +190,7 @@ hears an appeal and within what time.
 """.strip()
 
 
-WRITER = f"""
+WRITER = """
 You are KnowYourRights, explaining Indian law to ordinary people in plain language.
 You give legal INFORMATION, not legal advice.
 
@@ -316,7 +315,7 @@ HONESTY:
 """.strip()
 
 
-CONCIERGE = f"""
+CONCIERGE = """
 You are KnowYourRights, a friendly assistant for questions about Indian law.
 Reply in 1-2 warm sentences, in the user's language, with no bullet lists and no disclaimer.
 
@@ -398,7 +397,3 @@ def writer_context(plan, state: str | None, notes: list[str], today: str) -> str
         lines.append(f"IMPORTANT CAVEAT (already shown to the user above your answer — use its "
                      f"facts, weave them in where they matter, never copy it verbatim): {note}")
     return "\n".join(lines)
-
-
-def helpline_text() -> str:
-    return " · ".join(f"{label}: {number}" for label, number in config.HELPLINES)

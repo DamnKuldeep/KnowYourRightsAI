@@ -1,8 +1,8 @@
-"""Every tuning knob lives here. Nothing in this module may import torch, lancedb or
-transformers — it is imported by scripts that must stay cheap.
+"""Every tuning knob in one place.
 
-Values are overridable from the environment (and therefore from ``.env``); the defaults are
-tuned for the machine described in the plan: RTX 3050 4 GB / 16 GB RAM with ~3 GB free.
+Values can be overridden from the environment, or from a ``.env`` file in development (real
+environment variables win over ``.env``). Nothing here imports a heavy library, so scripts and
+tests can import it cheaply. See ``.env.example`` for the settings an operator is likely to set.
 """
 
 from __future__ import annotations
@@ -10,39 +10,21 @@ from __future__ import annotations
 import os
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
-# Whole escape sequences, stripped before character filtering — removing the punctuation first
-# would leave the digits of ESC[200~ behind as a literal "200" glued to a pasted value.
-_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z~]")
-
-try:  # optional, but this is how the API key normally arrives
+try:
     from dotenv import load_dotenv
 
-    load_dotenv(override=True)
-except ImportError:  # pragma: no cover - dotenv is in requirements
+    load_dotenv(override=False)
+except ImportError:  # pragma: no cover - python-dotenv is a runtime requirement
     pass
-
-
-# ── paths ─────────────────────────────────────────────────────────────────────────────
-ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = Path(os.environ.get("KYR_DATA_DIR", ROOT / "data"))
-RUNTIME_DIR = Path(os.environ.get("KYR_RUNTIME_DIR", ROOT / ".runtime"))
-CACHE_DIR = RUNTIME_DIR / "cache"
-
-DB_PATH = Path(os.environ.get("LEGAL_DB_PATH", DATA_DIR / "legal_db"))
-TABLE = "laws"
-PARQUET = Path(os.environ.get("LEGAL_PARQUET", DATA_DIR / "chunks_metadata.parquet"))
-ENRICH_CACHE = Path(os.environ.get("LEGAL_CACHE", DATA_DIR / "enrichment_cache.json"))
-
-WEB_DIR = Path(__file__).resolve().parent / "web"
 
 
 # ── env helpers ───────────────────────────────────────────────────────────────────────
 def env_str(key: str, default: str) -> str:
-    v = os.environ.get(key)
-    return default if v is None or v.strip() == "" else v.strip()
+    value = os.environ.get(key)
+    return default if value is None or not value.strip() else value.strip()
 
 
 def env_int(key: str, default: int) -> int:
@@ -60,27 +42,27 @@ def env_float(key: str, default: float) -> float:
 
 
 def env_bool(key: str, default: bool) -> bool:
-    v = os.environ.get(key)
-    if v is None:
+    value = os.environ.get(key)
+    if value is None:
         return default
-    return v.strip().lower() in ("1", "true", "yes", "on")
+    return value.strip().lower() in ("1", "true", "yes", "on")
 
 
-_KEY_ALLOWED = re.compile(r"[^A-Za-z0-9._-]")
+# Whole escape sequences are stripped before character filtering: removing the punctuation first
+# would leave the digits of ESC[200~ behind, glued to a pasted value.
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z~]")
+_NOT_KEY_CHAR = re.compile(r"[^A-Za-z0-9._-]")
 
 
 def env_key(name: str) -> str:
-    """Read an API key, keeping only characters an API key can actually contain.
+    """Read an API key, keeping only characters an API key can contain.
 
-    Keys arrive by paste, and a paste picks things up. A terminal with bracketed paste enabled
-    wraps the value in ESC[200~ … ESC[201~; a copy from a web page can carry a non-breaking
-    space or a smart dash. None of that is visible, and the failure it causes is not obviously
-    about the key: httpx encodes header values as ASCII, so one stray character makes *every*
-    call die with "'ascii' codec can't encode characters in position 9-10" while the key looks
-    perfectly fine in .env. This cost a deployment, so the value is cleaned on the way in.
+    Keys arrive by paste, and a paste picks things up: bracketed-paste escapes, a non-breaking
+    space, a smart dash. httpx encodes headers as ASCII, so one invisible character makes every
+    call fail with an encoding error while the key looks fine in the file.
     """
     raw = os.environ.get(name, "")
-    cleaned = _KEY_ALLOWED.sub("", _ANSI_ESCAPE.sub("", raw))
+    cleaned = _NOT_KEY_CHAR.sub("", _ANSI_ESCAPE.sub("", raw))
     if raw.strip() and cleaned != raw.strip():
         print(f"warning: {name} contained characters an API key cannot have; "
               f"{len(raw.strip()) - len(cleaned)} removed. Re-paste it if authentication fails.",
@@ -88,61 +70,66 @@ def env_key(name: str) -> str:
     return cleaned
 
 
-# ── providers ─────────────────────────────────────────────────────────────────────────
-# Two OpenAI-compatible endpoints, used together. NVIDIA has been unreliable in practice —
-# live 410s on healthy models, 503s, and calls swinging from 1s to 2.6s — so every role can
-# fail over to the other provider rather than to nothing.
-NIM_BASE_URL = env_str("NIM_BASE_URL", "https://integrate.api.nvidia.com/v1")
-NIM_RETRIEVAL_BASE = env_str("NIM_RETRIEVAL_BASE", "https://ai.api.nvidia.com/v1/retrieval")
-NVIDIA_API_KEY = env_key("NVIDIA_API_KEY")
-NIM_TIMEOUT_S = env_float("NIM_TIMEOUT_S", 90.0)
+# ── paths ─────────────────────────────────────────────────────────────────────────────
+ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = Path(os.environ.get("KYR_DATA_DIR", ROOT / "data"))
+RUNTIME_DIR = Path(os.environ.get("KYR_RUNTIME_DIR", ROOT / ".runtime"))
+CACHE_DIR = RUNTIME_DIR / "cache"
+DB_PATH = Path(os.environ.get("LEGAL_DB_PATH", DATA_DIR / "legal_db"))
+TABLE = "laws"
+WEB_DIR = Path(__file__).resolve().parent / "web"
 
+
+def ensure_runtime_dirs() -> None:
+    """Create the writable runtime tree. Safe to call repeatedly."""
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ── providers ─────────────────────────────────────────────────────────────────────────
+# OpenRouter serves the chat models and the retrieval models. NVIDIA NIM is an optional second
+# chat provider with its own rate limits, used only when OpenRouter's models cannot answer.
 OPENROUTER_BASE_URL = env_str("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 OPENROUTER_API_KEY = env_key("OPENROUTER_API_KEY")
-# Sent as HTTP-Referer/X-Title; OpenRouter uses them for attribution on free models.
-OPENROUTER_APP_URL = env_str("OPENROUTER_APP_URL", "https://github.com/DamnKuldeep/KnowYourRightsAI")
+# Sent as HTTP-Referer and X-Title; OpenRouter uses them for attribution.
+OPENROUTER_APP_URL = env_str("OPENROUTER_APP_URL",
+                             "https://github.com/DamnKuldeep/KnowYourRightsAI")
 OPENROUTER_APP_NAME = env_str("OPENROUTER_APP_NAME", "KnowYourRightsAI")
-# Free tier: 20 requests/minute, and a daily cap. Both are enforced client-side so we degrade
-# on our own terms rather than being cut off mid-answer.
+# Free models share ~20 requests a minute and 1,000 a day; both are enforced here, so the app
+# degrades on its own terms rather than being cut off mid-answer. Paid models are metered in
+# money, not by those caps, and get a realistic ceiling instead. 429s back off either way.
 OPENROUTER_RPM = env_int("OPENROUTER_RPM", 15)
+OPENROUTER_PAID_RPM = env_int("OPENROUTER_PAID_RPM", 60)
 OPENROUTER_DAILY_LIMIT = env_int("OPENROUTER_DAILY_LIMIT", 1000)
-# Stop well short of the ceiling so a demo never dies on the last few requests.
 OPENROUTER_DAILY_RESERVE = env_int("OPENROUTER_DAILY_RESERVE", 60)
 
-PROVIDERS = ("nim", "openrouter")
+NIM_BASE_URL = env_str("NIM_BASE_URL", "https://integrate.api.nvidia.com/v1")
+NVIDIA_API_KEY = env_key("NVIDIA_API_KEY")
 
-
-def is_free_model(model_id: str) -> bool:
-    """OpenRouter's 1,000-requests/day and ~20/min caps apply to ``:free`` variants only.
-
-    Paid requests are metered in money, not in that allowance. Treating every OpenRouter call as
-    free-tier traffic made the daily counter lock out *paid* models too — after ~155 questions a
-    day the router would have stopped using the fast stages it had just been told to prefer.
-    """
-    return model_id.endswith(":free") or model_id in ("openrouter/free",)
+LLM_TIMEOUT_S = env_float("KYR_LLM_TIMEOUT_S", 90.0)
+PROVIDERS = ("openrouter", "nim")
 
 
 def provider_available(name: str) -> bool:
-    return bool(NVIDIA_API_KEY) if name == "nim" else bool(OPENROUTER_API_KEY)
+    return bool(OPENROUTER_API_KEY) if name == "openrouter" else bool(NVIDIA_API_KEY)
+
+
+def is_free_model(model_id: str) -> bool:
+    """Only ``:free`` variants draw on OpenRouter's daily allowance; paid calls cost money."""
+    return model_id.endswith(":free") or model_id == "openrouter/free"
 
 
 @dataclass(frozen=True)
 class ModelSpec:
     """One model on one provider, and the limits we hold ourselves to when calling it.
 
-    ``rpm`` is per-model. NVIDIA caps around 40 requests/minute *per model*, so distinct models
-    get genuinely independent buckets; OpenRouter caps per-account instead, which the daily
-    ledger handles separately.
-
-    ``thinking`` controls Nemotron's reasoning pass. Measured on nemotron-3-nano: disabling it
-    via ``chat_template_kwargs`` cut a small structured reply from 63 completion tokens to 11.
-    Reasoning arrives in a separate ``reasoning_content`` field rather than mixed into the
-    answer, so this is purely a latency/credit decision — and for the writer also a UX one,
-    since a thinking pass delays the first visible token of a streamed answer.
+    ``thinking`` controls a model's reasoning pass. Off by default: on short structured stages it
+    multiplies completion tokens several times over, and for the writer it delays the first
+    visible word of the answer.
     """
 
     id: str
-    provider: str = "nim"
+    provider: str = "openrouter"
     rpm: int = 30
     ctx: int = 128_000
     max_out: int = 1024
@@ -151,303 +138,104 @@ class ModelSpec:
 
     @property
     def key(self) -> str:
-        """Provider-qualified id — both providers serve some of the same model names."""
+        """Provider-qualified id: both providers serve some of the same model names."""
         return f"{self.provider}:{self.id}"
 
 
-# Order is measured, not assumed — `python scripts/race_openrouter.py` reproduces it for about a
-# cent. The race uses the *real* planner prompt and requires the output to validate as a Plan,
-# and times the writer by first token, because that is what a reader feels. Toy prompts hid both.
+# Routing is measured, not assumed: `python scripts/race_models.py` reproduces it for about a
+# cent, timing the real planner prompt (output must validate as a Plan) and the writer by first
+# token, which is what a reader feels.
 #
-# OpenRouter is the primary provider; NVIDIA NIM stays at the end of each list as a free
-# failover with its own, independent rate limits.
+#   fast role (planner prompt)            median     valid   cost/call
+#     google/gemini-2.5-flash-lite        1,430 ms   2/2     $0.00020
+#     inception/mercury-2.5               1,475 ms   2/2     $0.00010
+#     nvidia/nemotron-3-nano-30b-a3b      1,912 ms   2/2     $0.00011
+#     nemotron-3.5-lightning:free        29,132 ms   2/2     free, and unusable
 #
-# fast role — planner prompt, 2 calls each, output must validate:
-#   google/gemini-2.5-flash-lite         1,430 ms   2/2 valid   $0.00020/call
-#   inception/mercury-2.5                1,475 ms   2/2 valid   $0.00010/call
-#   nvidia/nemotron-3-nano-30b-a3b       1,912 ms   2/2 valid   $0.00011/call
-#   openai/gpt-oss-20b · deepseek-v4     ~7,000 ms  2/2 valid
-#   qwen3.7-flash · gpt-5-nano           7-12 s     1/2 and 0/2 valid — rejected
-#   nemotron-3.5-lightning:free         29,132 ms  2/2 valid   free, and unusable
-#
-# The free model is the most important row. The fast role runs 4-6 times a question, so putting
-# it on the free tier would both take ~30 s a stage *and* spend the shared ~20/min allowance the
-# writer needs. A paid model here costs about a tenth of a cent per question.
-#
-# writer role — streamed, time to first token:
-#   nvidia/nemotron-3-super-120b:free      411 ms first token   1,090 ms total   free
-#   qwen/qwen3.7-flash                     906 ms               3,157 ms          $0.00008
-#   google/gemini-2.5-flash-lite         1,096 ms               1,526 ms          $0.00022
-#   gemma-4-31b:free · qwen3.8-27b:free    rate-limited (429) during the race
-#
-# The writer is one call per turn, which the free tier carries comfortably — and here the free
-# 120B is not a compromise, it is the fastest option measured.
-
-# Paid OpenRouter models are metered in money, not by the free tier's ~20/min, so they get a
-# realistic ceiling; 429s still back off.
-OPENROUTER_PAID_RPM = env_int("OPENROUTER_PAID_RPM", 60)
-
-# Cheap, high-frequency structured stages: planning, query writing, grading, gap analysis,
-# verification. Runs several times per question, so throughput matters more than eloquence.
+# The fast role runs 4-6 times a question, so a free model there would both take ~30 s a stage
+# and spend the shared allowance. A paid model costs about a tenth of a cent per question.
 FAST_MODELS: tuple[ModelSpec, ...] = (
-    ModelSpec("google/gemini-2.5-flash-lite", "openrouter", rpm=OPENROUTER_PAID_RPM,
+    ModelSpec("google/gemini-2.5-flash-lite", rpm=OPENROUTER_PAID_RPM,
               ctx=1_048_576, max_out=1400, temperature=0.1),
-    ModelSpec("inception/mercury-2.5", "openrouter", rpm=OPENROUTER_PAID_RPM,
+    ModelSpec("inception/mercury-2.5", rpm=OPENROUTER_PAID_RPM,
               ctx=260_000, max_out=1400, temperature=0.1),
-    ModelSpec("nvidia/nemotron-3-nano-30b-a3b", "openrouter", rpm=OPENROUTER_PAID_RPM,
+    ModelSpec("nvidia/nemotron-3-nano-30b-a3b", rpm=OPENROUTER_PAID_RPM,
               ctx=262_144, max_out=1400, temperature=0.1),
-    # free failover on independent limits
+    # failover on independent limits
     ModelSpec("nvidia/nemotron-3-nano-30b-a3b", "nim", rpm=30, max_out=1400, temperature=0.1),
     ModelSpec("nvidia/nemotron-3.5-lightning-30b-a3b", "nim", rpm=30, max_out=1400,
               temperature=0.1),
 )
 
-# The user-facing answer: one call a turn, streamed.
-#
-# The free 120B was first here on speed, and it was the wrong call. Over one session it failed
-# 12 times against 10 successes — 7 stream errors, and 5 connections dropped *after* text had
-# started, which is exactly what a reader saw as "the answer cuts off". A writer that breaks
-# half its streams is not fast, whatever its first-token time. qwen3.7-flash leads now: it
-# cited every step in both samples, reaches first token in ~0.9 s, and costs about a hundredth
-# of a cent an answer. The free model stays as a backstop, where its failures cost nothing.
+# The user-facing answer: one streamed call a turn. qwen3.7-flash leads because it streams
+# reliably: the free 120B was faster to its first token but, over one session, failed 12 of 22
+# streams, 5 of them after text had started, which a reader sees as an answer cutting off.
 WRITER_MODELS: tuple[ModelSpec, ...] = (
-    ModelSpec("qwen/qwen3.7-flash", "openrouter", rpm=OPENROUTER_PAID_RPM,
+    ModelSpec("qwen/qwen3.7-flash", rpm=OPENROUTER_PAID_RPM,
               ctx=1_000_000, max_out=1800, temperature=0.3),
-    ModelSpec("google/gemini-2.5-flash-lite", "openrouter", rpm=OPENROUTER_PAID_RPM,
+    ModelSpec("google/gemini-2.5-flash-lite", rpm=OPENROUTER_PAID_RPM,
               ctx=1_048_576, max_out=1800, temperature=0.3),
-    ModelSpec("nvidia/nemotron-3-super-120b-a12b:free", "openrouter", rpm=OPENROUTER_RPM,
+    ModelSpec("nvidia/nemotron-3-super-120b-a12b:free", rpm=OPENROUTER_RPM,
               ctx=262_144, max_out=1800, temperature=0.3),
-    # free failover on independent limits
     ModelSpec("nvidia/nemotron-3-super-120b-a12b", "nim", rpm=25, max_out=1600,
               temperature=0.3),
 )
 
-# Force a single model for experiments, as "provider:model-id".
+# Force a single model for an experiment, as "provider:model-id".
 FAST_MODEL_OVERRIDE = env_str("KYR_FAST_MODEL", "")
 WRITER_MODEL_OVERRIDE = env_str("KYR_WRITER_MODEL", "")
-FAST_MODEL = FAST_MODELS[0]
-WRITER_MODEL = WRITER_MODELS[0]
 
-
-# Optional remote reranker — used when the `lean` profile offloads reranking off-GPU.
-# Independent of the embedder (a cross-encoder reads text, not vectors), so it stays valid
-# even after `baai/bge-m3` leaves the hosted catalog.
-NIM_RERANK_MODEL = env_str("KYR_NIM_RERANK_MODEL", "nvidia/llama-3.2-nv-rerankqa-1b-v2")
-NIM_RERANK_ALTERNATES = (
-    "nvidia/llama-nemotron-rerank-1b-v2",
-    "nvidia/nv-rerankqa-mistral-4b-v3",
-)
-NIM_RERANK_RPM = env_int("KYR_NIM_RERANK_RPM", 30)
-
-# 429 / transient-failure policy. Deadlines, not retry counts, decide when to give up:
-# a rate limit must degrade the answer, never kill the turn.
+# 429 and transient-failure policy. Deadlines, not attempt counts, decide when to give up: a
+# rate limit should cost an answer some depth, never the whole turn.
 RETRY_INITIAL_DELAY = env_float("KYR_RETRY_INITIAL_DELAY", 2.0)
 RETRY_MAX_DELAY = env_float("KYR_RETRY_MAX_DELAY", 45.0)
 RETRY_MULTIPLIER = env_float("KYR_RETRY_MULTIPLIER", 2.0)
 RETRY_MAX_ATTEMPTS = env_int("KYR_RETRY_MAX_ATTEMPTS", 8)
 
-# AIMD self-tuning of the per-model buckets.
-AIMD_DECREASE = env_float("KYR_AIMD_DECREASE", 0.7)   # multiply rpm by this on a 429
+# AIMD self-tuning of the per-model request buckets.
+AIMD_DECREASE = env_float("KYR_AIMD_DECREASE", 0.7)   # multiply the rate by this on a 429
 AIMD_INCREASE = env_float("KYR_AIMD_INCREASE", 2.0)   # add this per clean minute
 AIMD_FLOOR_RPM = env_int("KYR_AIMD_FLOOR_RPM", 5)
 
-# Rough credit accounting so the UI can warn before the free tier runs dry.
-SESSION_CREDIT_BUDGET = env_int("KYR_SESSION_CREDIT_BUDGET", 0)  # 0 = unlimited/unknown
 
-
-# ── local models (embedder is corpus-locked; reranker is swappable) ───────────────────
-# Changing EMBED_MODEL invalidates the whole database — see DB README §8.
-EMBED_MODEL = env_str("KYR_EMBED_MODEL", "BAAI/bge-m3")
-EMBED_DIM = 1024
-EMBED_MAX_SEQ = env_int("KYR_EMBED_MAX_SEQ", 1024)
-
-# ── retrieval over the API ────────────────────────────────────────────────────────────
-# Both of these were local. Serving them over HTTP is the largest latency win available on a
-# small box — reranking 8 documents on one physical core measured 6,625 ms against ~830 ms over
-# the network — and it returns the 3.4 GB of RAM the two models held.
-#
-# The embedder is *the same model*, which is the only reason this is safe: OpenRouter's
-# `baai/bge-m3` was checked against vectors already in the corpus and matched at cosine 1.0000
-# (unrelated rows: 0.60). So no re-embedding of the 38,890 chunks is required. Verify it on any
-# machine with `python scripts/verify_embeddings.py` before trusting a deployment.
+# ── retrieval models (over OpenRouter) ────────────────────────────────────────────────
+# The embedder is corpus-locked: the database was built with bge-m3, and OpenRouter's copy was
+# verified against the stored vectors at cosine 1.0000 (scripts/verify_embeddings.py).
 EMBED_API_MODEL = env_str("KYR_EMBED_API_MODEL", "baai/bge-m3")
-
-# The reranker is a *different* model, so its scores live on a different scale and its
-# abstention thresholds must be recalibrated. The threshold key carries the model name, which is
-# what prevents a calibration being silently reused across the two.
-#   cohere/rerank-v3.5     ~830 ms   $0.001    /search   — faster
-#   qwen/qwen3-reranker-8b ~1190 ms  $0.000275 /search   — 3.6x cheaper
+EMBED_DIM = 1024
+# The reranker is swappable, but its scores have their own scale, so a new one needs
+# `python scripts/calibrate.py`.
+#   cohere/rerank-v3.5       ~830 ms   $0.001 a search
+#   qwen/qwen3-reranker-8b  ~1190 ms   $0.000275 a search
 RERANK_API_MODEL = env_str("KYR_RERANK_API_MODEL", "cohere/rerank-v3.5")
-
-# Short on purpose. A slow rerank should fall back to fused RRF scores and answer, not hold a
-# turn open — retrieval has a working degraded mode and using it beats waiting.
+# Short on purpose: a slow rerank should fall back to fused ranking, not hold a turn open.
 RETRIEVAL_API_TIMEOUT_S = env_float("KYR_RETRIEVAL_API_TIMEOUT_S", 20.0)
 RETRIEVAL_API_EMBED_BATCH = env_int("KYR_RETRIEVAL_API_EMBED_BATCH", 64)
-# Embedding and reranking are *paid* endpoints, so the free tier's shared ~20/min does not apply
-# to them. It was 12 here at first, which is right for free chat and badly wrong for this: the
-# limiter spaced calls 5 s apart, the eval measured a 5 s median for what is a ~640 ms search,
-# and a deep turn (4 rounds × 2 searches × embed + rerank) would have spent over a minute
-# waiting on its own throttle. 429s are still handled — Retry-After plus AIMD back-off — so this
-# is a ceiling, not a promise the provider has made.
+# Paid endpoints, so the free tier's ~20/min does not apply. A deep turn makes ~16 retrieval
+# calls, and a limit of 12/min once cost it a minute of waiting on its own throttle.
 RETRIEVAL_API_RPM = env_int("KYR_RETRIEVAL_API_RPM", 120)
-
-# Spend ceiling for embedding + reranking in one process, in US dollars. Retrieval is the only
-# metered-per-call part of the system, so this is where a runaway loop would actually cost
-# money. On reaching it the API degrades to local models, or to fused RRF if none are loadable —
-# the system keeps answering, just less well. 0 disables the ceiling.
-RETRIEVAL_API_BUDGET_USD = env_float("KYR_RETRIEVAL_API_BUDGET_USD", 2.0)
-
-# Cross-encoder cost is roughly linear in tokens and it dominates CPU retrieval — measured at
-# 6.6 s for 8 documents on one physical core, against 40 ms for the searches feeding it. These
-# two knobs exist for that case only; on a GPU the default 510 tokens in fp16 is already cheap.
-#   0 = use the model's own position limit.
-RERANK_MAX_LEN = env_int("KYR_RERANK_MAX_LEN", 0)
-# Dynamic int8 on the Linear layers, CPU only. Off by default, and that is a measured decision
-# rather than caution: quantising is roughly 2-3x faster but costs MRR 0.861 -> 0.829, top-1
-# 79% -> 76%, and one more stress question slipping past retrieval (10/11 -> 9/11). Turning it
-# on also invalidates the calibration — the thresholds are keyed by it, so scripts/calibrate.py
-# must be re-run afterwards or abstention degrades badly.
-#
-# Enable it, with the 256-token cap, when a box is too slow to demo:
-#     KYR_RERANK_QUANTIZE_CPU=true
-#     KYR_RERANK_MAX_LEN=256
-#     python scripts/calibrate.py          # required, not optional
-RERANK_QUANTIZE_CPU = env_bool("KYR_RERANK_QUANTIZE_CPU", False)
-EMBED_QUERY_PREFIX = ""  # bge-m3 encodes queries and passages symmetrically
-
-RERANK_QUALITY = env_str("KYR_RERANK_QUALITY", "BAAI/bge-reranker-v2-m3")
-RERANK_BALANCED = env_str("KYR_RERANK_BALANCED", "BAAI/bge-reranker-base")
-RERANK_CPU = env_str("KYR_RERANK_CPU", "BAAI/bge-reranker-base")
-
-
-@dataclass(frozen=True)
-class Profile:
-    """A measured resource plan. ``model_vram_mb`` is what the *models* occupy (weights plus
-    working activations), measured on an RTX 3050 with fp16 weights:
-
-        bge-m3            +1090 MiB
-        bge-reranker-base  +760 MiB   -> balanced = 1850
-        bge-reranker-v2-m3 +1394 MiB  -> quality  = 2484
-
-    A profile is selectable when ``free_vram >= model_vram_mb + VRAM_RESERVE_MB``, so the
-    reserve is what stays available to the desktop and everything else on the machine.
-    """
-
-    name: str
-    rerank_backend: str            # "local" | "api" | "nim" | "none"
-    rerank_model: str | None
-    model_vram_mb: int
-    embed_batch: int
-    rerank_batch: int
-    note: str = ""
-    # "local" loads bge-m3 into this process; "api" calls OpenRouter's copy of the same model.
-    # Because it is the same model — verified at cosine 1.0000 against the stored vectors — this
-    # is a transport choice, not a retrieval-quality one.
-    embed_backend: str = "local"   # "local" | "api"
-    # `lite` turns the embedder off entirely and runs on BM25 alone. Measured on the gold set:
-    # Recall@5 90.5% and MRR 0.769 against 100% / 0.873 for the full pipeline, at ~60 ms instead
-    # of ~400 ms, in under 1 GB of RAM. It works this well because the BM25 index covers
-    # `embed_text`, which carries the LLM-generated citizen questions — so keyword search is
-    # querying the way people ask, not raw statutory language.
-    # The real cost is abstention, not recall: without a reranker only 5 of the 11 stress
-    # questions are caught at retrieval level, so the planner's out_of_scope check carries it.
-    use_embedder: bool = True
-
-    @property
-    def needs_models(self) -> bool:
-        return self.use_embedder or self.rerank_backend == "local"
-
-
-# Everything over the network: no weights loaded, no GPU wanted, a few hundred MB of RAM for the
-# process itself. This is the deployment profile, and the reason it is first in the list is that
-# it is better than every local option on a machine without a GPU:
-#
-#   cpu       + local cross-encoder, pool 8   Recall@5 95.2%   6,625 ms rerank   3.4 GB RAM
-#   api       + cohere/rerank-v3.5            measured below     ~830 ms rerank   ~0 GB
-#
-# It is only selectable with an OpenRouter key, and it costs real money per search — a fraction
-# of a cent, bounded by RETRIEVAL_API_BUDGET_USD — so it is never chosen when no key is set.
-API = Profile("api", "api", None, model_vram_mb=0, embed_batch=64, rerank_batch=32,
-              embed_backend="api",
-              note="embedding and reranking over OpenRouter — no local weights, ~830 ms rerank")
-
-# Ordered best-first; the first profile that fits the probed machine wins.
-PROFILES: tuple[Profile, ...] = (
-    Profile("quality",  "local", RERANK_QUALITY,  model_vram_mb=2484, embed_batch=8, rerank_batch=16,
-            note="strongest multilingual reranker; ~0.85s per rerank batch"),
-    Profile("balanced", "local", RERANK_BALANCED, model_vram_mb=1850, embed_batch=8, rerank_batch=25,
-            note="multilingual reranker, ~0.39s per batch, keeps ~1.4 GB VRAM free"),
-    Profile("lean",     "nim",   None,            model_vram_mb=1090, embed_batch=4, rerank_batch=25,
-            note="embedding stays local (corpus-locked); reranking offloaded to NIM"),
-    Profile("cpu",      "local", RERANK_CPU,      model_vram_mb=0,    embed_batch=2, rerank_batch=8,
-            note="no usable CUDA; expect multi-second retrieval"),
-)
-
-# For CPU-only hosting: keep dense retrieval, drop the cross-encoder.
-#
-# This used to send reranking to NIM. That is not a real option — every NIM reranking endpoint
-# returns 410/404, so the profile silently degraded to fused RRF while still loading the
-# *uncalibrated* NIM thresholds, which is strictly worse than asking for no reranker at all.
-#
-# Measured on the gold set (42 questions), all four CPU-viable configurations:
-#
-#   embedder + cross-encoder, pool 24   Recall@5 100%    MRR 0.873   ~20 s   <- unusable on 2 vCPU
-#   embedder + cross-encoder, pool 12   Recall@5  95.2%  MRR 0.849   ~10 s   <- still too slow
-#   embedder, no cross-encoder (this)   Recall@5  93%    MRR 0.787   ~90 ms
-#   neither (`lite`)                    Recall@5  90.5%  MRR 0.769   ~60 ms
-#
-# The cross-encoder is worth 7 points of Recall@5 and it is the right default wherever there is
-# a GPU. On two shared vCPUs it costs 20 seconds a question, which no demo survives, so this
-# profile trades those 7 points for a response that arrives while somebody is still watching.
-CPU_LEAN = Profile("cpu_lean", "none", None, model_vram_mb=0, embed_batch=2, rerank_batch=25,
-                   note="dense + BM25 on CPU, no cross-encoder — Recall@5 93% in ~90 ms")
-
-# For a box too small to hold bge-m3 at all — a 1-2 GB free-tier instance. Never selected
-# automatically: it trades real retrieval quality for fitting, and that should be a decision
-# somebody makes, not something that quietly happens.
-LITE = Profile("lite", "none", None, model_vram_mb=0, embed_batch=1, rerank_batch=1,
-               use_embedder=False,
-               note="BM25 only — no models, <1 GB RAM, Recall@5 90.5% at ~60 ms")
-
-PROFILES = PROFILES + (CPU_LEAN, API)
-
-# auto | api | quality | balanced | lean | cpu | cpu_lean | lite
-PROFILE_REQUEST = env_str("KYR_PROFILE", "auto")
-# Prefer the API profile during auto-selection when a key is configured and no GPU is usable.
-# Off by default so `auto` keeps its existing meaning on a developer machine; the installer sets
-# it explicitly for a deployment, where it is unambiguously the right choice.
-PREFER_API_PROFILE = env_bool("KYR_PREFER_API_PROFILE", False)
-# 1 GB left for the desktop. This is what makes `balanced` rather than `quality` the default
-# on a 4 GB laptop card that is also driving a display.
-VRAM_RESERVE_MB = env_int("KYR_VRAM_RESERVE_MB", 1024)
-RAM_FLOOR_MB = env_int("KYR_RAM_FLOOR_MB", 1200)          # refuse to load below this
-RAM_LOAD_HEADROOM_MB = env_int("KYR_RAM_LOAD_HEADROOM_MB", 2600)  # bge-m3 load spike (measured 2329 MB)
-MODEL_IDLE_EVICT_S = env_int("KYR_MODEL_IDLE_EVICT_S", 0)  # 0 = never evict
-GPU_OOM_RETRIES = env_int("KYR_GPU_OOM_RETRIES", 2)       # batch halvings before falling back
 
 
 # ── retrieval ─────────────────────────────────────────────────────────────────────────
 FETCH_K = env_int("KYR_FETCH_K", 25)          # per ranked list, before fusion
 TOP_K = env_int("KYR_TOP_K", 5)               # sections returned to the answer layer
-RERANK_POOL = env_int("KYR_RERANK_POOL", 24)  # candidates that reach the cross-encoder
+RERANK_POOL = env_int("KYR_RERANK_POOL", 24)  # candidates that reach the reranker
 RRF_K = env_int("KYR_RRF_K", 60)
-# BM25 score treated as "certainly relevant" when no reranker is available. Measured on
+# A BM25 score treated as "certainly relevant" when ranking without a reranker. Measured on
 # this corpus: on-topic legal queries peak around 24-31, off-topic ones around 13-19.
 BM25_FULL_SCORE = env_float("KYR_BM25_FULL_SCORE", 40.0)
 MMR_LAMBDA = env_float("KYR_MMR_LAMBDA", 0.6)
-# When the question names a specific Act, several sections *of that Act* is the right answer,
-# so diversity is dialled down rather than spreading results across unrelated statutes.
+# When the question names an Act, several sections of that Act is the right answer, so
+# diversity is dialled down rather than spread across unrelated statutes.
 MMR_LAMBDA_FOCUSED = env_float("KYR_MMR_LAMBDA_FOCUSED", 0.85)
 # Without a reranker the base ordering is weaker, so diversity costs more than it returns.
 MMR_LAMBDA_NO_RERANK = env_float("KYR_MMR_LAMBDA_NO_RERANK", 0.97)
-# How much extra weight a ranked list restricted to a named Act carries in the fusion.
+# Extra weight for ranked lists restricted to an Act the question names.
 ACT_FILTER_WEIGHT = env_float("KYR_ACT_FILTER_WEIGHT", 2.5)
 
-# The general law of the land. Dozens of sectoral statutes grant *someone* a power of arrest —
-# forest officers, naval authorities, railway police — and they rank well for a query like
-# "can the police arrest me" while being useless to the person asking. When a question is
-# plainly about crime or policing and names no particular Act, these four get their own
-# weighted ranked lists so the general code outranks the specialist one.
+# The general law of the land. Dozens of sectoral statutes grant someone a power of arrest, and
+# they rank well for "can the police arrest me" while being useless to the person asking. When a
+# question is plainly about crime or policing and names no Act, these get weighted lists.
 GENERAL_CODES = (
     "Constitution of India",
     "Bharatiya Nyaya Sanhita, 2023",
@@ -455,107 +243,99 @@ GENERAL_CODES = (
     "Bharatiya Sakshya Adhiniyam, 2023",
 )
 GENERAL_CODE_WEIGHT = env_float("KYR_GENERAL_CODE_WEIGHT", 2.0)
-# Applied to the *ordering* after reranking, not to the reported score. Large enough to beat
-# a near-tie, since sectoral and general provisions are often worded almost identically.
+# Applied to the ordering after reranking, as fractions of the query's best score so they mean
+# the same thing on any reranker's scale: a general code within the eligible fraction of the best
+# candidate is lifted by the boost fraction. It settles near-ties; it never rescues bad rows.
 GENERAL_CODE_BOOST = env_float("KYR_GENERAL_CODE_BOOST", 0.25)
-# Both are fractions of the query's best cross-encoder score, so they mean the same thing on
-# every reranker's scale. A general code must already score at least this fraction of the best
-# candidate to be boosted: the boost settles near-ties, it does not rescue irrelevant rows.
 GENERAL_CODE_ELIGIBLE = env_float("KYR_GENERAL_CODE_ELIGIBLE", 0.5)
-# Show the cross-encoder each section's citizen questions as well as its text. See
-# search._rerank_document for what this fixed and what it measured.
+# Show the reranker each section's citizen questions as well as its text (ranking.py explains).
 RERANK_WITH_QUESTIONS = env_bool("KYR_RERANK_WITH_QUESTIONS", True)
-# Words that mean "this is a general criminal-law or policing question".
+# Words that mark a general criminal-law or policing question.
 CRIMINAL_TRIGGERS = (
     "police", "arrest", "arrested", "custody", "detain", "detention", "bail", "fir",
     "offence", "offense", "crime", "criminal", "punishment", "penalty", "imprison",
     "jail", "magistrate", "accused", "charge", "prosecut", "remand", "interrogat",
     "search warrant", "seizure", "handcuff", "lock-up", "lockup",
 )
-TOPK_MIN, TOPK_MAX = 2, 12
 
-# Thresholds are reranker-specific: a local sigmoid score and a NIM logit live on different
-# scales. scripts/calibrate.py re-derives these per profile and writes them to
-# .runtime/thresholds.json, which overrides these defaults at load time.
-LOW_SCORE = env_float("KYR_LOW_SCORE", 0.05)          # below this -> abstain, go to the web
-CITE_MIN_SCORE = env_float("KYR_CITE_MIN_SCORE", 0.20)  # pre-filter before the LLM grader
+# Abstention and citation cut-offs. Scores are ranking-method specific, so these are only the
+# fallback: calibrated values ship in knowyourrights/thresholds.json, and a local run of
+# scripts/calibrate.py writes .runtime/thresholds.json, which wins.
+LOW_SCORE = env_float("KYR_LOW_SCORE", 0.05)            # below this, abstain
+CITE_MIN_SCORE = env_float("KYR_CITE_MIN_SCORE", 0.20)  # below this, never cited
 THRESHOLDS_FILE = RUNTIME_DIR / "thresholds.json"
+PACKAGED_THRESHOLDS = Path(__file__).resolve().parent / "thresholds.json"
 
 
 # ── research depth ────────────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class DepthBudget:
     name: str
-    max_rounds: int
-    max_crawls: int
-    nav_depth: int
-    max_llm_calls: int
-    deadline_s: float
-    max_queries_per_subq: int
+    max_rounds: int      # research rounds (gap analysis decides whether another is needed)
+    max_crawls: int      # web pages read in full
+    nav_depth: int       # link levels followed inside a portal
+    deadline_s: float    # wall-clock budget; research stops and the answer is written from
+                         # what was found
 
 
 DEPTHS: dict[str, DepthBudget] = {
-    "quick":    DepthBudget("quick",    max_rounds=1, max_crawls=0,  nav_depth=0, max_llm_calls=4,  deadline_s=25,  max_queries_per_subq=1),
-    "standard": DepthBudget("standard", max_rounds=1, max_crawls=3,  nav_depth=1, max_llm_calls=8,  deadline_s=75,  max_queries_per_subq=3),
-    "deep":     DepthBudget("deep",     max_rounds=4, max_crawls=10, nav_depth=2, max_llm_calls=20, deadline_s=240, max_queries_per_subq=4),
+    "quick": DepthBudget("quick", max_rounds=1, max_crawls=0, nav_depth=0, deadline_s=25),
+    "standard": DepthBudget("standard", max_rounds=1, max_crawls=3, nav_depth=1, deadline_s=75),
+    "deep": DepthBudget("deep", max_rounds=4, max_crawls=10, nav_depth=2, deadline_s=240),
 }
-DEFAULT_DEPTH = env_str("KYR_DEFAULT_DEPTH", "auto")
 
 
 # ── context window management ─────────────────────────────────────────────────────────
-# Deliberately far below the model's advertised window: latency, credits and
-# lost-in-the-middle all degrade long before the context limit does.
+# Far below the models' advertised windows: latency, cost and lost-in-the-middle all degrade
+# long before the context limit does.
 WRITER_INPUT_BUDGET_TOKENS = env_int("KYR_WRITER_INPUT_BUDGET", 14_000)
-FAST_INPUT_BUDGET_TOKENS = env_int("KYR_FAST_INPUT_BUDGET", 8_000)
 CONTEXT_SAFETY_TOKENS = env_int("KYR_CONTEXT_SAFETY", 512)
 
 STATUTE_TEXT_CAP = env_int("KYR_STATUTE_TEXT_CAP", 2600)   # chars per statute section
-WEB_TEXT_CAP = env_int("KYR_WEB_TEXT_CAP", 1800)           # chars per web/crawl source
+WEB_TEXT_CAP = env_int("KYR_WEB_TEXT_CAP", 1800)           # chars per web or crawled source
 WIKI_TEXT_CAP = env_int("KYR_WIKI_TEXT_CAP", 1200)
 PAGE_CHUNK_CHARS = env_int("KYR_PAGE_CHUNK_CHARS", 1400)   # crawled-page chunk size
-PAGE_CHUNKS_KEPT = env_int("KYR_PAGE_CHUNKS_KEPT", 3)      # top chunks kept per page
+PAGE_CHUNKS_KEPT = env_int("KYR_PAGE_CHUNKS_KEPT", 3)      # best chunks kept per page
 
 HISTORY_TURNS_VERBATIM = env_int("KYR_HISTORY_TURNS", 4)
 HISTORY_SUMMARY_TRIGGER = env_int("KYR_HISTORY_SUMMARY_TRIGGER", 8)
-# Each past answer is capped on its own before the history budget is spent. A follow-up needs
-# to know *what was answered*, not all of it — and without a per-turn cap one long answer
-# (they run to ~3,000 characters) evicted every turn before it.
+# Each past answer is capped on its own before the history budget is spent: a follow-up needs to
+# know what was answered, not all of it, and one long answer must not evict every earlier turn.
 HISTORY_ANSWER_CAP_TOKENS = env_int("KYR_HISTORY_ANSWER_CAP_TOKENS", 220)
-# A past source is only offered back to a new question if it shares this fraction of the
-# question's content words. It is a pre-filter — the grader then judges everything recalled.
+# A past source is offered back to a new question only if it shares this fraction of the
+# question's content words. A pre-filter: the grader then judges everything recalled.
 RECALL_MIN_SHARE = env_float("KYR_RECALL_MIN_SHARE", 0.34)
+# Sources remembered per conversation for follow-ups; the oldest are dropped past this.
+SESSION_POOL_MAX = env_int("KYR_SESSION_POOL_MAX", 40)
 
 
-# ── web search & crawling ─────────────────────────────────────────────────────────────
+# ── web search and crawling ───────────────────────────────────────────────────────────
 WEB_MAX_RESULTS = env_int("KYR_WEB_MAX_RESULTS", 5)
 WEB_TIMEOUT = env_float("KYR_WEB_TIMEOUT", 8.0)
 # Keyless search engines, tried in this order. ddgs's "auto" picks at random and falls through
-# slowly when one rate-limits: Brave returned 429 all afternoon and each search cost 6-8 s
-# before giving up, against 1-2 s for this list (measured, same queries).
-WEB_BACKENDS = os.environ.get("KYR_WEB_BACKENDS", "duckduckgo,yahoo,yandex")
+# slowly when one rate-limits: measured 6-8 s per search against 1-2 s for this list.
+WEB_BACKENDS = env_str("KYR_WEB_BACKENDS", "duckduckgo,yahoo,yandex")
 WEB_CACHE_TTL = env_int("KYR_WEB_CACHE_TTL", 1800)
 WEB_MAX_PER_MIN = env_int("KYR_WEB_MAX_PER_MIN", 10)
 
 WIKI_MAX_RESULTS = env_int("KYR_WIKI_MAX_RESULTS", 2)
 WIKI_TIMEOUT = env_float("KYR_WIKI_TIMEOUT", 10.0)
 
-# Per page. Measured, government pages load three at a time in ~4.4 s, so 25 s only ever served
-# the outlier — and one outlier held the whole answer: a deposit question took 38 s to its first
-# token where the same question normally takes 16. A page that has not answered in 10 s is
-# dropped, and the answer is written from the pages that did.
+# Per page. Government pages load three at a time in ~4.4 s; a page that has not answered in
+# 10 s is dropped and the answer is written from the pages that did.
 CRAWL_TIMEOUT_S = env_float("KYR_CRAWL_TIMEOUT_S", 10.0)
-# The whole batch — several pages fetched together — gets this long, and keeps whatever has
-# arrived by then. A slow page costs only itself; it no longer takes the fast ones with it.
+# A batch keeps whatever has arrived within this budget, so a slow page costs only itself.
 CRAWL_BATCH_BUDGET_S = env_float("KYR_CRAWL_BATCH_BUDGET_S", 14.0)
 CRAWL_CACHE_TTL = env_int("KYR_CRAWL_CACHE_TTL", 86_400)
 CRAWL_MAX_CONCURRENT = env_int("KYR_CRAWL_MAX_CONCURRENT", 3)
-CRAWL_USE_BROWSER = env_bool("KYR_CRAWL_USE_BROWSER", True)   # escalate to Chromium when needed
+CRAWL_USE_BROWSER = env_bool("KYR_CRAWL_USE_BROWSER", True)   # escalate to Chromium if needed
 CRAWL_BROWSER_IDLE_S = env_int("KYR_CRAWL_BROWSER_IDLE_S", 180)
 CRAWL_MIN_CHARS = env_int("KYR_CRAWL_MIN_CHARS", 400)         # below this, retry with a browser
 CRAWL_RESPECT_ROBOTS = env_bool("KYR_CRAWL_RESPECT_ROBOTS", True)
 CRAWL_USER_AGENT = env_str(
     "KYR_CRAWL_USER_AGENT",
-    "KnowYourRights/0.1 (public legal-information assistant; +https://github.com/)",
+    "KnowYourRights/1.0 (public legal-information assistant; "
+    "+https://github.com/DamnKuldeep/KnowYourRightsAI)",
 )
 
 # Trust tiers. Higher wins when the writer must choose between conflicting sources.
@@ -573,7 +353,7 @@ OFFICIAL_DOMAINS = (
 LEGAL_PORTAL_DOMAINS = ("indiankanoon.org", "prsindia.org", "barandbench.com", "livelaw.in")
 
 
-# ── safety ────────────────────────────────────────────────────────────────────────────
+# ── safety and jurisdiction ───────────────────────────────────────────────────────────
 HELPLINES = (
     ("Emergency (police / fire / ambulance)", "112"),
     ("Women's helpline", "1091"),
@@ -588,16 +368,8 @@ DISCLAIMER = (
     "for your situation consult a qualified lawyer, or call NALSA on 15100 for free legal aid."
 )
 
-CATEGORIES = (
-    "Fundamental Rights", "Criminal & Police", "Consumer & Services",
-    "Employment & Labour", "Family & Marriage", "Property & Housing",
-    "Women & Children", "Privacy & Data", "Health & Medicine", "Education",
-    "Environment", "Taxation & Finance", "Business & Companies", "Information & RTI",
-    "Civil Procedure & Courts", "Transport & Motor", "Government & Administration", "Other",
-)
-
-# The corpus is central law but a few state acts leak in, and the `jurisdiction` column is
-# unreliable — the act title is the trustworthy signal. See DB README §9.
+# The corpus is central law, but a few state Acts leaked in and its `jurisdiction` column is
+# unreliable, so an Act's title is the trustworthy signal (DB README §9).
 STATE_PREFIXES = (
     "Andhra Pradesh", "Arunachal", "Assam", "Bihar", "Chhattisgarh", "Goa", "Gujarat",
     "Haryana", "Himachal", "Jharkhand", "Karnataka", "Kerala", "Madhya Pradesh",
@@ -606,15 +378,9 @@ STATE_PREFIXES = (
     "Uttar Pradesh", "Uttarakhand", "West Bengal", "Jammu", "Puducherry", "Pondicherry",
 )
 
-# Acts Parliament passed *for* a Union Territory. The DB README calls these "genuinely central",
-# and as to who enacted them that is true — but the label a reader sees answers a different
-# question, "does this apply to me?", and a Delhi Act applies only in Delhi whoever passed it.
-# Treating them as all-India law put the Delhi Rent Act at the top of a *Mumbai* deposit question
-# labelled "Central law — applies across India". 44 Acts in the corpus carry these prefixes.
-#
-# (prefix, the place it is limited to). Longest prefix first, so "National Capital Territory of
-# Delhi" is matched before "Delhi". The place names must match INDIAN_STATES below, because that
-# is what the user picks in the UI and what applies_in() compares against.
+# Acts Parliament passed for a Union Territory: not state law, but not all-India law either. A
+# Delhi Act applies only in Delhi whoever enacted it. (prefix, place), longest prefix first; the
+# places must match INDIAN_STATES, which is what the user picks in the UI.
 TERRITORY_PREFIXES: tuple[tuple[str, str], ...] = (
     ("National Capital Territory of Delhi", "Delhi"),
     ("New Delhi", "Delhi"),
@@ -628,8 +394,7 @@ TERRITORY_PREFIXES: tuple[tuple[str, str], ...] = (
     ("Ladakh", "Ladakh"),
 )
 
-# What the user can pick as "where I am". States and Union Territories alike, because both
-# decide whether a territorially-limited Act governs them.
+# What the user can pick as "where I am": states and Union Territories alike.
 INDIAN_STATES = (
     "Andaman and Nicobar Islands", "Andhra Pradesh", "Arunachal Pradesh", "Assam", "Bihar",
     "Chandigarh", "Chhattisgarh", "Dadra and Nagar Haveli and Daman and Diu", "Delhi", "Goa",
@@ -644,10 +409,27 @@ INDIAN_STATES = (
 HOST = env_str("KYR_HOST", "127.0.0.1")
 PORT = env_int("KYR_PORT", 8000)
 LOG_LEVEL = env_str("KYR_LOG_LEVEL", "INFO")
-TRACE_ENABLED = env_bool("KYR_TRACE", True)
 
+SESSION_MAX = env_int("KYR_SESSION_MAX", 200)            # conversations held in memory
+SESSION_TTL_S = env_int("KYR_SESSION_TTL_S", 6 * 3600)   # idle time before one is dropped
 
-def ensure_runtime_dirs() -> None:
-    """Create the writable runtime tree. Safe to call repeatedly."""
-    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+# ── public deployment guards ──────────────────────────────────────────────────────────
+# At most this many answers are researched at once; later questions wait in a first-come queue
+# and are shown their place in line. Past the queue's length, or its wait, they are turned away.
+MAX_ACTIVE_TURNS = env_int("KYR_MAX_ACTIVE_TURNS", 5)
+MAX_QUEUED_TURNS = env_int("KYR_MAX_QUEUED_TURNS", 20)
+QUEUE_TIMEOUT_S = env_float("KYR_QUEUE_TIMEOUT_S", 180.0)
+# Per client (IP address): questions in progress or queued, and questions per minute.
+CLIENT_MAX_PENDING = env_int("KYR_CLIENT_MAX_PENDING", 2)
+CLIENT_RPM = env_int("KYR_CLIENT_RPM", 10)
+# Dollars each client may spend before being told the free allowance is used up. The window is
+# how long before that allowance resets; 0 means it never does. 0 dollars disables the limit.
+CLIENT_BUDGET_USD = env_float("KYR_CLIENT_BUDGET_USD", 1.0)
+CLIENT_BUDGET_WINDOW_H = env_float("KYR_CLIENT_BUDGET_WINDOW_H", 0.0)
+# A ceiling on the whole service's spend per UTC day, whoever spends it. 0 disables it.
+DAILY_BUDGET_USD = env_float("KYR_DAILY_BUDGET_USD", 5.0)
+# Behind a reverse proxy or tunnel every request arrives from the proxy's address. Set this only
+# when one is in front of the app, or clients could claim any address they like.
+TRUST_PROXY_HEADERS = env_bool("KYR_TRUST_PROXY_HEADERS", False)
+# Bearer token for /api/status. Without one, that endpoint answers only from this machine.
+ADMIN_TOKEN = env_key("KYR_ADMIN_TOKEN")

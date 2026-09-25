@@ -9,13 +9,14 @@ something in the pipeline is worth *seeing*:
 * ``source``            — populates the citations panel **before** the prose starts
 * ``notice`` with ``resume_in_s`` — turns a rate-limit stall into a visible countdown
 * ``verdict``           — whether the answer's citations actually check out
+* ``queue`` / ``limit``  — the reader's place in line, and a usage limit being reached
 """
 
 from __future__ import annotations
 
 import json
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -75,7 +76,8 @@ def notice(text: str, level: str = "info", resume_in_s: float | None = None, **e
 
 def safety(helplines: list[tuple[str, str]], text: str) -> Event:
     return Event("safety", {"text": text,
-                            "helplines": [{"label": l, "number": n} for l, n in helplines]})
+                            "helplines": [{"label": name, "number": number}
+                                          for name, number in helplines]})
 
 
 def token(delta: str) -> Event:
@@ -104,5 +106,11 @@ def error(message: str, recoverable: bool = True) -> Event:
     return Event("error", {"message": message, "recoverable": recoverable})
 
 
-def as_dict(event: Event) -> dict:
-    return asdict(event)
+def queued(position: int) -> Event:
+    """The reader's place in line while the service is busy; 0 once their answer starts."""
+    return Event("queue", {"position": position})
+
+
+def limit(kind: str, message: str) -> Event:
+    """A usage limit was reached: ``client_budget`` or ``daily_budget``."""
+    return Event("limit", {"kind": kind, "message": message})

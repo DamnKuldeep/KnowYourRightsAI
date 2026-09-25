@@ -1,13 +1,12 @@
 """Which model, on which provider, answers for each role.
 
-Two providers rather than one, because a single hosted catalogue turned out to be an
-unreliable dependency. Observed on NVIDIA during development: a healthy model returning 410
-Gone on one call and answering normally on the next, every reranking endpoint returning 410 or
-404, plain 503s, and per-call latency swinging from 1 s to 2.6 s. None of that is a reason to
-stop working — it is a reason to have somewhere else to go.
+Two providers rather than one, because a single hosted catalogue is an unreliable dependency:
+healthy models returning 410 Gone on one call and answering on the next, plain 503s, and
+latency swinging from 1 s to 2.6 s were all observed. None of that is a reason to stop working;
+it is a reason to have somewhere else to go.
 
-So each role has an ordered list of ``ModelSpec`` spanning both NVIDIA NIM and OpenRouter, and
-the first that answers wins. Sidelining is temporary: a failure takes a model out of rotation
+So each role has an ordered list of ``ModelSpec`` spanning OpenRouter and NVIDIA NIM, and the
+first that answers wins. Sidelining is temporary: a failure takes a model out of rotation
 for this process, and only three failures inside an hour are written to disk. NVIDIA's 410s are
 often transient, and permanently retiring a healthy model over one blip is the bug this policy
 exists to prevent.
@@ -22,10 +21,12 @@ import time
 from typing import Literal
 
 from .. import config
+from .errors import ModelUnavailable
 
 log = logging.getLogger(__name__)
 
-ModelRole = Literal["fast", "writer", "rerank"]
+ModelRole = Literal["fast", "writer"]
+ROLES: tuple[ModelRole, ...] = ("fast", "writer")
 
 PERSIST_AFTER_FAILURES = 3
 UNAVAILABLE_TTL_S = 3600.0
@@ -46,23 +47,20 @@ def probe_file():
 
 # ── candidates ────────────────────────────────────────────────────────────────────────
 def _parse_override(raw: str, fallback: config.ModelSpec) -> config.ModelSpec | None:
-    """Accept "provider:model-id" or a bare model id (assumed NIM)."""
+    """Accept "provider:model-id" or a bare model id (assumed to be on OpenRouter)."""
     raw = (raw or "").strip()
     if not raw:
         return None
     provider, _, model_id = raw.partition(":")
     if provider not in config.PROVIDERS:
-        provider, model_id = "nim", raw
+        provider, model_id = "openrouter", raw
     return config.ModelSpec(model_id, provider, rpm=fallback.rpm, ctx=fallback.ctx,
                             max_out=fallback.max_out, temperature=fallback.temperature)
 
 
 def candidates(role: ModelRole) -> list[config.ModelSpec]:
     """Every model that could serve this role, best first, configured providers only."""
-    if role == "rerank":
-        specs = [config.ModelSpec(m, "nim", rpm=config.NIM_RERANK_RPM, ctx=8192, max_out=0)
-                 for m in (config.NIM_RERANK_MODEL, *config.NIM_RERANK_ALTERNATES)]
-    elif role == "fast":
+    if role == "fast":
         override = _parse_override(config.FAST_MODEL_OVERRIDE, config.FAST_MODELS[0])
         specs = [override] if override else list(config.FAST_MODELS)
     else:
@@ -79,20 +77,15 @@ def spec(role: ModelRole) -> config.ModelSpec:
         persisted = _expired_pruned(state)
         options = candidates(role)
         if not options:
-            raise RuntimeError(
-                f"No provider is configured for role {role!r}. Set NVIDIA_API_KEY or "
-                f"OPENROUTER_API_KEY in .env."
-            )
+            raise ModelUnavailable(
+                f"No model provider is configured for role {role!r}: set OPENROUTER_API_KEY "
+                f"(or NVIDIA_API_KEY) in the environment.")
 
         # A provider whose daily allowance is spent is skipped rather than tried and refused.
         # OpenRouter's free tier is capped per day, so hitting it is a certainty, not an error.
         affordable = [o for o in options if _within_budget(o.provider, o.id)]
         usable = affordable or options          # all spent: try anyway rather than do nothing
 
-        pinned = state.get("resolved", {}).get(role)
-        for option in usable:
-            if option.key == pinned and _usable(option.key, persisted):
-                return option
         for option in usable:
             if _usable(option.key, persisted):
                 return option
@@ -138,7 +131,7 @@ def _load() -> dict:
         try:
             _state = json.loads(probe_file().read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            _state = {"resolved": {}, "unavailable": [], "failures": {}}
+            _state = {"unavailable": [], "failures": {}}
     return _state
 
 
@@ -167,56 +160,51 @@ def _expired_pruned(state: dict) -> set[str]:
     return persisted
 
 
-def pin(role: ModelRole, key: str) -> None:
-    """Record that ``key`` answered for ``role``."""
+def mark_unavailable(key: str, reason: str = "",
+                     role: ModelRole | None = None) -> config.ModelSpec | None:
+    """Take a model out of rotation and return the next candidate for ``role``.
+
+    The role matters: one model can serve several roles, and the next candidate after it differs
+    between them. Without the role, a writer failure on a model that also serves the fast role
+    returned the fast role's next model, and the answer was written by a planner model.
+    """
     with _lock:
         state = _load()
-        state.setdefault("resolved", {})[role] = key
-        if key in state.get("unavailable", []):
-            state["unavailable"].remove(key)
-        state.get("failures", {}).pop(key, None)
-        _sidelined.pop(key, None)
+        persisted = _record_failure(state, key, reason)
         _save()
-
-
-def mark_unavailable(key: str, reason: str = "") -> config.ModelSpec | None:
-    """Take a model out of rotation and return the next candidate for its role."""
-    now = time.time()
-    with _lock:
-        state = _load()
-        failures = state.setdefault("failures", {})
-        record = failures.get(key) or {"count": 0, "first": now}
-        if now - record.get("last", record["first"]) > UNAVAILABLE_TTL_S:
-            record = {"count": 0, "first": now}          # a new streak, not a continuation
-        record.update(count=record["count"] + 1, last=now, reason=reason)
-        failures[key] = record
-        _sidelined[key] = now
-
-        persisted = set(state.get("unavailable", []))
-        if record["count"] >= PERSIST_AFTER_FAILURES and key not in persisted:
-            persisted.add(key)
-            state["unavailable"] = sorted(persisted)
-            log.warning("%s failed %d times — recording it as unavailable%s",
-                        key, record["count"], f" ({reason})" if reason else "")
+        role = role or next((r for r in ROLES if any(o.key == key for o in candidates(r))), None)
+        if role is None:
+            return None
+        nxt = next((o for o in candidates(role) if _usable(o.key, persisted)), None)
+        if nxt:
+            log.warning("role %r falling back to %s", role, nxt.key)
         else:
-            log.warning("%s unavailable this run (failure %d/%d)%s",
-                        key, record["count"], PERSIST_AFTER_FAILURES,
-                        f" ({reason})" if reason else "")
+            log.error("role %r has no reachable model left", role)
+        return nxt
 
-        for role in ("fast", "writer", "rerank"):
-            options = candidates(role)
-            if any(o.key == key for o in options):
-                if state.get("resolved", {}).get(role) == key:
-                    state["resolved"].pop(role, None)
-                _save()
-                nxt = next((o for o in options if _usable(o.key, persisted)), None)
-                if nxt:
-                    log.warning("role %r falling back to %s", role, nxt.key)
-                else:
-                    log.error("role %r has no reachable model left", role)
-                return nxt
-        _save()
-        return None
+
+def _record_failure(state: dict, key: str, reason: str) -> set[str]:
+    """Count the failure; persist the model as unavailable after repeated failures in an hour."""
+    now = time.time()
+    failures = state.setdefault("failures", {})
+    record = failures.get(key) or {"count": 0, "first": now}
+    if now - record.get("last", record["first"]) > UNAVAILABLE_TTL_S:
+        record = {"count": 0, "first": now}          # a new streak, not a continuation
+    record.update(count=record["count"] + 1, last=now, reason=reason)
+    failures[key] = record
+    _sidelined[key] = now
+
+    persisted = set(state.get("unavailable", []))
+    suffix = f" ({reason})" if reason else ""
+    if record["count"] >= PERSIST_AFTER_FAILURES and key not in persisted:
+        persisted.add(key)
+        state["unavailable"] = sorted(persisted)
+        log.warning("%s failed %d times — recording it as unavailable%s",
+                    key, record["count"], suffix)
+    else:
+        log.warning("%s unavailable this run (failure %d/%d)%s",
+                    key, record["count"], PERSIST_AFTER_FAILURES, suffix)
+    return persisted
 
 
 def mark_available(key: str) -> None:
@@ -236,15 +224,14 @@ def mark_available(key: str) -> None:
 def snapshot() -> dict:
     state = _load()
     roles = {}
-    for role in ("fast", "writer", "rerank"):
+    for role in ROLES:
         try:
             roles[role] = resolve(role)
-        except RuntimeError:
+        except ModelUnavailable:
             roles[role] = None
     return {
         "roles": roles,
-        "candidates": {role: [s.key for s in candidates(role)]
-                       for role in ("fast", "writer", "rerank")},
+        "candidates": {role: [s.key for s in candidates(role)] for role in ROLES},
         "unavailable": list(state.get("unavailable", [])),
         "sidelined_this_run": sorted(_sidelined),
         "providers": {p: config.provider_available(p) for p in config.PROVIDERS},

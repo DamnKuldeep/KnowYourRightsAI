@@ -1,22 +1,16 @@
 """The search contract: hybrid retrieve -> fuse -> de-duplicate -> rerank -> diversify.
 
-Follows DB README §11, with four deliberate changes:
+Four decisions shape it:
 
-1. **Multi-query fusion.** Every reformulation contributes its own dense and BM25 ranked list
-   and they all enter one RRF pass. A citizen's phrasing and the statute's phrasing rarely
-   overlap; asking several ways and fusing is the cheapest fix (an extra query costs ~25 ms
-   of GPU, and reranking still happens once).
-
-2. **Rank-preserving de-duplication.** Collapsing to one row per section keeps the *best
-   ranked* chunk rather than whichever row pandas happened to see first.
-
-3. **Stored-vector MMR.** Diversity is computed against the vectors that were actually
-   indexed, read back from LanceDB in ~25 ms. The notebook re-encoded ``chunk_text``, but the
-   index holds vectors of ``embed_text`` — so its diversity was measured in a space that was
-   never searched, and it cost a dozen long encodes per query.
-
-4. **A degradation ladder.** No embedder means BM25 alone; no reranker means fused RRF
-   ranking with its own threshold. Both are worse, both are honest, neither is an error.
+1. **Multi-query fusion.** Every phrasing contributes its own dense and BM25 ranked list and all
+   of them enter one RRF pass. A citizen's wording and a statute's rarely overlap, and asking
+   several ways is the cheapest fix. Reranking still happens once.
+2. **Rank-preserving de-duplication.** One row per section, keeping its best-ranked chunk.
+3. **Stored-vector MMR.** Diversity is computed against the vectors that were actually indexed,
+   read back from LanceDB, not against re-encoded text in a space that was never searched.
+4. **A degradation ladder.** No embeddings means BM25 alone; no reranker means ordering by fused
+   scores with their own calibrated threshold. Both are worse, both are honest, and both are
+   reported to the user through :attr:`SearchResult.degraded`.
 """
 
 from __future__ import annotations
@@ -28,10 +22,23 @@ from dataclasses import dataclass, field
 
 from .. import config, legal_terms
 from .embedder import get_embedder
-from .reranker import get_reranker
+from .ranking import clean, is_general_criminal, mmr_order, rerank_document, rrf
+from .reranker import (
+    FUSION_BM25_METHOD, FUSION_METHOD, get_reranker, load_thresholds, rerank_method,
+)
 from .store import get_store, sql_quote
 
 log = logging.getLogger(__name__)
+
+# What a reader is told when retrieval ran in a reduced mode.
+NOTE_NO_EMBEDDINGS = ("Semantic search is unavailable right now, so this answer is based on "
+                      "keyword search only and may miss relevant sections.")
+NOTE_NO_RERANK = ("The relevance ranker is unavailable right now, so sources were ordered by a "
+                  "simpler method and may be less precise.")
+NOTE_NO_KEYWORDS = "Keyword search is unavailable; sources come from semantic search only."
+
+MAX_QUERIES = 6
+MAX_TOP_K = 12
 
 
 @dataclass
@@ -53,16 +60,13 @@ class Hit:
     full_text: str = ""
     chunk_text: str = ""
     score: float = 0.0
-    rrf_score: float = 0.0
     # The place this law is limited to, or None if it applies across India. Filled for state
-    # Acts *and* for Acts Parliament passed for a Union Territory — both are territorially
-    # limited, which is the fact a reader needs.
+    # Acts and for Acts Parliament passed for a Union Territory: both are territorially limited.
     state: str | None = None
     union_territory: bool = False    # True when Parliament enacted it for that territory
 
     @property
     def is_territorial(self) -> bool:
-        """Applies only in one place — the question that decides whether it governs a reader."""
         return self.state is not None
 
     @property
@@ -75,7 +79,7 @@ class Hit:
         return (self.status or "").lower() == "omitted"
 
 
-def _extent(act_title: str) -> dict:
+def extent(act_title: str) -> dict:
     """Where an Act applies, read from its title: a state, a Union Territory, or everywhere."""
     state = legal_terms.is_state_law(act_title, config.STATE_PREFIXES)
     if state:
@@ -91,123 +95,31 @@ class SearchResult:
     hits: list[Hit] = field(default_factory=list)
     queries: list[str] = field(default_factory=list)
     mode: str = "hybrid"          # hybrid | dense_only | fts_only | unavailable
-    ranked_by: str = "rerank"     # rerank | rrf
+    ranked_by: str = "rerank"     # rerank | fusion
     abstain: bool = True
     top_score: float = 0.0
+    cite_floor: float = 0.0       # below this score a section is never cited
     candidates: int = 0
     elapsed_ms: int = 0
-    notes: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)      # diagnostics, for logs and scripts
+    degraded: list[str] = field(default_factory=list)   # reader-facing, see NOTE_* above
 
     def __bool__(self) -> bool:
         return bool(self.hits)
 
 
-def rrf(ranked_lists, k: int | None = None) -> dict[str, float]:
-    """Reciprocal Rank Fusion over ranked id lists, optionally weighted.
+@dataclass
+class _Ranked:
+    """Candidate lists fused from every ranked list, before scoring."""
 
-    Accepts either bare lists or ``(list, weight)`` pairs. Weighting matters when the user
-    names a statute: results filtered to that act are far more likely to be right than a free
-    semantic match, and equal-weight fusion would let a crowd of loosely-similar sections from
-    other acts outvote them.
-    """
-    k = config.RRF_K if k is None else k
-    scores: dict[str, float] = {}
-    for entry in ranked_lists:
-        ranking, weight = entry if isinstance(entry, tuple) else (entry, 1.0)
-        for position, item in enumerate(ranking):
-            scores[item] = scores.get(item, 0.0) + weight / (k + position + 1)
-    return scores
+    lists: list[tuple[list[str], float]]
+    mode: str
+    bm25: dict[str, float]
+    degraded: list[str]
 
-
-def mmr_order(vectors, relevance, lam: float | None = None, k: int = 5) -> list[int]:
-    """Maximal Marginal Relevance: trade relevance against redundancy.
-
-    Keeps the top-k from being five near-identical clauses of the same section.
-    """
-    import numpy as np
-
-    lam = config.MMR_LAMBDA if lam is None else lam
-    n = len(relevance)
-    if n == 0:
-        return []
-    chosen: list[int] = []
-    remaining = list(range(n))
-    while remaining and len(chosen) < k:
-        if not chosen:
-            best = int(np.argmax(relevance))
-            chosen.append(best)
-            remaining.remove(best)
-            continue
-        best_value, best_idx = -1e9, remaining[0]
-        for i in remaining:
-            redundancy = max(float(vectors[i] @ vectors[c]) for c in chosen)
-            value = lam * float(relevance[i]) - (1.0 - lam) * redundancy
-            if value > best_value:
-                best_value, best_idx = value, i
-        chosen.append(best_idx)
-        remaining.remove(best_idx)
-    return chosen
-
-
-def _is_general_criminal(queries: list[str]) -> bool:
-    """Does this look like an ordinary crime/policing question rather than a sectoral one?"""
-    blob = " ".join(queries).lower()
-    return any(trigger in blob for trigger in config.CRIMINAL_TRIGGERS)
-
-
-def _rerank_document(row) -> str:
-    """What the cross-encoder reads for a candidate section.
-
-    A marginal heading is prepended *only when the corpus actually has one*. Measured
-    coverage: every one of the 1,059 criminal-code sections carries a heading, and none of
-    the 34,111 Constitution/central-act sections do. Prepending a bare citation line to the
-    latter is pure noise — it measurably pushed the correct Article 22 out of the top-5 for
-    an arrest query — while the real headings lift the sanhitas sharply ("Cheating" is what
-    makes BNS §318 findable from the word "cheating").
-    """
-    heading = _clean(getattr(row, "section_name", ""))
-    body = _clean(getattr(row, "chunk_text", ""))
-    questions = _citizen_questions(row) if config.RERANK_WITH_QUESTIONS else ""
-    parts = [p for p in (heading, questions, body) if p]
-    return "\n".join(parts)
-
-
-def _citizen_questions(row) -> str:
-    """The questions this section answers, as written for it when the corpus was built.
-
-    Statute text often buries its answer. RTI Section 7 opens "Subject to the proviso to
-    sub-section (2) of section 5 or the proviso to sub-section (3) of section 6…" before it ever
-    says "thirty days", so for "how long does the PIO have to reply" the cross-encoder scored it
-    0.240 against 0.667 for Section 11, which merely mentions "five days". Its build-time
-    questions include "How long does the government have to respond to my information
-    request?" — generated *from* the text, so this adds the section's own meaning in the
-    reader's words, not anything invented.
-
-    ``embed_text`` is heading, questions, keywords, chunk; this takes the lines between the
-    heading and the chunk, and drops the keyword line, which reads as noise to a cross-encoder.
-    """
-    embed = _clean(getattr(row, "embed_text", ""))
-    chunk = _clean(getattr(row, "chunk_text", ""))
-    if not embed:
-        return ""
-    head, _, rest = embed.partition("\n")
-    if chunk and rest.endswith(chunk):
-        rest = rest[: -len(chunk)]
-    lines = [ln.strip() for ln in rest.splitlines() if ln.strip()]
-    return "\n".join(ln for ln in lines if ln.endswith("?"))
-
-
-def _clean(value) -> str:
-    """NaN / NaT / 'nan' all become an empty string so they never reach a prompt or the UI."""
-    try:
-        import pandas as pd
-
-        if pd.isna(value):
-            return ""
-    except (TypeError, ValueError, ImportError):
-        pass
-    text = str(value).strip()
-    return "" if text.lower() in ("", "nan", "none", "nat", "<na>") else text
+    @property
+    def total_weight(self) -> float:
+        return sum(weight for _, weight in self.lists)
 
 
 class SearchEngine:
@@ -217,310 +129,266 @@ class SearchEngine:
         self.reranker = get_reranker()
 
     async def warmup(self) -> dict:
-        """Load and warm both models plus the section index, at startup."""
-        results = await asyncio.gather(
-            self.embedder.warmup(), self.reranker.warmup(), return_exceptions=True,
-        )
+        """Open the database and prove the embedding API answers, at startup."""
+        errors: list[str] = []
         try:
-            stats = self.store.stats()
+            stats = await asyncio.to_thread(self.store.stats)
         except Exception as exc:
             log.error("could not open the legal database: %s", exc)
-            stats = {}
-        return {
-            "embedder": self.embedder.status(),
-            "reranker": self.reranker.status(),
-            "store": stats,
-            "errors": [str(r) for r in results if isinstance(r, Exception)],
-        }
-
-    # ── candidate generation ─────────────────────────────────────────────────────────
-    async def _ranked_lists(self, queries: list[str], fetch: int, act_filter: list[str],
-                            bm25: dict[str, float] | None = None
-                            ) -> tuple[list, str, list[str], float]:
-        notes: list[str] = []
-
-        vectors = await self.embedder.encode(queries)
-        if vectors is None:
-            reason = self.embedder.unavailable_reason or "embedder unavailable"
-            notes.append(f"Semantic search is off ({reason}); using keyword search only.")
-
-        loop = asyncio.get_running_loop()
-
-        def dense_for(vector, where=None, k=fetch):
-            return self.store.dense(vector, k, where)
-
-        def fts_for(text, where=None, k=fetch):
-            return self.store.fts(text, k, where, scores=bm25)
-
-        weights: list[float] = []
-        tasks = []
-        for i, query in enumerate(queries):
-            if vectors is not None:
-                tasks.append(loop.run_in_executor(None, dense_for, vectors[i], None, fetch))
-                weights.append(1.0)
-            tasks.append(loop.run_in_executor(None, fts_for, query, None, fetch))
-            weights.append(1.0)
-
-        # A named act contributes extra *filtered* lists, weighted up. Still additive rather
-        # than a hard WHERE, so a wrong act guess degrades the ranking instead of erasing the
-        # real answer — but heavy enough that a crowd of loosely-similar sections from
-        # unrelated statutes cannot outvote the act the user actually asked about.
-        for title in act_filter[:2]:
-            where = f"act_title = {sql_quote(title)}"
-            if vectors is not None:
-                tasks.append(loop.run_in_executor(None, dense_for, vectors[0], where, fetch))
-                weights.append(config.ACT_FILTER_WEIGHT)
-            tasks.append(loop.run_in_executor(None, fts_for, queries[0], where, fetch))
-            weights.append(config.ACT_FILTER_WEIGHT)
-
-        # No Act named, but plainly a criminal/policing question: lift the general codes so a
-        # forest officer's power of arrest cannot outrank the procedure code that actually
-        # governs the person asking.
-        if not act_filter and _is_general_criminal(queries):
-            titles = ",".join(sql_quote(t) for t in config.GENERAL_CODES)
-            where = f"act_title IN ({titles})"
-            if vectors is not None:
-                tasks.append(loop.run_in_executor(None, dense_for, vectors[0], where, fetch))
-                weights.append(config.GENERAL_CODE_WEIGHT)
-            tasks.append(loop.run_in_executor(None, fts_for, queries[0], where, fetch))
-            weights.append(config.GENERAL_CODE_WEIGHT)
-
-        lists: list[tuple[list[str], float]] = []
-        for result, weight in zip(await asyncio.gather(*tasks, return_exceptions=True), weights):
-            if isinstance(result, Exception):
-                log.debug("a ranked list failed: %s", result)
-                continue
-            if result:
-                lists.append((result, weight))
-        total_weight = sum(w for _, w in lists)
-
-        if vectors is None:
-            mode = "fts_only"
-        elif not self.store._fts_available:
-            mode = "dense_only"
-            notes.append("Keyword search is unavailable; using semantic search only.")
-        else:
-            mode = "hybrid"
-        return lists, mode, notes, total_weight
+            stats, errors = {}, [f"database: {exc}"]
+        await self.embedder.warmup()
+        return {"store": stats, "embedder": self.embedder.status(),
+                "reranker": self.reranker.status(), "errors": errors}
 
     # ── the main entry point ─────────────────────────────────────────────────────────
-    async def search(
-        self,
-        queries,
-        *,
-        top_k: int | None = None,
-        fetch: int | None = None,
-        rerank_with: str | None = None,
-        deadline: float | None = None,
-        on_pause=None,
-        session: str = "",
-    ) -> SearchResult:
+    async def search(self, queries, *, top_k: int | None = None, fetch: int | None = None,
+                     rerank_with: str | None = None, deadline: float | None = None,
+                     on_pause=None) -> SearchResult:
         started = time.monotonic()
-        if isinstance(queries, str):
-            queries = [queries]
-        queries = [q.strip() for q in queries if q and q.strip()][:6]
+        queries = _clean_queries(queries)
         if not queries:
             return SearchResult(mode="unavailable", notes=["No search query was produced."])
-
-        top_k = max(1, min(config.TOPK_MAX, top_k or config.TOP_K))
+        top_k = max(1, min(MAX_TOP_K, top_k or config.TOP_K))
         fetch = fetch or config.FETCH_K
-        acts = []
-        for query in queries:
-            for title in legal_terms.detect_acts(query):
-                if title not in acts:
-                    acts.append(title)
+        acts = _named_acts(queries)
 
-        bm25_scores: dict[str, float] = {}
-        lists, mode, notes, total_weight = await self._ranked_lists(
-            queries, fetch, acts, bm25=bm25_scores)
-        if not lists:
-            return SearchResult(queries=queries, mode="unavailable", abstain=True,
-                                notes=notes + ["Retrieval returned nothing at all."],
-                                elapsed_ms=int((time.monotonic() - started) * 1000))
+        ranked = await self._ranked_lists(queries, fetch, acts)
+        candidates, fused = self._candidates(ranked, fetch)
+        result = SearchResult(queries=queries, mode=ranked.mode, degraded=list(ranked.degraded),
+                              candidates=len(candidates))
+        if candidates:
+            rerank_query = legal_terms.annotate(rerank_with or queries[0])
+            scores, method = await self._score(rerank_query, candidates, ranked, fused,
+                                               deadline, on_pause, result)
+            result.hits = await self._order(candidates, scores, queries, acts, top_k,
+                                            result.ranked_by)
+            thresholds = load_thresholds(method)
+            result.top_score = round(result.hits[0].score if result.hits else 0.0, 4)
+            result.abstain = result.top_score < thresholds.low
+            result.cite_floor = thresholds.cite
+        else:
+            result.notes.append("No matching sections were found.")
+        result.elapsed_ms = int((time.monotonic() - started) * 1000)
+        return result
 
-        fused = rrf(lists)
+    # ── candidate generation ─────────────────────────────────────────────────────────
+    async def _ranked_lists(self, queries: list[str], fetch: int, acts: list[str]) -> _Ranked:
+        bm25: dict[str, float] = {}
+        vectors = await self.embedder.encode(queries)
+        degraded = [] if vectors is not None else [NOTE_NO_EMBEDDINGS]
+        jobs = _list_jobs(queries, vectors, acts)
+
+        def run(kind: str, payload, where: str | None) -> list[str]:
+            if kind == "dense":
+                return self.store.dense(payload, fetch, where)
+            return self.store.fts(payload, fetch, where, scores=bm25)
+
+        results = await asyncio.gather(
+            *(asyncio.to_thread(run, kind, payload, where) for kind, payload, where, _ in jobs),
+            return_exceptions=True)
+        lists: list[tuple[list[str], float]] = []
+        for result, (_, _, _, weight) in zip(results, jobs, strict=True):
+            if isinstance(result, Exception):
+                log.debug("a ranked list failed: %s", result)
+            elif result:
+                lists.append((result, weight))
+
+        mode = "hybrid"
+        if vectors is None:
+            mode = "fts_only"
+        elif not self.store.fts_available:
+            mode = "dense_only"
+            degraded.append(NOTE_NO_KEYWORDS)
+        return _Ranked(lists, mode, bm25, degraded)
+
+    def _candidates(self, ranked: _Ranked, fetch: int) -> tuple[list, dict[str, float]]:
+        """One row per section, best-ranked chunk first, capped at the rerank pool."""
+        if not ranked.lists:
+            return [], {}
+        fused = rrf(ranked.lists)
         ordered_ids = sorted(fused, key=fused.get, reverse=True)[:fetch * 2]
-
         rows = self.store.rows(ordered_ids)
-        if rows.empty:
-            return SearchResult(queries=queries, mode=mode, abstain=True,
-                                notes=notes + ["No matching sections were found."],
-                                elapsed_ms=int((time.monotonic() - started) * 1000))
-
-        # De-duplicate to one chunk per section, keeping the best-ranked chunk of each.
         by_chunk = {row.chunk_id: row for row in rows.itertuples()}
         best_per_unit: dict[str, object] = {}
         for chunk_id in ordered_ids:
             row = by_chunk.get(chunk_id)
-            if row is None:
-                continue
-            best_per_unit.setdefault(row.unit_id, row)
+            if row is not None:
+                best_per_unit.setdefault(row.unit_id, row)
+        return list(best_per_unit.values())[:config.RERANK_POOL], fused
 
-        candidates = list(best_per_unit.values())[:config.RERANK_POOL]
-        if not candidates:
-            return SearchResult(queries=queries, mode=mode, abstain=True, notes=notes,
-                                elapsed_ms=int((time.monotonic() - started) * 1000))
+    # ── scoring ──────────────────────────────────────────────────────────────────────
+    async def _score(self, query: str, candidates: list, ranked: _Ranked,
+                     fused: dict[str, float], deadline, on_pause,
+                     result: SearchResult) -> tuple[list[float], str]:
+        """Cross-encoder scores, or fused scores when the reranker is unavailable."""
+        # Reranked against the natural phrasing: acronym expansion helps BM25 and the
+        # bi-encoder but reads as broken English to a cross-encoder.
+        scores = await self.reranker.score(query, [rerank_document(c) for c in candidates],
+                                           deadline=deadline, on_pause=on_pause)
+        if scores is not None:
+            result.ranked_by = "rerank"
+            return scores, rerank_method()
+        result.ranked_by = "fusion"
+        result.degraded.append(NOTE_NO_RERANK)
+        method = FUSION_METHOD if ranked.mode != "fts_only" else FUSION_BM25_METHOD
+        return _fusion_scores(candidates, ranked, fused), method
 
-        # Rerank against the *natural* phrasing, not an expanded one. Acronym expansion is a
-        # retrieval aid — it turns "file an RTI" into "file an Right to Information Act, 2005",
-        # which helps BM25 and the bi-encoder but reads as broken English to a cross-encoder
-        # trained on natural queries.
-        # Acronyms are named beside themselves for the cross-encoder — see legal_terms.annotate.
-        # A bare "RTI" let the Credit Information Companies Act outrank the RTI Act's appeal.
-        rerank_query = legal_terms.annotate(rerank_with or queries[0])
-        scores = await self.reranker.score(
-            rerank_query, [_rerank_document(c) for c in candidates],
-            deadline=deadline, on_pause=on_pause, session=session,
-        )
-        if scores is None:
-            ranked_by = "rrf"
-            # Rank fusion alone cannot support abstention: RRF describes *order*, so the top
-            # item of a single list always scores best whether the match is good or hopeless.
-            # BM25 magnitude is an absolute signal — measured, a real legal query reaches ~30
-            # while an off-topic one sits near 13 — so that is what the ranking uses here,
-            # with rank fusion breaking ties.
-            best_possible = (total_weight / (config.RRF_K + 1)) or 1.0
-            scores = []
-            for c in candidates:
-                relevance = min(1.0, bm25_scores.get(c.chunk_id, 0.0) / config.BM25_FULL_SCORE)
-                tiebreak = min(1.0, fused.get(c.chunk_id, 0.0) / best_possible)
-                scores.append(round(relevance + 0.001 * tiebreak, 6))
-            notes.append("Reranking was unavailable; results are ordered by keyword/semantic "
-                         "fusion, which is less precise.")
-        else:
-            ranked_by = "rerank"
-
-        # A cross-encoder cannot separate "power to arrest without warrant" in the Essential
-        # Services Maintenance Act from the same words in the procedure code — measured at
-        # 0.994 against 0.992. The distinction is not textual, it is about which statute
-        # governs the person asking, so it has to be applied here rather than hoped for from
-        # the model. Ordering only: the score shown to the user stays the honest one.
-        prefer_general = not acts and _is_general_criminal(queries)
-        # Relative to this query's best score, and only for near-ties. It was a flat +0.25, tuned
-        # against the local cross-encoder whose relevant scores sit near 0.99 — there it decided
-        # between 0.994 and 0.992, which is its whole purpose. Cohere's relevant scores sit near
-        # 0.2-0.4, where the same +0.25 swamped them: Article 193 at 0.056 was lifted above
-        # Motor Vehicles Act sections at 0.334 for "driving without a licence penalty", and the
-        # right Act vanished from the answer. Scaled, the local behaviour is unchanged
-        # (0.25 x 0.99 ~ 0.25) and an irrelevant general-code row can no longer be promoted.
-        top_score = max(scores) if scores else 0.0
-        boost = config.GENERAL_CODE_BOOST * top_score
-        eligible = config.GENERAL_CODE_ELIGIBLE * top_score
-
-        def boosted(candidate, score: float) -> float:
-            if (prefer_general and score >= eligible
-                    and _clean(getattr(candidate, "act_title", "")) in config.GENERAL_CODES):
-                return score + boost
-            return score
-
-        # Carry (candidate, reported_score, ranking_score) together. The boost has to reach
-        # MMR too — ranking with it and then diversifying on the raw scores simply undoes it.
-        ranked = [(c, s, boosted(c, s)) for c, s in zip(candidates, scores)]
-        ranked.sort(key=lambda row: row[2], reverse=True)
-        shortlist = [(c, s) for c, s, _ in ranked[:max(top_k * 2, 12)]]
-        rank_scores = [r for _, _, r in ranked[:max(top_k * 2, 12)]]
-
-        # When the user named a statute, spreading results across *different* acts is the
-        # opposite of what they want — they asked about one Act, so several of its sections
-        # is the right answer. Lean towards relevance in that case.
-        # Diversity is a luxury paid for out of relevance. With a cross-encoder ranking the
-        # candidates that trade is worth it; on fusion scores alone the base ordering is weaker,
-        # and spreading it further measurably costs recall (85.7% against 93% on the gold set).
+    async def _order(self, candidates: list, scores: list[float], queries: list[str],
+                     acts: list[str], top_k: int, ranked_by: str) -> list[Hit]:
+        ranked = _with_general_code_boost(candidates, scores, queries, acts)
+        pool = max(top_k * 2, 12)
+        shortlist = [(c, s) for c, s, _ in ranked[:pool]]
+        rank_scores = [r for _, _, r in ranked[:pool]]
+        # Diversity is paid for out of relevance. It is worth it with a cross-encoder ordering the
+        # candidates; on fused scores the base order is weaker and spreading it costs recall. When
+        # a statute is named, several of its sections is the right answer, so lean to relevance.
         if ranked_by != "rerank":
             lam = config.MMR_LAMBDA_NO_RERANK
         else:
             lam = config.MMR_LAMBDA_FOCUSED if acts else config.MMR_LAMBDA
         order = await self._diversify(shortlist, top_k, lam, rank_scores)
-        hits = [self._to_hit(shortlist[i][0], shortlist[i][1], fused) for i in order]
+        return [_to_hit(shortlist[i][0], shortlist[i][1]) for i in order]
 
-        # Thresholds are stored per backend+model, so the fusion-only path gets its own
-        # calibrated cut rather than a guessed constant.
-        thresholds = self.reranker.thresholds
-        cutoff = thresholds.low
-        top_score = hits[0].score if hits else 0.0
-
-        return SearchResult(
-            hits=hits, queries=queries, mode=mode, ranked_by=ranked_by,
-            abstain=top_score < cutoff, top_score=round(top_score, 4),
-            candidates=len(candidates), notes=notes,
-            elapsed_ms=int((time.monotonic() - started) * 1000),
-        )
-
-    async def _diversify(self, shortlist, top_k: int, lam: float | None = None,
-                         rank_scores: list[float] | None = None) -> list[int]:
-        """MMR over the *stored* vectors — the ones retrieval actually searched."""
+    async def _diversify(self, shortlist, top_k: int, lam: float,
+                         rank_scores: list[float]) -> list[int]:
+        """MMR over the stored vectors, the ones retrieval actually searched."""
         import numpy as np
 
         if len(shortlist) <= top_k:
             return list(range(len(shortlist)))
-
         chunk_ids = [c.chunk_id for c, _ in shortlist]
-        loop = asyncio.get_running_loop()
         try:
-            vector_map = await loop.run_in_executor(None, self.store.vectors, chunk_ids)
+            vector_map = await asyncio.to_thread(self.store.vectors, chunk_ids)
         except Exception as exc:
             log.debug("stored-vector fetch failed, skipping MMR: %s", exc)
             vector_map = {}
-
         if len(vector_map) < len(chunk_ids):
-            # Without every vector, MMR's redundancy term is meaningless — take pure relevance.
-            return list(range(min(top_k, len(shortlist))))
-
+            # Without every vector the redundancy term is meaningless: take pure relevance.
+            return list(range(top_k))
         vectors = np.vstack([vector_map[cid] for cid in chunk_ids])
-        relevance = np.array(rank_scores if rank_scores is not None
-                             else [s for _, s in shortlist], dtype="float32")
-        return mmr_order(vectors, relevance, lam=lam, k=top_k)
-
-    @staticmethod
-    def _to_hit(row, score: float, fused: dict[str, float]) -> Hit:
-        act_title = _clean(getattr(row, "act_title", ""))
-        return Hit(
-            unit_id=_clean(row.unit_id),
-            chunk_id=_clean(row.chunk_id),
-            citation=_clean(getattr(row, "citation", "")),
-            act_title=act_title,
-            section_label=_clean(getattr(row, "section_label", "")),
-            section_name=_clean(getattr(row, "section_name", "")),
-            category=_clean(getattr(row, "category", "")),
-            status=_clean(getattr(row, "status", "")),
-            effective_date=_clean(getattr(row, "effective_date", "")),
-            act_year=_clean(getattr(row, "act_year", "")),
-            source_type=_clean(getattr(row, "source_type", "")),
-            source_snapshot=_clean(getattr(row, "source_snapshot", "")),
-            full_text=_clean(getattr(row, "full_text", "")),
-            chunk_text=_clean(getattr(row, "chunk_text", "")),
-            score=round(float(score), 4),
-            rrf_score=round(float(fused.get(row.chunk_id, 0.0)), 6),
-            # Trust the title, never the `jurisdiction` column (DB README §9).
-            **_extent(act_title),
-        )
+        return mmr_order(vectors, np.array(rank_scores, dtype="float32"), lam=lam, k=top_k)
 
     # ── exact lookup ─────────────────────────────────────────────────────────────────
     def lookup(self, act: str | None, section_label: str | None,
                constitution: bool = False) -> list[Hit]:
-        """Exact provision text. No embedding, no reranking — this is a fact, not a guess."""
-        df = self.store.lookup(act, section_label, constitution)
+        """Exact provision text. No embedding, no reranking: this is a fact, not a guess."""
         hits: list[Hit] = []
-        for row in df.itertuples():
-            hit = self._to_hit(row, 1.0, {})
-            hit.score = 1.0
-            hits.append(hit)
-        # A long section is several chunks; they share one citation, so keep the first.
         seen: set[str] = set()
-        unique = []
-        for hit in hits:
-            if hit.unit_id in seen:
-                continue
-            seen.add(hit.unit_id)
-            unique.append(hit)
-        return unique
+        for row in self.store.lookup(act, section_label, constitution).itertuples():
+            hit = _to_hit(row, 1.0)
+            # A long section is several chunks sharing one citation; keep the first.
+            if hit.unit_id not in seen:
+                seen.add(hit.unit_id)
+                hits.append(hit)
+        return hits
 
     def status(self) -> dict:
-        return {
-            "embedder": self.embedder.status(),
-            "reranker": self.reranker.status(),
-            "store": self.store.stats(),
-        }
+        return {"embedder": self.embedder.status(), "reranker": self.reranker.status(),
+                "store": self.store.stats()}
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────────────
+def _clean_queries(queries) -> list[str]:
+    if isinstance(queries, str):
+        queries = [queries]
+    return [q.strip() for q in queries if q and q.strip()][:MAX_QUERIES]
+
+
+def _named_acts(queries: list[str]) -> list[str]:
+    acts: list[str] = []
+    for query in queries:
+        for title in legal_terms.detect_acts(query):
+            if title not in acts:
+                acts.append(title)
+    return acts
+
+
+def _list_jobs(queries: list[str], vectors, acts: list[str]) -> list[tuple]:
+    """Every ranked list to run, as ``(kind, query or vector, where, weight)``.
+
+    A named Act contributes extra lists filtered to it, weighted up, and still additive rather
+    than a hard filter, so a wrong guess costs ranking rather than erasing the real answer.
+    With no Act named but plainly a policing question, the general codes get the same lift, so a
+    forest officer's power of arrest cannot outrank the procedure code that governs the reader.
+    """
+    jobs: list[tuple] = []
+    for i, query in enumerate(queries):
+        if vectors is not None:
+            jobs.append(("dense", vectors[i], None, 1.0))
+        jobs.append(("fts", query, None, 1.0))
+
+    filters = [(f"act_title = {sql_quote(title)}", config.ACT_FILTER_WEIGHT)
+               for title in acts[:2]]
+    if not acts and is_general_criminal(queries):
+        titles = ",".join(sql_quote(t) for t in config.GENERAL_CODES)
+        filters.append((f"act_title IN ({titles})", config.GENERAL_CODE_WEIGHT))
+    for where, weight in filters:
+        if vectors is not None:
+            jobs.append(("dense", vectors[0], where, weight))
+        jobs.append(("fts", queries[0], where, weight))
+    return jobs
+
+
+def _fusion_scores(candidates: list, ranked: _Ranked, fused: dict[str, float]) -> list[float]:
+    """Scores for ordering and abstention without a reranker.
+
+    Rank fusion alone cannot support abstention: the top of any list scores best whether the
+    match is good or hopeless. BM25 magnitude is an absolute signal (a real legal query reaches
+    ~30, an off-topic one ~13), so it leads, with fusion breaking ties.
+    """
+    best_possible = (ranked.total_weight / (config.RRF_K + 1)) or 1.0
+    scores = []
+    for c in candidates:
+        relevance = min(1.0, ranked.bm25.get(c.chunk_id, 0.0) / config.BM25_FULL_SCORE)
+        tiebreak = min(1.0, fused.get(c.chunk_id, 0.0) / best_possible)
+        scores.append(round(relevance + 0.001 * tiebreak, 6))
+    return scores
+
+
+def _with_general_code_boost(candidates: list, scores: list[float], queries: list[str],
+                             acts: list[str]) -> list[tuple]:
+    """``(candidate, reported_score, ranking_score)``, best ranking first.
+
+    A cross-encoder cannot separate "power to arrest without warrant" in a sectoral Act from the
+    same words in the procedure code; which statute governs the reader is not a textual fact. So
+    for a general criminal question the general codes win near-ties. The boost is relative to the
+    best score and applies only to near-ties, so it means the same on every reranker's scale and
+    can never lift an irrelevant row. The reported score stays the honest one.
+    """
+    prefer_general = not acts and is_general_criminal(queries)
+    top = max(scores) if scores else 0.0
+    boost, eligible = config.GENERAL_CODE_BOOST * top, config.GENERAL_CODE_ELIGIBLE * top
+
+    def ranking(candidate, score: float) -> float:
+        general = clean(getattr(candidate, "act_title", "")) in config.GENERAL_CODES
+        return score + boost if prefer_general and general and score >= eligible else score
+
+    ranked = [(c, s, ranking(c, s)) for c, s in zip(candidates, scores, strict=True)]
+    ranked.sort(key=lambda row: row[2], reverse=True)
+    return ranked
+
+
+def _to_hit(row, score: float) -> Hit:
+    act_title = clean(getattr(row, "act_title", ""))
+    return Hit(
+        unit_id=clean(row.unit_id),
+        chunk_id=clean(row.chunk_id),
+        citation=clean(getattr(row, "citation", "")),
+        act_title=act_title,
+        section_label=clean(getattr(row, "section_label", "")),
+        section_name=clean(getattr(row, "section_name", "")),
+        category=clean(getattr(row, "category", "")),
+        status=clean(getattr(row, "status", "")),
+        effective_date=clean(getattr(row, "effective_date", "")),
+        act_year=clean(getattr(row, "act_year", "")),
+        source_type=clean(getattr(row, "source_type", "")),
+        source_snapshot=clean(getattr(row, "source_snapshot", "")),
+        full_text=clean(getattr(row, "full_text", "")),
+        chunk_text=clean(getattr(row, "chunk_text", "")),
+        score=round(float(score), 4),
+        # Trust the title, never the corpus's `jurisdiction` column (DB README §9).
+        **extent(act_title),
+    )
 
 
 _ENGINE: SearchEngine | None = None

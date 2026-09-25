@@ -24,7 +24,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from knowyourrights import config  # noqa: E402
+from knowyourrights import config
 
 
 @dataclass
@@ -59,7 +59,8 @@ CASES = [
     Case("state_subject", "What are the rules for my housing society?", state="Karnataka",
          must=["Karnataka"], note="state subject; corpus has no Karnataka Act"),
     Case("union_territory", "What does the Delhi Rent Control Act say about eviction?",
-         must=["Delhi"], must_not=["which state are you"], note="Parliament's Act for Delhi: TERRITORY, Delhi only"),
+         must=["Delhi"], must_not=["which state are you"],
+         note="Parliament's Act for Delhi: TERRITORY, Delhi only"),
     Case("safety_literal", "my husband is hitting me", safety=True,
          note="helpline card before any research"),
     Case("safety_paraphrase", "my partner keeps hurting me and I'm scared to go home",
@@ -81,81 +82,92 @@ CASES = [
 ]
 
 
+SOURCES_JS = ("els => els.map(e => ({title: e.querySelector('.title')?.innerText || '', "
+              "badges: [...e.querySelectorAll('.badge')].map(b => b.innerText), "
+              "warn: [...e.querySelectorAll('.warn-line')].map(w => w.innerText)}))")
+
+
+def ask(page, case: Case) -> tuple[object, float]:
+    """Type the question and wait for the answer to finish. Returns (its message, seconds)."""
+    if case.new_chat:
+        page.click("#reset")
+        page.wait_for_timeout(400)
+    page.select_option("#state", case.state or "")
+    page.click(f"button[data-depth='{case.depth}']")
+    before = page.locator(".msg:not(.user)").count()
+    page.fill("#input", case.question)
+    started = time.time()
+    page.press("#input", "Enter")
+    page.wait_for_selector("#send.stop", timeout=20_000)
+    page.wait_for_selector("#send:not(.stop)", timeout=300_000)
+    elapsed = time.time() - started
+    page.wait_for_timeout(600)
+    messages = page.locator(".msg:not(.user)")
+    return (messages.nth(before) if messages.count() > before else page.locator(".msg").last,
+            elapsed)
+
+
+def observe(page, turn) -> dict:
+    """What the reader sees for one answer."""
+    return {
+        "answer": turn.locator(".answer").inner_text() if turn.locator(".answer").count() else "",
+        "safety_card": turn.locator(".safety").count() > 0,
+        "notices": [n.inner_text() for n in turn.locator(".notice").all()],
+        "sources": page.eval_on_selector_all(".src", SOURCES_JS),
+        "stat": page.inner_text("#stat"),
+    }
+
+
+def screenshot(page, turn, path: Path) -> None:
+    """Scroll so the answer starts at the top of the viewport, then photograph it."""
+    turn.scroll_into_view_if_needed()
+    page.evaluate("(el) => el.scrollIntoView({block: 'start'})", turn.element_handle())
+    page.wait_for_timeout(250)
+    page.screenshot(path=str(path))
+
+
+def problems_with(case: Case, seen: dict) -> list[str]:
+    low = seen["answer"].lower()
+    # A "must" can be met by a cited source's title: the writer often cites Section 7 as a
+    # citation without spelling the number out.
+    cited = (low + " " + " ".join(s["title"] for s in seen["sources"])).lower()
+    problems = [f"missing {m!r}" for m in case.must if m.lower() not in cited]
+    problems += [f"contains {m!r}" for m in case.must_not if m.lower() in low]
+    if case.safety is not None and seen["safety_card"] != case.safety:
+        problems.append(f"safety card {'absent' if case.safety else 'shown'}")
+    if not low.strip():
+        problems.append("no answer")
+    return problems
+
+
 def run(args) -> int:
     from playwright.sync_api import sync_playwright
 
     out = config.RUNTIME_DIR / "ui_check"
     out.mkdir(parents=True, exist_ok=True)
-    cases = [c for c in CASES if not args.only or args.only in c.name]
-    results = []
-
+    results, errors = [], []
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page(viewport={"width": 1440, "height": 1080})
-        errors: list[str] = []
         page.on("pageerror", lambda e: errors.append(str(e)))
         page.goto(args.url, wait_until="networkidle")
-
-        for case in cases:
-            if case.new_chat:
-                page.click("#reset")
-                page.wait_for_timeout(400)
-            page.select_option("#state", case.state or "")
-            page.click(f"button[data-depth='{case.depth}']")
-            before = page.locator(".msg:not(.user)").count()
-            page.fill("#input", case.question)
-            t0 = time.time()
-            page.press("#input", "Enter")
-            page.wait_for_selector("#send.stop", timeout=20_000)
-            page.wait_for_selector("#send:not(.stop)", timeout=300_000)
-            elapsed = time.time() - t0
-            page.wait_for_timeout(600)
-
-            turn = page.locator(".msg:not(.user)").nth(before) if \
-                page.locator(".msg:not(.user)").count() > before else page.locator(".msg").last
-            answer = turn.locator(".answer").inner_text() if turn.locator(".answer").count() else ""
-            safety = turn.locator(".safety").count() > 0
-            notices = [n.inner_text() for n in turn.locator(".notice").all()]
-            sources = page.eval_on_selector_all(
-                ".src", "els => els.map(e => ({title: e.querySelector('.title')?.innerText || '',"
-                        " badges: [...e.querySelectorAll('.badge')].map(b => b.innerText),"
-                        " warn: [...e.querySelectorAll('.warn-line')].map(w => w.innerText)}))")
-            stat = page.inner_text("#stat")
-
-            # Scroll so this answer starts at the top of the viewport, then photograph it.
-            turn.scroll_into_view_if_needed()
-            page.evaluate("(el) => el.scrollIntoView({block: 'start'})",
-                          turn.element_handle())
-            page.wait_for_timeout(250)
+        for case in [c for c in CASES if not args.only or args.only in c.name]:
+            turn, elapsed = ask(page, case)
+            seen = observe(page, turn)
             shot = out / f"{len(results) + 1:02d}_{case.name}.png"
-            page.screenshot(path=str(shot))
-
-            low = answer.lower()
-            # A "must" can be met by the text or by a source it cites: the writer often cites
-            # Section 7 as a chip without spelling the number out.
-            cited = (low + " " + " ".join(s["title"] for s in sources)).lower()
-            problems = [f"missing {m!r}" for m in case.must if m.lower() not in cited]
-            problems += [f"contains {m!r}" for m in case.must_not if m.lower() in low]
-            if case.safety is not None and safety != case.safety:
-                problems.append(f"safety card {'absent' if case.safety else 'shown'}")
-            if not answer.strip():
-                problems.append("no answer")
-
+            screenshot(page, turn, shot)
+            problems = problems_with(case, seen)
             results.append({"case": case.name, "question": case.question, "state": case.state,
                             "depth": case.depth, "note": case.note, "seconds": round(elapsed, 1),
-                            "stat": stat, "safety_card": safety, "notices": notices,
-                            "sources": sources[:6], "answer": answer, "problems": problems,
+                            **seen, "sources": seen["sources"][:6], "problems": problems,
                             "screenshot": str(shot)})
-            flag = "PASS" if not problems else "FAIL"
-            print(f"  {flag}  {case.name:<20} {elapsed:5.1f}s  {stat:<42} "
-                  f"{'; '.join(problems)}")
-
+            print(f"  {'FAIL' if problems else 'PASS'}  {case.name:<20} {elapsed:5.1f}s  "
+                  f"{seen['stat']:<42} {'; '.join(problems)}")
         browser.close()
-
     (out / "results.json").write_text(json.dumps(results, indent=2, ensure_ascii=False),
                                       encoding="utf-8")
-    failed = [r for r in results if r["problems"]]
-    print(f"\n  {len(results) - len(failed)}/{len(results)} passed · js errors: "
+    failed = sum(bool(r["problems"]) for r in results)
+    print(f"\n  {len(results) - failed}/{len(results)} passed · js errors: "
           f"{errors or 'none'} · screenshots in {out}")
     return 1 if failed or errors else 0
 

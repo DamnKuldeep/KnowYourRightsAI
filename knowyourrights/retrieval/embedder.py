@@ -1,268 +1,114 @@
-"""The query embedder — ``BAAI/bge-m3``, permanently, locally or over the API.
+"""Query embeddings: ``baai/bge-m3`` over OpenRouter.
 
-The *model* is not a choice. The corpus was embedded with it, so swapping it means re-embedding
-all 38,890 chunks (DB README §8). The *transport* is a choice, and there are two:
+The model is not a choice. The corpus was embedded with bge-m3, so a different model would mean
+re-embedding all 38,000+ chunks. OpenRouter serves the same model, and its vectors were checked
+against the stored ones at cosine 1.0000 (``scripts/verify_embeddings.py`` repeats the check).
 
-* **local** — load the weights here. ~1090 MiB of VRAM in fp16, or ~2.3 GB of host RAM while
-  loading, which is the most likely way to wedge a busy laptop. No network, no per-call cost.
-* **api** — OpenRouter serves the same ``baai/bge-m3``. Verified against vectors already stored
-  in the corpus at cosine **1.0000** (unrelated rows: 0.60), so the two are interchangeable and
-  nothing needs re-embedding. Costs ~$0.01 per million tokens and needs no RAM at all.
-
-The API path falls back to the local model on any failure, never to nothing — returning None
-here means "no semantic search at all" to everything downstream, which is a much larger
-degradation than one slow call.
-
-Cost control, measured on an RTX 3050:
-
-* fp16 weights are ~1090 MiB of VRAM (fp32 would be ~2.2 GB and would not leave room for a
-  reranker).
-* The first encode costs 1.86s of CUDA warmup and every one after it ~25 ms — so we warm up
-  at startup rather than making the first user wait.
-* Loading spikes host RAM to ~2.3 GB, which is the most likely way to wedge a busy laptop.
-  We check available RAM first and decline rather than risk it; retrieval then runs keyword-only
-  until memory frees up.
+When the API cannot answer, :meth:`Embedder.encode` returns None and records why. Search then
+runs on keyword (BM25) retrieval alone and tells the user, which is a real answer, only a less
+thorough one.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import time
 
 from .. import config
-from ..runtime import gpu, resources
+from ..llm import retrieval_api
 from ..runtime.cache import get_cache, key_of
 
 log = logging.getLogger(__name__)
 
 
 class Embedder:
-    """Single-flight lazy load, then a warm model behind the shared GPU executor."""
-
-    def __init__(self, plan: resources.ResourcePlan | None = None) -> None:
-        self._plan = plan
-        self._model = None
-        self._load_lock = asyncio.Lock()
-        self._load_failed: str | None = None
-        self._warm = False
+    def __init__(self) -> None:
         self.encodes = 0
         self.cache_hits = 0
         self.api_calls = 0
-        self._api_failures = 0
+        self.api_failures = 0
+        self.last_error: str | None = None
+        self.warm = False
 
     @property
-    def plan(self) -> resources.ResourcePlan:
-        if self._plan is None:
-            self._plan = resources.get_plan()
-        return self._plan
-
-    @property
-    def loaded(self) -> bool:
-        return self._model is not None
+    def available(self) -> bool:
+        return retrieval_api.available()
 
     @property
     def unavailable_reason(self) -> str | None:
-        return self._load_failed
-
-    # ── loading ──────────────────────────────────────────────────────────────────────
-    def _load_sync(self):
-        """Runs on the GPU worker thread so the CUDA context is created there."""
-        import torch
-        from sentence_transformers import SentenceTransformer
-
-        plan = self.plan
-        started = time.time()
-        dtype = getattr(torch, plan.embed_dtype)
-        try:
-            model = SentenceTransformer(
-                config.EMBED_MODEL, trust_remote_code=True, device=plan.embed_device,
-                model_kwargs={"dtype": dtype},
-            )
-        except TypeError:
-            # Older transformers spell it `torch_dtype`; newer ones deprecate that spelling.
-            model = SentenceTransformer(
-                config.EMBED_MODEL, trust_remote_code=True, device=plan.embed_device,
-                model_kwargs={"torch_dtype": dtype},
-            )
-        model.max_seq_length = config.EMBED_MAX_SEQ
-        log.info("embedder loaded: %s on %s/%s in %.1fs",
-                 config.EMBED_MODEL, plan.embed_device, plan.embed_dtype, time.time() - started)
-        return model
-
-    async def ensure_loaded(self) -> bool:
-        """Load once. Returns False if the model is unavailable — never raises."""
-        if self._model is not None:
-            return True
-        if not self.plan.use_embedder:
-            # The `lite` profile runs on BM25 alone. This is a deliberate configuration, not a
-            # failure, so it is recorded once and never retried.
-            if self._load_failed is None:
-                self._load_failed = "lite profile: semantic search is off by configuration"
-                log.info("lite profile — no embedder will be loaded")
-            return False
-        if self._load_failed is not None:
-            return False
-
-        async with self._load_lock:
-            if self._model is not None:
-                return True
-            if self._load_failed is not None:
-                return False
-
-            snapshot = resources.probe()
-            if snapshot.ram_available_mb < config.RAM_FLOOR_MB:
-                self._load_failed = (
-                    f"only {snapshot.ram_available_mb} MB RAM available (floor is "
-                    f"{config.RAM_FLOOR_MB} MB) — refusing to load a 2 GB model"
-                )
-                log.warning("embedder unavailable: %s", self._load_failed)
-                return False
-
-            try:
-                self._model = await gpu.get_executor().run(self._load_sync)
-                gpu.get_executor().register_evict_hook(self._unload_sync)
-                return True
-            except Exception as exc:
-                self._load_failed = f"{type(exc).__name__}: {exc}"
-                log.error("embedder failed to load: %s", self._load_failed)
-                gpu.empty_cache()
-                return False
-
-    def _unload_sync(self) -> None:
-        if self._model is not None:
-            log.info("evicting embedder from %s", self.plan.embed_device)
-            self._model = None
-            self._warm = False
-
-    async def retry_load(self) -> bool:
-        """Clear a previous failure and try again — used once RAM frees up."""
-        self._load_failed = None
-        return await self.ensure_loaded()
+        if not self.available:
+            return "no OPENROUTER_API_KEY is configured"
+        return self.last_error
 
     async def warmup(self) -> bool:
-        """Pay the ~1.9s CUDA warmup at startup instead of on the first question.
-
-        Over the API there is no warmup to pay and nothing to load, so this does one real call
-        to prove the key, the model name and the vector width are all what we think they are —
-        failing at boot is far better than failing on someone's first question.
-        """
-        if self.plan.embed_backend == "api":
-            vectors = await self.encode(["warmup"], use_cache=False)
-            self._warm = vectors is not None
-            if not self._warm:
-                log.error("embedding API did not answer at warmup — retrieval will be keyword-only")
-            return self._warm
-        if not await self.ensure_loaded():
-            return False
-        if self._warm:
-            return True
-        started = time.time()
-        await self.encode(["warmup"], use_cache=False)
-        self._warm = True
-        log.info("embedder warm in %.2fs (subsequent queries ~25 ms)", time.time() - started)
-        return True
-
-    # ── encoding ─────────────────────────────────────────────────────────────────────
-    def _encode_sync(self, texts):
-        import numpy as np
-
-        vectors = self._model.encode(list(texts), normalize_embeddings=True,
-                                     batch_size=self.plan.embed_batch,
-                                     show_progress_bar=False)
-        return np.asarray(vectors, dtype="float32")
+        """One real call at startup, proving the key, the model and the vector width."""
+        self.warm = await self.encode(["warmup"], use_cache=False) is not None
+        if not self.warm:
+            log.error("embedding API did not answer at startup (%s) — retrieval will be "
+                      "keyword-only until it recovers", self.unavailable_reason)
+        return self.warm
 
     async def encode(self, texts, use_cache: bool = True):
-        """Encode a batch. Returns an (n, 1024) float32 array, or None if unavailable.
-
-        bge-m3 encodes queries and passages symmetrically, so there is no prefix to add —
-        adding one would silently shift queries away from the indexed vectors.
-        """
+        """An (n, 1024) float32 array of unit vectors, or None if the API is unavailable."""
         import numpy as np
 
         items = [str(t or "") for t in texts]
         if not items:
             return np.zeros((0, config.EMBED_DIM), dtype="float32")
-        if not self.plan.use_embedder:
-            # Answering some queries from cache and not others would make retrieval quality
-            # depend on what happened to be asked before. In lite mode semantic search is off,
-            # consistently.
+        if not self.available:
             return None
 
         cache = get_cache() if use_cache else None
-        out: list = [None] * len(items)
-        todo: list[int] = []
-
-        if cache is not None:
-            for i, text in enumerate(items):
-                hit = cache.get_vector(key_of(config.EMBED_MODEL, text))
-                if hit is not None:
-                    out[i] = hit
-                    self.cache_hits += 1
-                else:
-                    todo.append(i)
-        else:
-            todo = list(range(len(items)))
-
+        out, todo = self._from_cache(items, cache)
         if todo:
-            pending = [items[i] for i in todo]
-            vectors = None
-
-            if self.plan.embed_backend == "api":
-                # Same model, different transport — OpenRouter's bge-m3 was verified against the
-                # stored corpus vectors at cosine 1.0000, so these are interchangeable with the
-                # ones in the index. On any failure fall through to the local model rather than
-                # returning None, because None means "no semantic search at all" downstream.
-                from ..llm import retrieval_api
-
-                try:
-                    vectors = await retrieval_api.embed(pending)
-                    self.api_calls += 1
-                except retrieval_api.RetrievalApiError as exc:
-                    self._api_failures += 1
-                    log.warning("embedding API unavailable (%s) — trying the local model", exc)
-
+            vectors = await self._embed([items[i] for i in todo])
             if vectors is None:
-                if not await self.ensure_loaded():
-                    return None
-                try:
-                    vectors = await gpu.get_executor().map_batches(
-                        self._encode_sync, pending, self.plan.embed_batch, label="embed",
-                    )
-                except gpu.GpuOutOfMemory as exc:
-                    log.error("embedding ran out of memory: %s", exc)
-                    return None
-                except Exception as exc:
-                    log.error("embedding failed: %s", exc)
-                    return None
-
-            self.encodes += len(pending)
-            for slot, vector in zip(todo, vectors):
-                vector = np.asarray(vector, dtype="float32")
+                return None
+            for slot, vector in zip(todo, vectors, strict=True):
                 out[slot] = vector
                 if cache is not None:
-                    cache.set_vector(key_of(config.EMBED_MODEL, items[slot]), vector)
-
+                    cache.set_vector(key_of(config.EMBED_API_MODEL, items[slot]), vector)
         return np.vstack([np.asarray(v, dtype="float32").reshape(-1) for v in out])
 
+    def _from_cache(self, items: list[str], cache) -> tuple[list, list[int]]:
+        out: list = [None] * len(items)
+        todo: list[int] = []
+        for i, text in enumerate(items):
+            hit = cache.get_vector(key_of(config.EMBED_API_MODEL, text)) if cache else None
+            if hit is None:
+                todo.append(i)
+            else:
+                out[i] = hit
+                self.cache_hits += 1
+        return out, todo
+
+    async def _embed(self, texts: list[str]):
+        try:
+            vectors = await retrieval_api.embed(texts)
+        except retrieval_api.RetrievalApiError as exc:
+            self.api_failures += 1
+            self.last_error = str(exc)[:200]
+            log.warning("embedding API unavailable: %s", self.last_error)
+            return None
+        self.api_calls += 1
+        self.encodes += len(texts)
+        self.last_error = None
+        return vectors
+
     async def encode_one(self, text: str):
-        """One query vector, or None. The common case — cached, so repeats are free."""
+        """One query vector, or None. Cached, so a repeated query costs nothing."""
         result = await self.encode([text])
         return None if result is None else result[0]
 
     def status(self) -> dict:
         return {
-            "model": config.EMBED_MODEL,
-            "loaded": self.loaded,
-            "warm": self._warm,
-            "backend": self.plan.embed_backend,
-            "device": "api" if self.plan.embed_backend == "api" else self.plan.embed_device,
+            "model": config.EMBED_API_MODEL,
+            "available": self.available,
+            "warm": self.warm,
             "api_calls": self.api_calls,
-            "api_failures": self._api_failures,
-            "dtype": self.plan.embed_dtype,
+            "api_failures": self.api_failures,
             "encodes": self.encodes,
             "cache_hits": self.cache_hits,
-            "unavailable_reason": self._load_failed,
+            "last_error": self.last_error,
         }
 
 

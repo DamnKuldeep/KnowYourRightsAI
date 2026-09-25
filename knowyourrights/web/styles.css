@@ -424,3 +424,27 @@ textarea::placeholder { color: var(--text-faint); }
   content: "Updating with confirmed details…";
   display: block; margin-top: 10px; font-size: .78rem; color: var(--text-dim);
 }
+
+.procedure .portal { margin: 10px 0 0; }
+.queue-banner b { color: var(--accent); font-variant-numeric: tabular-nums; }
+.footer .quota { color: var(--text-faint); }
+
+/* ── usage-limit dialog ──────────────────────────────────────────────────────────────── */
+.modal {
+  position: fixed; inset: 0; z-index: 60;
+  background: rgba(35, 32, 28, .45);
+  display: grid; place-items: center; padding: 16px;
+}
+.modal[hidden] { display: none; }        /* see .pipeline[hidden]: display outranks hidden */
+.modal-inner {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: var(--shadow); max-width: 440px; width: 100%; padding: 22px 24px 20px;
+}
+.modal-inner h2 { margin: 0 0 10px; font-size: 1.05rem; }
+.modal-inner p { margin: 0 0 12px; font-size: .9rem; line-height: 1.55; color: var(--text); }
+.modal-inner .modal-foot { color: var(--text-dim); font-size: .82rem; }
+.modal-inner .primary {
+  margin-top: 4px; padding: 8px 18px; border-radius: var(--radius-sm); border: 0;
+  background: var(--accent); color: var(--surface); font-weight: 600; cursor: pointer;
+}
+textarea:disabled { opacity: .6; cursor: not-allowed; }

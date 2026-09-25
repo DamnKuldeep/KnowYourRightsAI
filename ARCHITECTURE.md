@@ -1,376 +1,331 @@
-# How KnowYourRightsAI works
+# Architecture
 
-One question in, one cited answer out. This is everything in between — what runs, when, and
-why it is there rather than something simpler.
+How one question becomes one cited answer, and why each part is there rather than something
+simpler. For the numbers behind these decisions, see [EVALUATION.md](EVALUATION.md).
+
+## Contents
+
+1. [Design principles](#1-design-principles)
+2. [A request, end to end](#2-a-request-end-to-end)
+3. [The pipeline](#3-the-pipeline)
+4. [The safety gate](#4-the-safety-gate)
+5. [Statute retrieval](#5-statute-retrieval)
+6. [Models and failure handling](#6-models-and-failure-handling)
+7. [When something fails: degraded modes](#7-when-something-fails-degraded-modes)
+8. [Jurisdiction](#8-jurisdiction)
+9. [Writing and checking the answer](#9-writing-and-checking-the-answer)
+10. [Conversation memory](#10-conversation-memory)
+11. [Cost tracking and public-deployment limits](#11-cost-tracking-and-public-deployment-limits)
+12. [Security](#12-security)
+13. [Module map](#13-module-map)
 
 ---
 
-## The whole pipeline
+## 1. Design principles
+
+- **Code orchestrates; models advise.** A model emits a validated plan and Python executes it.
+  A model that cannot call tools cannot hallucinate a tool call, and a web page cannot trigger
+  one.
+- **Rules a model follows only sometimes are enforced in code.** Always searching the statute,
+  asking which state, mapping IPC sections to BNS, dropping unverifiable citations: each is a
+  deterministic step, because each went wrong in a real answer when it was only a prompt rule.
+- **Degrade, never fail silently.** Every stage has a fallback, and the reader is told when one
+  was used. Only a configuration problem (no key, a rejected key) stops a turn.
+- **Deadlines, not attempt counts.** Each turn has a wall-clock budget. When it runs out,
+  research stops and the answer is written from what was found.
+- **Measure, then decide.** Model routing, thresholds and ranking weights come from scripts in
+  `scripts/` that anyone can re-run.
+
+## 2. A request, end to end
+
+```mermaid
+flowchart LR
+    B([browser]) -->|POST /api/chat| V[validate<br/><small>state, length, session id</small>]
+    V --> G{guards<br/><small>daily ceiling · client allowance · rate</small>}
+    G -->|refused| E([JSON error<br/><small>403 / 429</small>])
+    G --> Q{admission queue<br/><small>5 at a time</small>}
+    Q -->|full| F([503 busy])
+    Q -->|waiting| P[queue events<br/><small>'you are number N'</small>] --> Q
+    Q -->|admitted| O[orchestrator<br/><small>one turn</small>]
+    O -->|SSE events| B
+    O -.->|every billed call| S[(spend book<br/><small>per client, per day</small>)]
+```
+
+- **Validation** (`server/models.py`): the selected state must be one of the known states and
+  union territories, because it is written into the prompt.
+- **Guards** (`server/quota.py`): checked before any money is spent. A client is identified by
+  IP address, stored only as a salted hash.
+- **Admission** (`server/admission.py`): a first-come queue with a length cap, a wait cap and a
+  per-client share. A reader who closes the tab gives their place back.
+- **The turn** (`orchestrator/`): runs as a background task feeding an event queue, so a
+  rate-limit pause deep inside the model client can still put a countdown on screen.
+
+## 3. The pipeline
 
 ```mermaid
 flowchart TD
-    Q([" User question<br/><i>English · Hindi · Hinglish</i> "]) --> SAFETY
+    Q([question]) --> SAFE{{safety gate<br/><small>patterns now · meaning alongside the planner</small>}}
+    SAFE -->|emergency| HELP[helpline card, first]
+    SAFE --> PLAN[planner · fast model<br/><small>intent · depth · sub-questions · sources</small>]
+    HELP --> PLAN
+    PLAN -->|small talk| CHAT[short reply, no research]
+    PLAN -->|names a provision| EXACT[exact lookup<br/><small>no search</small>]
+    PLAN --> RULES[rules in code<br/><small>language · always the statute · deadline & appeal search · state known?</small>]
+    RULES --> ROUND
 
-    SAFETY{{" 1 · SAFETY GATE<br/><small>patterns, then meaning — never a model call</small><br/><b>33/33 caught · 0/26 false alarms</b> "}}
-    SAFETY -->|emergency detected| HELP[" Helpline card shown FIRST<br/><small>112 · 1091 · 1098 · 15100 · 14416</small> "]
-    SAFETY --> LANG
-    HELP --> LANG
-
-    LANG[" 2 · LANGUAGE + VOCABULARY<br/><small>script & function words · acronyms · repeals</small><br/><b>IPC → BNS · RTI → Right to Information Act</b> "]
-    LANG --> PLAN
-
-    PLAN[" 3 · PLANNER <i>(fast model)</i><br/><small>intent · depth · sub-questions · which source answers what</small> "]
-    PLAN -->|small talk| CHAT[" Concierge — streamed, no research "]
-    PLAN -->|names a provision| EXACT[" 4a · EXACT LOOKUP<br/><small>no embedding, no reranking · 52 ms</small> "]
-    PLAN -->|needs research| LOOP
-
-    subgraph LOOP [" 4b · RESEARCH LOOP — up to 4 rounds, under a wall-clock deadline "]
-        direction TB
-        RW[" Query writer <i>(fast)</i><br/><small>2–4 phrasings per source</small> "] --> PAR
-        PAR{{" run in parallel "}}
-        PAR --> STAT[" legal_db<br/><small>the statute</small> "]
-        PAR --> OFF[" official<br/><small>gov.in search</small> "]
-        PAR --> WIKI[" wikipedia<br/><small>background only</small> "]
-        STAT & OFF & WIKI --> GRADE[" Grader <i>(fast)</i><br/><small>drops vocabulary-only matches</small> "]
-        GRADE --> CRAWL[" crawl4ai<br/><small>read pages · walk portals</small> "]
-        CRAWL --> GAP{" Gap analyst <i>(fast)</i><br/>anything still missing? "}
-        GAP -->|gaps + time left| RW
+    subgraph ROUND [research round: steps run in parallel]
+        LDB[statute search]
+        WEB[official and web search, then read pages]
+        WIKI[Wikipedia]
+        NAV[portal navigation]
     end
-
+    ROUND --> GRADE[grader · fast model<br/><small>drops vocabulary-only matches</small>]
+    GRADE --> GAP{deep mode: gaps left<br/>and time left?}
+    GAP -->|yes| ROUND
+    GAP -->|no| PROC[procedure card · fast model<br/><small>fee · time limit · appeal · portal</small>]
     EXACT --> PROC
-    LOOP --> PROC
-    PROC[" 5 · PROCEDURE EXTRACTOR <i>(fast)</i><br/><small>steps · fee · deadline · appeal route · portal link</small> "]
-    PROC --> PACK
-
-    PACK[" 6 · CONTEXT PACKER<br/><small>token budget · statute always keeps a slot</small><br/><b>jurisdiction stamped on every statute</b> "]
-    PACK --> WRITE
-
-    WRITE[" 7 · WRITER <i>(large model)</i> — STREAMED<br/><small>shape follows the question · [S1] citation markers</small> "]
-    WRITE --> FC
-
-    FC{" 8 · SELF-CHECK <i>(fast)</i><br/><small>deep mode only</small><br/>anything here I should confirm? "}
-    FC -->|confident| VERIFY
-    FC -->|"fees · deadlines · thin support"| RECHECK[" Targeted web checks<br/><small>≤2 searches</small> "]
-    RECHECK --> REWRITE[" Rewrite with what they said "]
-    REWRITE --> VERIFY
-
-    VERIFY[" 9 · CITATION VERIFIER<br/><small>code, not a model</small><br/><b>every [S1] must resolve — unresolvable ones are stripped</b> "]
-    VERIFY --> OUT([" Answer + sources panel<br/><small>jurisdiction badges · trust tiers · verified count</small> "])
+    PROC --> WRITE[writer · streamed]
+    WRITE --> CHECK[answer checks · code<br/><small>citations · cleanup · state question</small>]
+    CHECK --> VERIFY{deep mode:<br/>self-verify}
+    VERIFY -->|claims to confirm| WEBCHECK[targeted web checks] --> REWRITE[silent rewrite, swapped in]
+    VERIFY --> OUT([answer + sources])
+    REWRITE --> OUT
     CHAT --> OUT
-
-    classDef gate fill:#fff4e6,stroke:#d97706,stroke-width:2px,color:#111
-    classDef model fill:#e7f1ee,stroke:#1f6f5c,stroke-width:2px,color:#111
-    classDef code fill:#eef2ff,stroke:#4f46e5,stroke-width:2px,color:#111
-    classDef out fill:#f4f2ee,stroke:#6c665e,stroke-width:2px,color:#111
-    classDef danger fill:#fdecea,stroke:#b3261e,stroke-width:2px,color:#111
-    class SAFETY,GAP,FC gate
-    class PLAN,RW,GRADE,PROC,WRITE,CHAT,REWRITE model
-    class LANG,EXACT,PACK,VERIFY,CRAWL,RECHECK code
-    class Q,OUT out
-    class HELP danger
 ```
 
-**Green = a model call. Blue = plain Python. Amber = a decision point. Red = safety.**
+| Depth | Research rounds | Pages read | Time budget | Extra steps |
+|---|---:|---:|---:|---|
+| quick | 1 | 0 | 25 s | a named provision skips search entirely |
+| standard | 1 | up to 3 | 75 s | procedure card for how-to questions |
+| deep | up to 4 | up to 10, 2 links deep | 240 s | query rewriting, gap analysis, self-verification |
 
-The shape of that diagram is the main design decision: **the blue boxes are in charge.** The
-model never chooses to call a tool — it emits a validated plan, and Python executes it. A model
-that cannot call tools cannot hallucinate a tool call, and a web page full of hostile
-instructions cannot trigger one either.
+The planner chooses the depth unless the reader forces one.
 
----
+## 4. The safety gate
 
-## The safety gate — the one thing that runs before everything
+It runs first because someone writing *"he is hitting me right now"* needs 112 before anything
+else, even when every model provider is down.
 
-It is first in the pipeline on purpose. Someone typing *"he is hitting me right now"* needs 112
-before anything else happens, and that has to hold when every model provider is rate-limited,
-retired, or down. So the gate never makes a model call.
+| Tier | How | Cost | Notes |
+|---|---|---|---|
+| 1 · patterns | literal phrasings, strong and weak | none, synchronous | strong ("hitting me", "I was raped") always fire; weak bare nouns ("suicide") only when the message is not a question about the law |
+| 2 · meaning | cosine similarity to curated crisis exemplars (English, Hindi, Hinglish) | one embedding, run alongside the planner | suppressed for messages that read as questions *about* the law |
+
+Tier 2 fails open: if embeddings are unavailable, tier 1 still applies. The gate's result is
+settled before research begins, so the card always comes first.
+
+## 5. Statute retrieval
 
 ```mermaid
 flowchart LR
-    M([" message "]) --> T1
-    T1{{" TIER 1 · patterns<br/><small>~0 ms · no model, no network</small> "}}
-    T1 -->|"strong match<br/><i>'hitting me' · 'I was raped'</i>"| FIRE
-    T1 -->|"weak match<br/><i>bare noun: 'suicide'</i>"| GUARD
-    T1 -->|no match| GUARD
-
-    GUARD{" is this a question ABOUT the law?<br/><small><i>'punishment for…' · 'which act…' · '…laws in India'</i></small> "}
-    GUARD -->|yes| PASS([" no card — continue to research "])
-    GUARD -->|no| T2
-
-    T2{{" TIER 2 · meaning<br/><small>cosine vs curated exemplars, bge-m3</small><br/><small>the embedding is reused by retrieval — free</small> "}}
-    T2 -->|"≥ 0.64"| FIRE
-    T2 -->|below| PASS
-
-    FIRE[" HELPLINE CARD, before research<br/><small>112 · 1091 · 181 · 1098 · 15100 · 14416</small> "]
-
-    classDef gate fill:#fff4e6,stroke:#d97706,stroke-width:2px,color:#111
-    classDef danger fill:#fdecea,stroke:#b3261e,stroke-width:2px,color:#111
-    classDef out fill:#f4f2ee,stroke:#6c665e,stroke-width:2px,color:#111
-    class T1,T2,GUARD gate
-    class FIRE danger
-    class M,PASS out
+    Q([query]) --> X[acronym expansion<br/><small>RTI → Right to Information Act, 2005</small>]
+    X --> EMB[bge-m3 embedding<br/><small>OpenRouter</small>] --> ANN[vector search<br/><small>IVF-HNSW</small>]
+    X --> BM[BM25 keyword search]
+    ANN & BM --> RRF{{weighted rank fusion}}
+    NAMED[×2.5 lists limited to a named Act] --> RRF
+    GEN[×2.0 lists limited to the Constitution + 2023 codes<br/><small>for policing questions</small>] --> RRF
+    RRF --> DED[one row per section]
+    DED --> RR[rerank<br/><small>Cohere, sees each section's citizen questions</small>]
+    RR --> BOOST[general law wins near-ties<br/><small>relative to the best score</small>]
+    BOOST --> MMR[diversify on the stored vectors]
+    MMR --> OUT([top 5 sections])
 ```
 
-**Why two tiers.** Patterns are instant and exact, and they cannot generalise. *"my partner
-keeps hurting me and I am scared to go home"* matches nothing literal — and it is exactly what
-someone types. So a second tier compares the message against curated exemplars of each crisis,
-written the way frightened people write, in English, Hindi and Hinglish. It uses the embedder
-already loaded for retrieval, and retrieval embeds the same string moments later and reads it
-from cache, so the tier costs one embedding per turn rather than one per tier.
+Each non-obvious box answers an observed failure:
 
-**Why strong and weak patterns.** Bare topic nouns are the vocabulary of the crime *and* of
-every legal question about it. Matching them naively produced helpline cards on *"is suicide a
-crime in India"* and *"child labour laws in India"*. Strong phrasings carry a subject or object
-and fire unconditionally; weak ones are suppressed when the message reads as a question.
-
-| | Disclosures caught | False alarms |
-|---|---:|---:|
-| Patterns only | 17 / 33 | 3 / 26 |
-| **Both tiers** | **33 / 33** | **0 / 26** |
-
-Scored on 33 labelled disclosures — literal and paraphrased, three languages — against 26 legal
-questions deliberately chosen to be *about the same crimes in the same words*. Both sets live in
-[`knowyourrights/safety_eval.py`](knowyourrights/safety_eval.py);
-`python scripts/calibrate_safety.py` sweeps the threshold and prints the whole curve, weighting
-a miss four times a false alarm.
-
-**It fails open, never closed.** A broken embedder, or the `lite` profile which loads none,
-degrades to tier 1 rather than to nothing.
-
----
-
-## Retrieval, in detail
-
-The statute search is where most of the engineering went.
-
-```mermaid
-flowchart LR
-    Q([" query "]) --> EXP[" acronym expansion<br/><small>RTI → Right to Information Act, 2005</small> "]
-
-    EXP --> EMB[" bge-m3<br/><small>local · fp16 · 61 ms</small> "]
-    EXP --> BM[" BM25<br/><small>LanceDB · 23 ms</small> "]
-    EMB --> ANN[" ANN vector search<br/><small>IVF-HNSW · <b>23 ms</b></small> "]
-
-    ANN --> RRF{{" WEIGHTED FUSION (RRF) "}}
-    BM --> RRF
-    ACTF[" ×2.5 — searches limited<br/>to a named Act "] --> RRF
-    GENF[" ×2.0 — searches limited to<br/>the Constitution + 2023 codes "] --> RRF
-
-    RRF --> DED[" de-duplicate to one row per section<br/><small>keeping the best-ranked chunk</small> "]
-    DED --> RR[" cross-encoder rerank<br/><small><b>309 ms</b> — 75% of the total</small> "]
-    RR --> BOOST[" prefer general law over sectoral law<br/><small>Forest Act 0.994 vs BNSS 0.992 — the model cannot tell</small> "]
-    BOOST --> MMR[" diversify on the <i>stored</i> vectors<br/><small>20 ms, and in the space actually searched</small> "]
-    MMR --> TOP([" top sections<br/><b>399 ms end to end</b> "])
-
-    classDef local fill:#e7f1ee,stroke:#1f6f5c,color:#111
-    classDef fuse fill:#fff4e6,stroke:#d97706,stroke-width:2px,color:#111
-    classDef step fill:#eef2ff,stroke:#4f46e5,color:#111
-    class EMB,ANN,RR local
-    class RRF,BOOST fuse
-    class EXP,BM,DED,MMR step
-```
-
-Four of those boxes exist because of a specific observed failure:
-
-| Box | What went wrong without it |
+| Step | What went wrong without it |
 |---|---|
-| **ANN vector search** | The corpus shipped with no vector index. Every query scanned 38,890 × 1024 floats — **159 MB**, 304 ms. |
-| **Act-filtered lists ×2.5** | "How do I file an RTI" returned three unrelated *institute* Acts above the RTI Act. |
-| **Prefer general law** | "Can the police arrest me" returned the **Navy Act, Forest Act and Railway Property Act** — all of which grant *someone* a power of arrest, in near-identical words. |
-| **MMR on stored vectors** | Diversity was computed by re-encoding `chunk_text`, but the index holds vectors of `embed_text`. It was measuring in a space that was never searched. |
+| Act-filtered lists | "How do I file an RTI" ranked unrelated institute Acts above the RTI Act. |
+| General-law boost | "Can the police arrest me" returned the Navy, Forest and Railway Property Acts, which grant *someone* a power of arrest in near-identical words. |
+| Citizen questions for the reranker | RTI §7 opens with provisos before it says "thirty days", and scored below a section that merely mentions "five days". |
+| Acronyms annotated, not replaced, for the reranker | Expanded text reads as broken English to a cross-encoder; a bare "RTI" let the Credit Information Companies Act outrank RTI §19. |
+| MMR on stored vectors | Diversity was once computed on re-encoded text, a space that was never searched. |
 
----
+**Abstention.** When the best section scores below the calibrated threshold, retrieval reports
+that it has nothing on point. Thresholds belong to a ranking method (reranker model and document
+format, or fused ranking), are calibrated by `scripts/calibrate.py`, and ship in
+`knowyourrights/thresholds.json`, which a local calibration in `.runtime/` overrides.
 
-## Where the models come from
+**Exact lookup.** "What does Article 21 say" and "Section 420 IPC" are fetched directly.
+Repealed-code sections are translated through a verified map (38 entries checked against the
+corpus headings); an old number with no verified mapping is never guessed.
 
-Two providers, because one turned out to be an unreliable dependency.
+## 6. Models and failure handling
 
-```mermaid
-flowchart TB
-    subgraph ROLES [" what each stage needs "]
-        direction LR
-        F[" FAST<br/><small>plan · queries · grade<br/>gaps · fact-check</small><br/><b>4–6 calls/question</b> "]
-        W[" WRITER<br/><small>the answer</small><br/><b>1–2 calls/question</b> "]
-        R[" RERANK<br/><small>retrieval</small> "]
-    end
+| Role | Calls per question | Models, in order |
+|---|---:|---|
+| fast: plan, grade, gaps, procedure, fact-check, summary | 2–6 | Gemini 2.5 Flash-Lite → Mercury 2.5 → Nemotron Nano (OpenRouter) → Nemotron on NVIDIA NIM |
+| writer: the answer | 1–2 | Qwen 3.7 Flash → Gemini 2.5 Flash-Lite → Nemotron Super 120B (free) → NVIDIA NIM |
+| embeddings | 1–3 | `baai/bge-m3` (the corpus's own model) |
+| reranking | 1–3 | `cohere/rerank-v3.5` |
 
-    F --> FR{" registry "}
-    W --> WR{" registry "}
-    R --> RR{" registry "}
-
-    FR -->|1st| N1[" NVIDIA NIM<br/>nemotron-3-nano<br/><small>40 rpm <b>per model</b></small> "]
-    FR -->|fallback| O1[" OpenRouter<br/>nemotron-3.5-lightning:free<br/><small>~20 rpm shared</small> "]
-
-    WR -->|1st| N2[" NVIDIA NIM<br/>nemotron-3-super-120b<br/><small><b>2.8 s</b> measured</small> "]
-    WR -->|fallback| O2[" OpenRouter<br/>gemma-4-31b:free · glm-5.2:free<br/>ultra-550b:free <small>(21.6 s — last resort)</small> "]
-
-    RR --> LOC[" local cross-encoder<br/><small>every NIM rerank endpoint returns 410/404</small> "]
-
-    classDef nim fill:#e7f1ee,stroke:#1f6f5c,stroke-width:2px,color:#111
-    classDef or fill:#eef2ff,stroke:#4f46e5,stroke-width:2px,color:#111
-    classDef local fill:#f4f2ee,stroke:#6c665e,stroke-width:2px,color:#111
-    class N1,N2 nim
-    class O1,O2 or
-    class LOC local
-```
-
-**The order is measured, not assumed.** NVIDIA leads the fast role because its limit is 40/min
-*per model* while OpenRouter shares ~20/min across all free models — and the fast role fires
-4–6 times per question, so OpenRouter 429s almost immediately. NVIDIA also leads the writer
-role on latency: 2.8 s against 4.1 s for the same model on OpenRouter.
-
-And bigger is not better. `nemotron-3-ultra-550b` is the largest free model available anywhere
-in this stack, and it took **21.6 seconds** for a two-sentence answer. It is kept last, as an
-availability backstop.
-
-**The embedder cannot move.** The corpus is embedded with `bge-m3`, so a different model means
-re-embedding all 38,890 chunks. It runs locally, permanently, on whatever machine this is on.
-
-### When a provider fails
+The order is measured by `scripts/race_models.py` on the real prompts. Paid models lead the fast
+role because it runs several times per question: a free model there would take ~30 s a stage and
+spend the shared free allowance. The free 120B writer was fastest to its first token but broke 12
+of 22 streams in one session, so a reliable paid model leads.
 
 ```mermaid
 flowchart LR
-    C[" call "] --> S{" response "}
-    S -->|200| OK([" answer<br/><small>clears the failure streak</small> "])
-    S -->|429| P[" honour Retry-After<br/>countdown in the UI<br/>AIMD: rate ×0.7 "] --> C
-    S -->|"410 / 404"| M[" sideline for this process<br/><small>3 failures in an hour to persist</small> "] --> NX[" next candidate<br/><small>often the other provider</small> "] --> C
-    S -->|"5xx ×2"| NX
-    S -->|"402 / 403"| NX
-    S -->|deadline hit| DEG([" answer with what we have<br/><small>never nothing</small> "])
-
-    classDef good fill:#e7f1ee,stroke:#1f6f5c,color:#111
-    classDef bad fill:#fff4e6,stroke:#d97706,color:#111
-    class OK,DEG good
-    class P,M,NX bad
+    C[call] --> R{response}
+    R -->|200| OK([answer · clears the failure streak])
+    R -->|429| W[honour Retry-After · countdown in the UI · slow the bucket] --> C
+    R -->|404 / 410 / 402 / 403| N[sideline this model · next for the same role] --> C
+    R -->|5xx twice| N
+    R -->|400 on an optional field| D[retry once without it] --> C
+    R -->|401| A([ProviderAuthError: ends the turn with a clear message])
+    R -->|deadline reached| DL([answer from what was found])
 ```
 
-A single 410 no longer retires a model. NVIDIA returns them transiently under load — observed
-live, a model 410'd on one call and answered normally on the next — and the earlier behaviour
-of writing that verdict to disk meant one blip silently moved the whole app onto its fallback.
+A model is sidelined for the process on one failure and recorded as unavailable only after three
+failures within an hour, because providers return 410 transiently under load. Fallbacks are
+looked up per role: a model that serves two roles falls back within the role that failed.
 
----
+## 7. When something fails: degraded modes
 
-## What the user actually sees
+Every stage has a defined fallback. Readers are told when one ran.
 
-```mermaid
-flowchart LR
-    O[" orchestrator "] -->|"typed SSE events"| UI[" browser "]
+| What fails | What happens | What the reader sees |
+|---|---|---|
+| Embedding API | keyword (BM25) search only; the safety gate keeps its pattern tier | notice: search is keyword-only and may miss sections |
+| Reranking API | ordered by fused scores, under that mode's own threshold | notice: sources ordered by a simpler method |
+| Planner | a default plan: statute search on the question | notice: researched without a tailored plan |
+| Grader | every source kept, marked unvetted | notice: some sources may be loosely related |
+| Gap analysis, procedure card, query rewriting, fact-check | the stage is skipped | nothing (the answer is complete without it) |
+| Writer | the provisions found, quoted with their citations | notice, and the answer is the raw provisions |
+| Writer cut off mid-answer | what arrived is kept | notice: the answer may be incomplete |
+| Time budget | research stops; the answer is written from what was found | notice |
+| API key rejected | the turn stops | error: the operator needs to fix the key |
+| No provider configured | every question is refused | error; `/api/health` reports `unavailable` |
 
-    subgraph EV [" the event stream "]
-        direction TB
-        E1[" <b>stage</b> — what is happening now "]
-        E2[" <b>tool</b> — each search, with timing "]
-        E3[" <b>source</b> — fills the panel <i>before</i> the prose starts "]
-        E4[" <b>notice</b> — rate-limit countdown, jurisdiction warnings "]
-        E5[" <b>procedure</b> — steps, fee, deadline, appeal "]
-        E6[" <b>token</b> — the answer, streamed "]
-        E7[" <b>sources_final</b> — the definitive citable set "]
-        E8[" <b>verdict</b> — citations verified / stripped "]
-    end
-    O --- EV
+## 8. Jurisdiction
 
-    classDef ev fill:#f4f2ee,stroke:#6c665e,color:#111
-    class E1,E2,E3,E4,E5,E6,E7,E8 ev
-```
+The corpus's `jurisdiction` column says `central` for every row, including state Acts that leaked
+in, so jurisdiction is read from the Act's title:
 
-Typed events rather than a bare token stream, because a deep research turn runs for up to a
-minute and a blank screen is indistinguishable from a crash. `sources_final` exists because the
-packer re-assigns ids at the end — without it a citation chip could point at nothing.
+| Label | Meaning | Example |
+|---|---|---|
+| CONSTITUTION | applies nationwide | Article 21 |
+| CENTRAL | applies across India | Right to Information Act, 2005 |
+| TERRITORY | passed by Parliament for one Union Territory; applies only there | Delhi Rent Control Act, 1958 |
+| STATE | a state legislature's law; applies only in that state | Maharashtra Rent Control Act, 1999 |
 
----
+The writer is told that the law of **where the matter is** governs, not where the reader lives.
+When the answer depends on a state nobody named, a question asking which state is appended. A
+question that names a place (a state, a union territory or a major city) is not asked.
+Source cards also carry corrections the corpus cannot know: the 2019 change to Jammu & Kashmir,
+references to the repealed codes, and an Act that was passed but never brought into force.
 
-## Jurisdiction — the thing it must not get wrong
+## 9. Writing and checking the answer
 
-Telling someone in Kerala that a Maharashtra rent law governs them is worse than telling them
-nothing. So jurisdiction is never inferred:
+The writer receives only the packed sources, each labelled with its jurisdiction and marked as
+untrusted data if it came from the web. The packer reserves a place for each kind of source so a
+long web page cannot crowd out the statute, and it trims a copy rather than the shared original.
 
-```mermaid
-flowchart TD
-    S[" a statute section "] --> T{" read the Act's TITLE<br/><small>never the jurisdiction column</small> "}
-    T -->|"starts with a state name"| ST[" <b>STATE</b><br/>applies only there "]
-    T -->|"Constitution of India"| CO[" <b>CONSTITUTION</b><br/>applies nationwide "]
-    T --> CE[" <b>CENTRAL</b><br/>applies across India "]
+After writing, code checks and cleans the text (`agents/answer_text.py`):
 
-    ST --> CMP{" does it match<br/>the user's state? "}
-    CMP -->|yes| FINE[" cite normally "]
-    CMP -->|no| WARN[" red badge · warning line<br/>writer must say it does not apply "]
-    CMP -->|state unknown| ASK[" say the answer depends on their state "]
+- every `[S1]` must resolve to a supplied source; unresolvable markers are removed;
+- invented citation shapes (`[S1(a)]`, `[S1, S2]`) are normalised so they can be linked;
+- page titles pasted as link text are shortened; prompt block names cited as sources are removed;
+- "the sources do not state…" lines are dropped, with any heading they leave empty;
+- the which-state question is added once, in the reader's language, if needed.
 
-    classDef warn fill:#fdecea,stroke:#b3261e,stroke-width:2px,color:#111
-    classDef ok fill:#e7f1ee,stroke:#1f6f5c,color:#111
-    class WARN warn
-    class CE,CO,FINE ok
-```
+In deep mode a fact-checker names claims worth confirming (fees, deadlines); two targeted web
+searches check them, and the answer is rewritten silently and swapped in whole, so the reader
+never watches it restart.
 
-The corpus's own `jurisdiction` column says `central` for **every** row — including the 53
-state Acts that leaked in from the source dataset. The Act title is the only trustworthy
-signal, which is why it is the one that is used.
+## 10. Conversation memory
 
----
+- **History** is built newest-first under a token budget, with each past answer capped, so a
+  follow-up always sees the exchange it refers to. The current question is not repeated in its
+  own history. Older turns fold into a rolling summary written in the background.
+- **Sources** vetted earlier are recalled for a follow-up when they share enough of its words,
+  and go through the grader again. The pool is bounded (40 sources per conversation).
+- **Sessions** are held in memory: at most 200, dropped after six idle hours.
 
-## What runs where
+## 11. Cost tracking and public-deployment limits
 
-The same pipeline, sized to the machine. Only the two local models move; everything else is
-identical, which is why **accuracy is a property of the system and latency is a property of the
-box**.
+Every billed call (chat, embedding, reranking) charges the turn that made it through a context
+variable, so concurrent turns each know their own exact cost and each client's spend is
+attributed correctly. That feeds:
 
-| Profile | Embedder | Reranker | Recall@5 | Off-topic caught | Retrieval | Picked when |
-|---|---|---|---:|---:|---:|---|
-| `quality` | bge-m3 fp16 GPU | bge-reranker-v2-m3 | 100% | 11/11 | ~0.4 s | VRAM ≥ 3600 MiB |
-| `balanced` | bge-m3 fp16 GPU | bge-reranker-base | 100% | 11/11 | ~0.4 s | VRAM ≥ 2900 MiB |
-| **`cpu`** ← deployed | bge-m3 fp32 CPU | bge-reranker-base, pool 8 | **95.2%** | **10/11** | **6.6 s** | no usable CUDA |
-| `cpu_lean` | bge-m3 fp32 CPU | none — fused RRF | 93% | 5/11 | 0.09 s | CPU box too slow to demo |
-| `lite` | none | none — BM25 only | 90.5% | 5/11 | 0.06 s | under 2 GB RAM |
+| Limit | Default | Behaviour |
+|---|---|---|
+| Answers at once | 5 | later questions queue and see their place in line |
+| Queue | 20 waiting, 180 s wait | beyond either, the request is turned away |
+| Per client | 2 in progress or waiting, 10 per minute | 429 with `Retry-After` |
+| Per-client allowance | $1 | a popup says the free allowance is used up; the input is disabled |
+| Service per day | $5 | everyone is told to come back tomorrow |
 
-Two things this table is really saying:
+A question already running is allowed to finish, so a client can end slightly over its
+allowance by at most one answer's cost. The spend book survives restarts.
 
-**The cross-encoder's job is refusal, not ranking.** Removing it costs 7 points of Recall@5,
-which is survivable, and takes off-topic rejection from 10/11 to 5/11, which is not. Without it
-the answerable and off-topic score populations overlap, so no threshold separates them. The
-deployed profile therefore keeps the model and shrinks its pool to 8 documents instead of
-dropping it — 8 is enough to preserve the refusal and a third of the cost.
+## 12. Security
 
-**Thresholds belong to a configuration, not a model.** They are keyed by backend, model,
-quantisation and input length, because each of those moves the score distribution while leaving
-the model's name unchanged. Reusing a calibration across them is silent and it breaks
-abstention: measured, int8 scored against float32's threshold let off-topic questions through
-6 times in 11 instead of 1.
-
-### Measured on the deployment target
-
-`m7i-flex.large`, 2 vCPU (**1 physical core**), 8 GB, Ubuntu 24.04, no GPU — against the
-development laptop with an RTX 3050:
-
-| | Laptop (GPU) | EC2 (CPU) | |
-|---|---:|---:|---|
-| Recall@5 | 95.2% | **95.2%** | identical |
-| MRR | 0.861 | 0.854 | float32 vs fp16 flips near-ties |
-| Off-topic wrongly answered | 0/8 | **0/8** | |
-| Exact lookup | 4/4 | **4/4** | |
-| Cold start | 56.7 s | **16.0 s** | no CUDA init |
-| Dense search | 33 ms | **12 ms** | EC2 is faster |
-| BM25 | 32 ms | **8 ms** | EC2 is faster |
-| Cross-encoder | 309 ms* | **6,625 ms** | one core, no GPU |
-
-\* on a GPU at full clock. Regenerate any of this on your own machine with
-`python scripts/benchmark.py --all` then `python scripts/deploy_report.py`.
-
-The searches feeding the reranker are *faster* on the small cloud box than on the laptop. All
-of the difference is the cross-encoder, and all of that is having one physical core.
-
----
-
-## Cost and limits at a glance
-
-| | |
+| Risk | Measure |
 |---|---|
-| Embedder | local, always — corpus-locked to bge-m3 |
-| LLM calls per question | 4 (quick) · 8 (standard) · 20 (deep), as ceilings |
-| NVIDIA free tier | ~1,000 credits, 40 rpm **per model** |
-| OpenRouter free tier | 1,000 requests/day, ~20 rpm **shared across all free models** |
-| Corpus | 38,890 chunks · 35,170 sections · 1,020 Acts · ~300 MB |
-| Hosting | $0.0958/hour running, $1.60/month stopped |
+| Prompt injection from web pages | crawled text is sanitised, injection phrases removed and flagged, and delivered as labelled data; the model cannot call tools |
+| Server-side request forgery | the crawler fetches only public http(s) addresses: every resolved IP is checked, and each page again by its final URL after redirects |
+| Injection through request fields | the state must be a known state; all fields are length-bounded; session ids are restricted to safe characters |
+| Cross-site scripting | the UI escapes everything before rendering markdown; links must be http(s); a Content-Security-Policy restricts scripts to the app's own |
+| Information leaks | errors show a reference, not internals; `/api/status` needs a token or a local request |
+| Abuse and cost | admission queue, per-client rate limit and allowance, daily ceiling |
+| Secrets | read from the environment only; `.env` and key files are gitignored |
 
-Both free tiers are tracked client-side. OpenRouter's daily count survives restarts, so
-bouncing the server cannot quietly blow the allowance, and a spent provider is skipped rather
-than tried and refused.
+## 13. Module map
+
+```text
+knowyourrights/
+├── config.py                every setting; environment overrides
+├── events.py                the typed events streamed to the browser
+├── evidence.py              the Evidence type: source, trust tier, jurisdiction, corrections
+├── legal_terms.py           acronyms, repealed codes, section map, language detection, places
+├── safety.py                the two-tier safety gate
+├── thresholds.json          shipped retrieval calibrations
+├── server/
+│   ├── api.py               routes, lifespan, security headers, maintenance loop
+│   ├── models.py            validated request bodies
+│   ├── admission.py         the admission queue
+│   ├── quota.py             spend book, per-client rate limit, guard
+│   └── sessions.py          in-memory conversations
+├── orchestrator/
+│   ├── core.py              the turn: plan, gather, write, verify, commit; failure reporting
+│   ├── research.py          research rounds, grading, tools, page reading, procedure card
+│   ├── writer.py            prompt, stream, fallbacks, finalising
+│   ├── verify.py            deep-mode self-check
+│   ├── digest.py            the no-model fallback answer
+│   └── turn.py              turn state and budget; degraded-stage helper
+├── agents/
+│   ├── planning.py          the planner and the rules applied to its plan
+│   ├── grading.py           the relevance grader and its rescue path
+│   ├── stages.py            query writer, gap analyst, procedure extractor, fact-checker, summary
+│   ├── answer_text.py       deterministic answer checks and cleanup
+│   ├── prompts.py           every system prompt
+│   └── schemas.py           validated stage outputs
+├── retrieval/
+│   ├── search.py            the search pipeline and its degradation ladder
+│   ├── ranking.py           fusion, MMR, what the reranker reads
+│   ├── store.py             LanceDB access and exact lookup
+│   ├── embedder.py          embeddings over the API, cached
+│   └── reranker.py          reranking over the API; thresholds
+├── llm/
+│   ├── client.py            chat, structured chat, streaming
+│   ├── failures.py          what each failed response means
+│   ├── streaming.py         reading a chat stream
+│   ├── registry.py          model routing and sidelining
+│   ├── limiter.py           per-model rate limiting (AIMD)
+│   ├── retrieval_api.py     embedding and reranking endpoints
+│   ├── ledger.py            usage log and the free tier's daily allowance
+│   ├── spend.py             per-turn spend meters
+│   └── errors.py            the error types callers act on
+├── tools/
+│   ├── legal_db.py          statute search, exact lookup, caveats
+│   ├── web.py               web search
+│   ├── crawl.py             reading pages (HTTP first, browser when needed)
+│   ├── navigate.py          walking a portal towards a procedure
+│   ├── pages.py             the page model, sanitising, evidence conversion
+│   ├── url_safety.py        which URLs may be fetched
+│   └── wikipedia.py         background summaries
+├── context/                 token budgets, conversation memory, page reduction, packing
+├── runtime/                 the on-disk cache, console helpers
+└── web/                     index.html, app.js, styles.css
+```

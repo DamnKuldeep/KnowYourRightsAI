@@ -14,12 +14,11 @@ remaining risk, which is a page talking the writer into believing something.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from .. import config
 from ..evidence import Evidence
 from .budget import Budget, estimate_tokens, fit_to_tokens
-from .reduce import cap_text
 
 log = logging.getLogger(__name__)
 
@@ -63,6 +62,15 @@ class PackResult:
         }
 
 
+def cap_text(item: Evidence) -> str:
+    """The per-kind hard ceiling. Statutes get the most room: they are what gets cited."""
+    if item.is_statute:
+        return item.text[:config.STATUTE_TEXT_CAP]
+    if item.kind == "wikipedia":
+        return item.text[:config.WIKI_TEXT_CAP]
+    return item.text[:config.WEB_TEXT_CAP]
+
+
 def render(item: Evidence) -> str:
     """One evidence block as the writer sees it."""
     header = KIND_HEADER.get(item.kind, "SOURCE")
@@ -104,59 +112,66 @@ def pack(items: list[Evidence], budget: Budget | None = None, *,
         return PackResult("", [], [], 0, available)
 
     ordered = sorted(items, key=lambda e: (-e.tier, -e.score))
-
-    # Reserve a place for the strongest item of each kind present, so no single source type
-    # can crowd the others out on score alone.
-    guaranteed: list[Evidence] = []
+    packing = _Packing(available, estimate_tokens(UNTRUSTED_PREAMBLE) + 16)
+    # Reserve a place for the strongest item of each kind present, so no single source type can
+    # crowd the others out on score alone.
     for kind in ("statute", "procedure", "official", "web", "wikipedia"):
         first = next((e for e in ordered if e.kind == kind), None)
         if first is not None:
-            guaranteed.append(first)
-
-    included: list[Evidence] = []
-    dropped: list[Evidence] = []
-    used = estimate_tokens(UNTRUSTED_PREAMBLE) + 16
-
-    def try_add(item: Evidence, allow_trim: bool) -> bool:
-        nonlocal used
-        block = render(item)
-        cost = estimate_tokens(block) + 4
-        if used + cost <= available:
-            included.append(item)
-            used += cost
-            return True
-        if allow_trim:
-            # A guaranteed slot is worth keeping even truncated: a trimmed statute still
-            # carries its citation and its operative words.
-            headroom = available - used - 32
-            if headroom > 180:
-                item.text = fit_to_tokens(item.text, headroom)
-                item.meta["trimmed"] = True
-                block = render(item)
-                if used + estimate_tokens(block) <= available:
-                    included.append(item)
-                    used += estimate_tokens(block) + 4
-                    return True
-        return False
-
-    for item in guaranteed:
-        if not try_add(item, allow_trim=True):
-            dropped.append(item)
-
+            packing.offer(first, allow_trim=True)
     for item in ordered:
-        if item in included or item in dropped:
-            continue
-        if len(included) >= max_sources or not try_add(item, allow_trim=False):
-            dropped.append(item)
+        if not packing.seen(item):
+            packing.offer(item, allow_trim=False, room=len(packing.included) < max_sources)
 
-    included.sort(key=lambda e: (-e.tier, -e.score))
+    included = sorted(packing.included, key=lambda e: (-e.tier, -e.score))
     body = "\n\n".join(render(e) for e in included)
     text = f"{UNTRUSTED_PREAMBLE}\n\n{body}" if body else ""
-
-    if dropped:
+    if packing.dropped:
         log.debug("packer: kept %d source(s), dropped %d, %d/%d tokens",
-                  len(included), len(dropped), used, available)
-    return PackResult(text, included, dropped, used, available)
+                  len(included), len(packing.dropped), packing.used, available)
+    return PackResult(text, included, packing.dropped, packing.used, available)
+
+
+class _Packing:
+    """Sources accepted so far against a token budget, tracked by identity."""
+
+    def __init__(self, available: int, used: int) -> None:
+        self.available = available
+        self.used = used
+        self.included: list[Evidence] = []
+        self.dropped: list[Evidence] = []
+        self._seen: set[int] = set()
+
+    def seen(self, item: Evidence) -> bool:
+        return id(item) in self._seen
+
+    def offer(self, item: Evidence, *, allow_trim: bool, room: bool = True) -> None:
+        self._seen.add(id(item))
+        cost = estimate_tokens(render(item)) + 4
+        if room and self.used + cost <= self.available:
+            self._accept(item, cost)
+        elif room and allow_trim and (trimmed := self._trimmed(item)) is not None:
+            # A guaranteed slot is worth keeping even truncated: a trimmed statute still
+            # carries its citation and its operative words.
+            self._accept(trimmed, estimate_tokens(render(trimmed)) + 4)
+        else:
+            self.dropped.append(item)
+
+    def _trimmed(self, item: Evidence) -> Evidence | None:
+        """A shortened copy that fits, or None. A copy: the original also lives in the
+        conversation's memory, and trimming it in place shortened it for every later turn."""
+        # The block's header lines (title, jurisdiction, corrections) cost tokens too.
+        header = estimate_tokens(render(replace(item, text=""))) + 8
+        room = self.available - self.used - header
+        if room <= 150:
+            return None
+        copy = replace(item, text=fit_to_tokens(item.text, room),
+                       meta={**item.meta, "trimmed": True})
+        return copy if self.used + estimate_tokens(render(copy)) <= self.available else None
+
+    def _accept(self, item: Evidence, cost: int) -> None:
+        self.included.append(item)
+        self.used += cost
 
 
 def render_empty_note(notes: list[str] | None = None) -> str:

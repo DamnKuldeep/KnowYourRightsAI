@@ -1,9 +1,4 @@
-"""Shared test setup.
-
-The retry and backoff constants are production values measured in seconds. Left alone they
-make the suite spend most of its time asleep, so they are scaled down globally here — the
-*logic* under test is unchanged, only the wall-clock cost.
-"""
+"""Shared test setup: no network, no real keys, and no writes outside a temporary directory."""
 
 from __future__ import annotations
 
@@ -14,11 +9,22 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from knowyourrights import config  # noqa: E402
+from knowyourrights import config
+
+
+def corpus_available() -> bool:
+    """True when the LanceDB corpus has been downloaded, not just its Git LFS pointers."""
+    data = config.DB_PATH / f"{config.TABLE}.lance" / "data"
+    return any(p.stat().st_size > 1024 for p in data.glob("*.lance")) if data.is_dir() else False
+
+
+requires_corpus = pytest.mark.skipif(not corpus_available(),
+                                     reason="the corpus is not downloaded (git lfs pull)")
 
 
 @pytest.fixture(autouse=True)
 def fast_retries(monkeypatch):
+    """Production retry delays are seconds; the logic under test is the same at milliseconds."""
     monkeypatch.setattr(config, "RETRY_INITIAL_DELAY", 0.01)
     monkeypatch.setattr(config, "RETRY_MAX_DELAY", 0.05)
     monkeypatch.setattr(config, "RETRY_MULTIPLIER", 1.5)
@@ -26,27 +32,24 @@ def fast_retries(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def stub_provider_keys(monkeypatch):
-    """Give both providers a fake key so the suite runs without real credentials.
+    """Fake keys, so every role resolves on a machine with no ``.env`` (CI included).
 
-    ``registry.candidates()`` filters out providers with no key configured, so on a machine
-    with no ``.env`` — CI, or anyone who just cloned the repo — every role resolves to nothing
-    and a third of the tests fail before reaching what they actually test. Every request is
-    served by ``httpx.MockTransport`` regardless, so these values are never sent anywhere.
+    Requests are served by ``httpx.MockTransport`` or stubbed out, so these are never sent.
     """
     monkeypatch.setattr(config, "NVIDIA_API_KEY", "nvapi-test-key-not-real")
     monkeypatch.setattr(config, "OPENROUTER_API_KEY", "sk-or-v1-test-key-not-real")
+    monkeypatch.setattr(config, "ADMIN_TOKEN", "")
 
 
 @pytest.fixture(autouse=True)
 def isolated_runtime(tmp_path, monkeypatch):
-    """Keep tests off the developer's real ``.runtime`` directory.
+    """Keep every test off the real ``.runtime`` directory and every singleton fresh.
 
-    Not merely tidiness. The model-failover test deliberately makes a model return 410, and
-    the registry persists that verdict — so without isolation a mocked failure retires a
-    healthy production model, and the app quietly runs on its fallback afterwards. This
-    happened, which is why the registry now resolves its path lazily.
+    Not tidiness: a mocked model failure used to be persisted by the registry and retire a
+    healthy model in the developer's real runtime.
     """
-    from knowyourrights.llm import registry
+    from knowyourrights.llm import ledger, limiter, registry
+    from knowyourrights.runtime import cache
 
     runtime = tmp_path / "runtime"
     runtime.mkdir(parents=True, exist_ok=True)
@@ -54,9 +57,11 @@ def isolated_runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "CACHE_DIR", runtime / "cache")
     monkeypatch.setattr(config, "THRESHOLDS_FILE", runtime / "thresholds.json")
     monkeypatch.setattr(registry, "_state", None)
-    # The ledger is a process-wide singleton holding daily provider counts. Without a reset,
-    # one test's calls count against the next test's "allowance", and the counts get persisted.
-    from knowyourrights.llm import ledger
-    monkeypatch.setattr(ledger, "_LEDGER", None, raising=False)
+    registry._sidelined.clear()
+    monkeypatch.setattr(ledger, "_LEDGER", None)
+    monkeypatch.setattr(cache, "_CACHE", None)
+    # Rate-limit buckets carried over between tests made later tests wait on earlier ones.
+    monkeypatch.setattr(limiter, "_REGISTRY", None)
     yield runtime
     registry._state = None
+    registry._sidelined.clear()

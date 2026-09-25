@@ -21,7 +21,7 @@ import logging
 import re
 import threading
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from collections.abc import Sequence
 
 from .. import config, legal_terms
 
@@ -36,14 +36,15 @@ def pd_isna(value) -> bool:
     except (TypeError, ValueError):
         return value is None
 
-# Everything the answer layer needs about a section. `embed_text` is deliberately absent:
-# it is a build-time artefact and must never be shown to a user (DB README §7).
+
+# Everything the answer layer needs about a section. `embed_text` is read only for its citizen
+# questions, which the reranker is shown; it is build-time text and never reaches a user.
 DISPLAY_COLUMNS = [
     "chunk_id", "unit_id", "citation", "act_title", "act_year", "section_label",
     "section_name", "chapter", "category", "status", "effective_date",
     "source_type", "source_snapshot", "chunk_text", "full_text",
     # carries the citizen questions written for each section at build time; the reranker reads
-    # them (see search._rerank_document)
+    # them (see ranking.rerank_document)
     "embed_text",
 ]
 
@@ -73,6 +74,8 @@ def normalize_title(text: str) -> str:
 
 
 _STOPWORDS = {"the", "of", "and", "act", "a", "an", "for", "to", "in", "india", "indian"}
+# The longest section in the corpus is well under this many chunks.
+MAX_CHUNKS_PER_SECTION = 25
 
 
 @dataclass(frozen=True)
@@ -93,6 +96,11 @@ class LegalStore:
         # Reentrant: building the index needs the table, and both are guarded by this lock.
         self._lock = threading.RLock()
         self._fts_available = True
+
+    @property
+    def fts_available(self) -> bool:
+        """False once LanceDB has reported that the full-text index is missing."""
+        return self._fts_available
 
     # ── connection ───────────────────────────────────────────────────────────────────
     @property
@@ -171,7 +179,7 @@ class LegalStore:
             if scores is not None and "_score" in df.columns:
                 # Zip the columns rather than itertuples: pandas renames any column starting
                 # with an underscore to a positional name, so `row._score` silently is not it.
-                for chunk_id, score in zip(df["chunk_id"], df["_score"]):
+                for chunk_id, score in zip(df["chunk_id"], df["_score"], strict=True):
                     scores[chunk_id] = max(scores.get(chunk_id, 0.0), float(score))
             return df["chunk_id"].tolist()
         except Exception as exc:
@@ -231,7 +239,7 @@ class LegalStore:
             df = (self.table.search()
                   .where(sql_in("unit_id", ids))
                   .select(list(columns or DISPLAY_COLUMNS))
-                  .limit(config.__dict__.get("MAX_CHUNKS_PER_SECTION", 25) * len(ids) + 32)
+                  .limit(MAX_CHUNKS_PER_SECTION * len(ids) + 32)
                   .to_pandas())
             return df.sort_values(["unit_id", "chunk_id"]).reset_index(drop=True)
         except Exception as exc:
@@ -269,35 +277,11 @@ class LegalStore:
         if not wanted:
             return []
 
-        wants_amendment = "amendment" in wanted
         counts = idx.groupby("act_title").size()
-        scored: list[ActMatch] = []
         titles = idx[["act_title", "_title_norm", "act_year"]].drop_duplicates("act_title")
-
-        for title, norm, year in titles.itertuples(index=False):
-            tokens = set(norm.split()) - _STOPWORDS
-            if not tokens:
-                continue
-            overlap = len(wanted & tokens)
-            if not overlap:
-                continue
-            # Cover the query first, then the title, then reward exact containment.
-            score = overlap / len(wanted) * 0.7 + overlap / len(tokens) * 0.3
-            if normalized and normalized in norm:
-                score += 0.25
-            # Amendment acts only amend; the principal act is what someone asking about
-            # "the Maternity Benefit Act" actually wants.
-            if "amendment" in tokens and not wants_amendment:
-                score -= 0.30
-            # Several statutes exist in an old and a current version (Consumer Protection
-            # 1986 vs 2019). Nudge towards the current one when nothing else separates them.
-            try:
-                if year and not pd_isna(year):
-                    score += min(0.05, max(0.0, (int(year) - 1950) / 1500))
-            except (TypeError, ValueError):
-                pass
-            scored.append(ActMatch(title, round(score, 4), int(counts.get(title, 0))))
-
+        scored = [ActMatch(title, round(score, 4), int(counts.get(title, 0)))
+                  for title, norm, year in titles.itertuples(index=False)
+                  if (score := _title_score(wanted, normalized, norm, year)) is not None]
         scored.sort(key=lambda m: (-m.score, -m.sections, m.act_title))
         return scored[:limit]
 
@@ -330,17 +314,29 @@ class LegalStore:
             return pd.DataFrame(columns=DISPLAY_COLUMNS)
         return self.chunks_of(candidates["unit_id"].tolist()[:4])
 
-    def browse_act(self, act: str, limit: int = 400):
-        """The section list for an act — a table of contents, from the resident index."""
-        import pandas as pd
 
-        matches = self.find_acts(act, limit=1)
-        if not matches:
-            return pd.DataFrame(columns=INDEX_COLUMNS), None
-        title = matches[0].act_title
-        rows = self.index[self.index["act_title"] == title].copy()
-        rows = rows.sort_values("section_num", na_position="last").head(limit)
-        return rows.drop(columns=["_title_norm"], errors="ignore"), title
+def _title_score(wanted: set[str], normalized: str, norm: str, year) -> float | None:
+    """How well an Act's normalised title matches the query words, or None for no overlap."""
+    tokens = set(norm.split()) - _STOPWORDS
+    overlap = len(wanted & tokens)
+    if not overlap:
+        return None
+    # Cover the query first, then the title, then reward exact containment.
+    score = overlap / len(wanted) * 0.7 + overlap / len(tokens) * 0.3
+    if normalized and normalized in norm:
+        score += 0.25
+    # Amendment Acts only amend; the principal Act is what someone asking about "the Maternity
+    # Benefit Act" wants.
+    if "amendment" in tokens and "amendment" not in wanted:
+        score -= 0.30
+    # Several statutes exist in an old and a current version (Consumer Protection 1986 and
+    # 2019). Nudge towards the current one when nothing else separates them.
+    try:
+        if year and not pd_isna(year):
+            score += min(0.05, max(0.0, (int(year) - 1950) / 1500))
+    except (TypeError, ValueError):
+        pass
+    return score
 
 
 # LanceDB's FTS parser treats these as syntax; a citizen's question is not a query language.

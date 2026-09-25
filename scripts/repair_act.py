@@ -36,12 +36,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pydantic import BaseModel, Field                                  # noqa: E402
+from pydantic import BaseModel, Field
 
-from knowyourrights import config                                     # noqa: E402
-from knowyourrights.llm import retrieval_api                          # noqa: E402
-from knowyourrights.llm.client import get_client                      # noqa: E402
-from knowyourrights.runtime.console import bold, rule, setup_console  # noqa: E402
+from knowyourrights import config
+from knowyourrights.llm import retrieval_api
+from knowyourrights.llm.client import get_client
+from knowyourrights.retrieval.store import sql_quote
+from knowyourrights.runtime.console import bold, rule, setup_console
 
 setup_console()
 
@@ -105,9 +106,10 @@ CATEGORIES = ["Fundamental Rights", "Criminal & Police", "Consumer & Services",
               "Other"]
 
 # Notebook 01, cell 19 — verbatim, so repaired rows are enriched exactly like the rest.
-ENRICH_SYS = ("You write search metadata for a section of Indian central law, for an app that helps "
-              "ordinary citizens. Base everything ONLY on the provided text; never invent legal "
-              "facts. Reply with a single JSON object and nothing else: {\"questions\":[3 everyday "
+ENRICH_SYS = ("You write search metadata for a section of Indian central law, for an app that "
+              "helps ordinary citizens. Base everything ONLY on the provided text; never invent "
+              "legal facts. Reply with a single JSON object and nothing else: "
+              "{\"questions\":[3 everyday "
               "questions a normal person might ask that this provision answers],\"keywords\":[6-10 "
               "short topic keywords],\"category\":\"one of " + " | ".join(CATEGORIES) + "\"}.")
 ENRICH_MAX_CHARS = 3000
@@ -155,6 +157,20 @@ def _clean(text: str, act_title: str) -> str:
     return re.sub(r"\s{2,}", " ", text).strip()
 
 
+_HEADING = re.compile(r"(?m)^\s*(\d{1,3})\.\s*([A-Z][^\n]{1,180}?)\s*\.?\s*[—–-]\s*")
+_CHAPTER = re.compile(r"(?m)^\s*CHAPTER\s+([IVXL]+)\s*\n\s*([A-Z][A-Z ,'&-]{3,})\s*$")
+
+
+def _numbered_headings(body: str) -> list[tuple[int, int, int, str]]:
+    """``(start, end, number, name)`` for each heading that is the next number in sequence."""
+    found, expected = [], 1
+    for m in _HEADING.finditer(body):
+        if int(m.group(1)) == expected:
+            found.append((m.start(), m.end(), expected, m.group(2).strip().rstrip(".")))
+            expected += 1
+    return found
+
+
 def parse_sections(raw: str, spec: dict, act_title: str) -> list[dict]:
     """Split the body into sections, accepting a heading only if it is the NEXT number.
 
@@ -165,21 +181,12 @@ def parse_sections(raw: str, spec: dict, act_title: str) -> list[dict]:
     start = raw.find(spec["body_start"])
     end = raw.find(spec["body_end"], start)
     if start < 0 or end < 0:
-        raise SystemExit(f"could not find the body markers in the text")
+        raise SystemExit("could not find the body markers in the text")
     body = raw[start:end]
 
-    heading = re.compile(r"(?m)^\s*(\d{1,3})\.\s*([A-Z][^\n]{1,180}?)\s*\.?\s*[—–-]\s*")
-    chapter = re.compile(r"(?m)^\s*CHAPTER\s+([IVXL]+)\s*\n\s*([A-Z][A-Z ,'&-]{3,})\s*$")
     chapters = [(m.start(), f"CHAPTER {m.group(1)} {m.group(2).strip().title()}")
-                for m in chapter.finditer(body)]
-
-    found, expected = [], 1
-    for m in heading.finditer(body):
-        if int(m.group(1)) != expected:
-            continue
-        found.append((m.start(), m.end(), expected, m.group(2).strip().rstrip(".")))
-        expected += 1
-
+                for m in _CHAPTER.finditer(body)]
+    found = _numbered_headings(body)
     names = spec.get("names") or []
     known_chapters = spec.get("chapters") or []
     sections = []
@@ -226,7 +233,7 @@ async def enrich(act_title: str, sec: dict) -> Enrichment:
 def build_rows(act_title: str, template: dict, sections: list[dict],
                enrichments: list[Enrichment], spec: dict) -> list[dict]:
     rows = []
-    for sec, e in zip(sections, enrichments):
+    for sec, e in zip(sections, enrichments, strict=True):
         unit_id = f"central_act|{act_title}|{sec['label']}"
         head = f"{act_title} — Section {sec['label']}"
         if sec["name"]:
@@ -251,106 +258,129 @@ def build_rows(act_title: str, template: dict, sections: list[dict],
     return rows
 
 
-# ── main ──────────────────────────────────────────────────────────────────────────────
-async def main_async(args) -> int:
-    import lancedb
-    import numpy as np
+# ── actions ───────────────────────────────────────────────────────────────────────────
+REMOVAL_LOG = Path("data/repair/removed.json")
 
-    act_title = args.act
-    spec = ACTS[act_title]
-    db = lancedb.connect(str(config.DB_PATH))
-    table = db.open_table(config.TABLE)
 
-    if args.restore is not None:
-        table.restore(args.restore)
-        print(f"  restored {config.TABLE} to version {args.restore}")
-        return 0
+def remove_act(table, act_title: str, reason: str | None) -> int:
+    """Delete an Act that should not be in the corpus, and record why in the removal log."""
+    where = f"act_title = {sql_quote(act_title)}"
+    n = table.count_rows(where)
+    if not n or not reason:
+        print(f"  no rows for {act_title!r}" if not n else
+              "  --remove needs --reason: a removal nobody can explain later is a bug")
+        return 1
+    before = table.version
+    table.delete(where)
+    table.create_fts_index("embed_text", use_tantivy=False, replace=True)
+    REMOVAL_LOG.parent.mkdir(parents=True, exist_ok=True)
+    entries = json.loads(REMOVAL_LOG.read_text(encoding="utf-8")) if REMOVAL_LOG.exists() else []
+    entries.append({"act_title": act_title, "rows": n, "reason": reason,
+                    "table_version_before": before, "date": time.strftime("%Y-%m-%d")})
+    REMOVAL_LOG.write_text(json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"  removed {n} row(s); version {before} -> {table.version}; logged in {REMOVAL_LOG}")
+    print(f"  undo with --restore {before}; next: python scripts/build_index.py --rebuild")
+    return 0
 
-    if args.remove:
-        # For an Act that should not be in the corpus at all. Recorded with its reason in
-        # data/repair/removed.json, so the corpus's provenance stays explainable.
-        n = table.count_rows(f"act_title = '{args.remove}'")
-        if not n:
-            print(f"  no rows for {args.remove!r}")
-            return 1
-        if not args.reason:
-            print("  --remove needs --reason: a removal nobody can explain later is a bug")
-            return 1
-        before = table.version
-        table.delete(f"act_title = '{args.remove}'")
-        table.create_fts_index("embed_text", use_tantivy=False, replace=True)
-        log_path = Path("data/repair/removed.json")
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        entries = json.loads(log_path.read_text(encoding="utf-8")) if log_path.exists() else []
-        entries.append({"act_title": args.remove, "rows": n, "reason": args.reason,
-                        "table_version_before": before, "date": time.strftime("%Y-%m-%d")})
-        log_path.write_text(json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8")
-        print(f"  removed {n} row(s) of {args.remove!r}; version {before} -> {table.version}")
-        print(f"  logged in {log_path}; undo with --restore {before}")
-        print("  next: python scripts/build_index.py --rebuild")
-        return 0
 
-    rule(f"parse — {act_title}")
+def fetch_pdf(spec: dict, insecure: bool) -> Path:
+    """The official text, downloaded once. Some government hosts serve an incomplete TLS
+    certificate chain; ``--insecure-download`` exists for them and must be asked for."""
+    import httpx
+
     pdf = Path(spec["pdf"])
     if not pdf.exists():
-        import httpx
         pdf.parent.mkdir(parents=True, exist_ok=True)
-        r = httpx.get(spec["url"], timeout=60, follow_redirects=True, verify=False,
-                      headers={"User-Agent": "KnowYourRights corpus repair"})
-        r.raise_for_status()
-        pdf.write_bytes(r.content)
+        response = httpx.get(spec["url"], timeout=60, follow_redirects=True,
+                             verify=not insecure,
+                             headers={"User-Agent": "KnowYourRights corpus repair"})
+        response.raise_for_status()
+        pdf.write_bytes(response.content)
+    return pdf
+
+
+def parse_checked(spec: dict, act_title: str, pdf: Path) -> list[dict] | None:
+    """Every section, in sequence, or None (with the reason printed) if any is missing."""
     sections = parse_sections(pdf_text(pdf), spec, act_title)
-    labels = [int(s["label"]) for s in sections]
     print(f"  sections found: {len(sections)} of {spec['sections']}")
-    if labels != list(range(1, spec["sections"] + 1)):
-        missing = sorted(set(range(1, spec["sections"] + 1)) - set(labels))
+    missing = sorted(set(range(1, spec["sections"] + 1)) - {int(s["label"]) for s in sections})
+    if missing or len(sections) != spec["sections"]:
         print(f"  {bold('REFUSING TO WRITE')}: sections missing or out of order: {missing}")
-        return 1
+        return None
     for s in sections:
         print(f"    §{s['label']:<3} {s['name'][:48]:<50} {len(s['text'].split()):>5} words"
               f"  {s['chapter'][:34]}")
+    return sections
 
-    old = table.search().where(f"act_title = '{act_title}'").limit(10_000).to_pandas()
-    print(f"\n  replaces {len(old)} existing row(s) across "
-          f"{old['section_label'].nunique()} mis-numbered section(s)")
-    if args.dry_run:
-        print("\n  --dry-run: nothing written")
-        return 0
+
+async def rebuild_rows(act_title: str, spec: dict, sections: list[dict], old) -> list[dict]:
+    """Enrich, lay out and embed the new rows exactly as notebook 01 built the rest."""
+    import numpy as np
 
     rule("enrich — citizen questions and keywords, as notebook 01 did")
     enrichments = []
     for s in sections:
-        e = await enrich(act_title, s)
-        enrichments.append(e)
-        print(f"    §{s['label']:<3} {e.category:<22} {(e.questions or ['—'])[0][:60]}")
-
+        enrichments.append(await enrich(act_title, s))
+        print(f"    §{s['label']:<3} {enrichments[-1].category:<22} "
+              f"{(enrichments[-1].questions or ['—'])[0][:60]}")
     template = {k: v for k, v in old.iloc[0].to_dict().items() if k != "vector"}
     rows = build_rows(act_title, template, sections, enrichments, spec)
-
     rule("embed — baai/bge-m3, the corpus's own model")
     vectors = await retrieval_api.embed([r["embed_text"] for r in rows])
-    for r, v in zip(rows, vectors):
-        r["vector"] = np.asarray(v, dtype="float32")
+    for row, vector in zip(rows, vectors, strict=True):
+        row["vector"] = np.asarray(vector, dtype="float32")
     print(f"  {len(rows)} chunks embedded, spend so far {retrieval_api.session().stats()}")
+    return rows
 
-    rule("write")
+
+def replace_act(table, act_title: str, rows: list[dict]) -> None:
     before = table.version
-    table.delete(f"act_title = '{act_title}'")
+    table.delete(f"act_title = {sql_quote(act_title)}")
     table.add(rows)
     table.create_fts_index("embed_text", use_tantivy=False, replace=True)
     print(f"  table version {before} -> {table.version}; {table.count_rows():,} rows")
     print(f"  to undo:  python scripts/repair_act.py --restore {before}")
     print("  next:     python scripts/build_index.py --rebuild   (the vector index)")
+
+
+# ── main ──────────────────────────────────────────────────────────────────────────────
+async def main_async(args) -> int:
+    import lancedb
+
+    table = lancedb.connect(str(config.DB_PATH)).open_table(config.TABLE)
+    if args.restore is not None:
+        table.restore(args.restore)
+        print(f"  restored {config.TABLE} to version {args.restore}")
+        return 0
+    if args.remove:
+        return remove_act(table, args.remove, args.reason)
+
+    act_title, spec = args.act, ACTS[args.act]
+    rule(f"parse — {act_title}")
+    sections = parse_checked(spec, act_title, fetch_pdf(spec, args.insecure_download))
+    if sections is None:
+        return 1
+    old = table.search().where(f"act_title = {sql_quote(act_title)}").limit(10_000).to_pandas()
+    print(f"\n  replaces {len(old)} existing row(s) across "
+          f"{old['section_label'].nunique()} mis-numbered section(s)")
+    if args.dry_run:
+        print("\n  --dry-run: nothing written")
+        return 0
+    rows = await rebuild_rows(act_title, spec, sections, old)
+    rule("write")
+    replace_act(table, act_title, rows)
     return 0
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--act", default="Right to Information Act, 2005", choices=list(ACTS))
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--restore", type=int, metavar="VERSION")
     ap.add_argument("--remove", metavar="ACT_TITLE", help="delete an Act that should not be here")
     ap.add_argument("--reason", help="why, recorded in data/repair/removed.json")
+    ap.add_argument("--insecure-download", action="store_true",
+                    help="skip TLS verification when downloading the official PDF")
     return asyncio.run(main_async(ap.parse_args()))
 
 

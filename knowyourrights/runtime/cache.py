@@ -9,6 +9,7 @@ Namespaces in use: ``embed``, ``search``, ``web``, ``crawl``, ``turn``, ``wiki``
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -39,7 +40,8 @@ CREATE INDEX IF NOT EXISTS kv_expires ON kv(expires);
 def key_of(*parts: Any) -> str:
     """Stable short key for arbitrary inputs (queries, URLs, option dicts)."""
     blob = "\x1f".join(
-        json.dumps(p, sort_keys=True, ensure_ascii=False, default=str) if not isinstance(p, str) else p
+        p if isinstance(p, str)
+        else json.dumps(p, sort_keys=True, ensure_ascii=False, default=str)
         for p in parts
     )
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:32]
@@ -203,11 +205,8 @@ class Cache:
         }
 
     def close(self) -> None:
-        with self._lock:
-            try:
-                self._conn.close()
-            except sqlite3.Error:
-                pass
+        with self._lock, contextlib.suppress(sqlite3.Error):
+            self._conn.close()
 
 
 _CACHE: Cache | None = None

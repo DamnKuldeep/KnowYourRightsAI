@@ -1,41 +1,38 @@
 # Secrets
 .env
+.env.*
+!.env.example
+*.pem
+*.ppk
+*.key
+kyr-key*
 
-# Runtime state: caches, usage ledger, calibrated thresholds, feedback
+# Runtime state: caches, usage log, local calibrations, client spend, feedback
 .runtime/
 
-# The ~350 MB corpus IS committed, via Git LFS (see .gitattributes), so the repo is runnable
-# straight after a clone. Worth knowing: GitHub's free LFS allowance is 1 GB of storage and
-# 1 GB of bandwidth a month, and a full clone pulls ~350 MB of that — about three clones a
-# month. If that ever becomes a problem, move the bundle to a GitHub Release asset, which has
-# no bandwidth quota.
-#
-# Transient LanceDB bookkeeping — no value in version control.
+# LanceDB writes transient bookkeeping here. _deletions/ is NOT transient: the table manifest
+# names its deletion files, so a clone without them cannot open the database.
 data/legal_db/**/_transactions/
-#
-# _deletions/ is NOT transient and must stay committed. The table manifest names its deletion
-# files by path, so a clone without them cannot open the database at all — it fails with
-# "Not found: …/_deletions/0-2-….arrow" on the first query, long after the corpus check has
-# happily reported 299 MB present. It is 762 bytes. Ignoring it cost a deployment.
 
 # Python
 __pycache__/
 *.py[cod]
-.pytest_cache/
+*.egg-info/
 .venv/
 venv/
-*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # Crawl4AI's own cache
 .crawl4ai/
 
-# Editors / OS
+# Logs
+*.log
+
+# Editors and operating systems
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
-
-# SSH private keys — never commit these
-*.pem
-*.ppk
-kyr-key*

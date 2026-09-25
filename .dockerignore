@@ -1,26 +1,25 @@
-# Keep the build context small. Without this, Docker uploads the 350 MB corpus and the whole
-# git history on every build — the corpus is mounted as a volume instead (see compose).
+# Keep the build context small: the image needs only the package and requirements.txt.
+# The corpus is mounted at run time (see docker-compose.yml), never copied in.
 .git
+.github
 .gitattributes
-data/legal_db
-data/chunks_metadata.parquet
-data/enrichment_cache.json
-
+data
+notebooks
+scripts
+tests
 .runtime
+.crawl4ai
 .venv
 venv
-__pycache__
 **/__pycache__
 *.py[cod]
 .pytest_cache
-.crawl4ai
-
-notebooks
-.github
+.ruff_cache
 *.md
 !README.md
-
 .env
+*.pem
+*.ppk
 .vscode
 .idea
 .DS_Store

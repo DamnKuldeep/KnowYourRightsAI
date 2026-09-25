@@ -1,157 +1,151 @@
-"""Derive the abstention and citation thresholds for whichever reranker is in use.
+"""Derive the abstention and citation thresholds for a ranking method.
 
-This is not optional bookkeeping. ``LOW_SCORE = 0.05`` and ``CITE_MIN_SCORE = 0.20`` were
-tuned in the build notebook against a *different* cross-encoder. Score distributions are not
-portable between rerankers — the NIM endpoint emits logits measured from −15.9 to +6.8, a
-local head emits sigmoid probabilities — so reusing those numbers silently drops good
-citations or admits bad ones.
+Scores are not portable between rerankers, or between a reranker and fused ranking, so reusing
+one method's thresholds for another silently drops good citations or admits bad ones. This runs
+the gold set (questions the corpus can answer) and the off-topic set (questions it cannot) and
+picks the cut that best separates them.
 
-Method: run the gold set (questions the corpus *can* answer) and the off-topic stress set
-(questions it cannot), then pick the cut that best separates them.
+    python scripts/calibrate.py                   # the reranker in use -> .runtime/thresholds.json
+    python scripts/calibrate.py --method fusion   # ranking without the reranker
+    python scripts/calibrate.py --method keywords # without embeddings either (BM25 only)
+    python scripts/calibrate.py --dry-run         # measure and print, change nothing
+    python scripts/calibrate.py --ship            # also update the shipped calibration
 
-    python scripts/calibrate.py            # measure and write .runtime/thresholds.json
-    python scripts/calibrate.py --dry-run  # measure and print, change nothing
+Costs about $0.05 in retrieval calls. Needs OPENROUTER_API_KEY and the corpus.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from knowyourrights import config, legal_terms                        # noqa: E402
-from knowyourrights.eval_data import GOLD, offtopic_cases             # noqa: E402
-from knowyourrights.retrieval.reranker import save_thresholds         # noqa: E402
-from knowyourrights.retrieval.search import get_engine                # noqa: E402
-from knowyourrights.runtime.console import bold, rule, setup_console  # noqa: E402
+from knowyourrights import config, legal_terms
+from knowyourrights.eval_data import GOLD, offtopic_cases
+from knowyourrights.retrieval.reranker import (
+    FUSION_BM25_METHOD, FUSION_METHOD, rerank_method, save_thresholds,
+)
+from knowyourrights.retrieval.search import get_engine
+from knowyourrights.runtime.console import bold, rule, setup_console
 
 setup_console()
 
 
-def separation_threshold(answerable: list[float], unanswerable: list[float]) -> tuple[float, float]:
-    """Pick the cut that best separates the two score populations.
-
-    Returns ``(threshold, accuracy)``. Ties break low, because wrongly abstaining costs the
-    user an answer they could have had, while wrongly answering costs them a bad citation —
-    and for a legal tool the bad citation is the worse failure, so we still prefer the lowest
-    cut that achieves the best score rather than dipping under the noise.
-    """
-    candidates = sorted({round(s, 4) for s in answerable + unanswerable})
-    if not candidates:
-        return config.LOW_SCORE, 0.0
-    best, best_acc = candidates[0], -1.0
-    for cut in candidates:
-        correct = sum(1 for s in answerable if s >= cut) + sum(1 for s in unanswerable if s < cut)
-        acc = correct / max(1, len(answerable) + len(unanswerable))
-        if acc > best_acc:
-            best, best_acc = cut, acc
-    return best, best_acc
+def separation_threshold(answerable: list[float], unanswerable: list[float]) -> float:
+    """The lowest cut that best separates the two populations: a wrong citation is the worse
+    failure for a legal tool, but abstaining needlessly costs an answer, so ties break low."""
+    best, best_accuracy = config.LOW_SCORE, -1.0
+    total = max(1, len(answerable) + len(unanswerable))
+    for cut in sorted({round(s, 4) for s in answerable + unanswerable}):
+        correct = sum(s >= cut for s in answerable) + sum(s < cut for s in unanswerable)
+        if correct / total > best_accuracy:
+            best, best_accuracy = cut, correct / total
+    return best
 
 
-async def main_async(dry_run: bool) -> int:
-    engine = get_engine()
-
-    rule("warmup")
-    status = await engine.warmup()
-    backend = status["reranker"]["backend"]
-    model = status["reranker"]["model"]
-    print(f"  reranker: {model} ({backend})")
-    print(f"  current : low={status['reranker']['low_score']} "
-          f"cite={status['reranker']['cite_min_score']} "
-          f"[{status['reranker']['thresholds_source']}]")
-    if backend == "none":
-        # Still worth calibrating. Without a reranker the ranking signal is normalised RRF
-        # fusion, which has its own distribution — and abstention matters just as much when the
-        # pipeline is smaller. The `lite` profile depends on this.
-        print("  no reranker — calibrating the fusion scores instead")
-
-    rule("measuring")
-    answerable: list[float] = []
-    correct_hit_scores: list[float] = []
+async def measure(engine) -> tuple[list[float], list[float], list[float]]:
+    """(best score per answerable question, scores of correct hits, best per off-topic one)."""
+    answerable, correct = [], []
     for case in GOLD:
-        expanded = legal_terms.expand(case.query)
-        variants = [case.query] if expanded == case.query else [case.query, expanded]
-        result = await engine.search(variants, rerank_with=case.query)
+        result = await engine.search([case.query, legal_terms.expand(case.query)],
+                                     rerank_with=case.query)
         if result.hits:
             answerable.append(result.hits[0].score)
-            for hit in result.hits:
-                if case.matches(hit.citation):
-                    correct_hit_scores.append(hit.score)
-    print(f"  {len(answerable)} answerable queries  "
-          f"top-score min {min(answerable):.4f} / median "
-          f"{sorted(answerable)[len(answerable) // 2]:.4f} / max {max(answerable):.4f}")
-
-    offtopic = list(offtopic_cases())
-    unanswerable: list[float] = []
-    for case in offtopic:
+            correct += [h.score for h in result.hits if case.matches(h.citation)]
+    unanswerable = []
+    for case in offtopic_cases():
         result = await engine.search([legal_terms.expand(case.query)], rerank_with=case.query)
         if result.hits:
             unanswerable.append(result.hits[0].score)
-    if unanswerable:
-        print(f"  {len(unanswerable)} off-topic queries   "
-              f"top-score max {max(unanswerable):.4f}")
-    else:
-        print("  no off-topic scores captured; falling back to a percentile of the gold set")
+    return answerable, correct, unanswerable
 
-    rule("chosen thresholds")
-    # Use a low percentile rather than the minimum. A gold query whose *best* hit scores 0.03
-    # is one where retrieval genuinely failed — abstaining there and searching the web is the
-    # correct outcome, not a threshold bug. Letting that outlier set the cut would drag it
-    # under the off-topic noise floor and disable abstention altogether.
-    ordered_gold = sorted(answerable)
-    floor_index = max(0, int(len(ordered_gold) * 0.10) - 1)
-    gold_floor = ordered_gold[floor_index]
+
+def choose(answerable: list[float], correct: list[float],
+           unanswerable: list[float]) -> tuple[float, float]:
+    """``(low, cite)``: the abstention cut and the more generous citation floor."""
+    # A low percentile, not the minimum: a gold question whose best hit scores near zero is one
+    # where retrieval genuinely failed, and letting it set the cut would disable abstention.
+    ordered = sorted(answerable)
+    floor = ordered[max(0, int(len(ordered) * 0.10) - 1)]
     ceiling = max(unanswerable) if unanswerable else 0.0
-    print(f"  answerable floor (10th pct): {gold_floor:.4f}   off-topic ceiling: {ceiling:.4f}")
-
-    if ceiling < gold_floor:
-        # Sit in the gap, nearer the off-topic side so a weak but genuine answer survives.
-        low = round(ceiling + (gold_floor - ceiling) * 0.35, 4)
-        print(f"  cleanly separated — placing the cut inside the gap")
+    if ceiling < floor:
+        low = round(ceiling + (floor - ceiling) * 0.35, 4)     # inside the gap, nearer off-topic
     else:
-        low, accuracy = separation_threshold(answerable, unanswerable)
-        print(f"  populations overlap; best separating cut is {accuracy:.0%} accurate")
+        low = separation_threshold(answerable, unanswerable)
+    # The citation floor only pre-filters for the grader, so it is generous: clamping it up to
+    # the abstention cut once hid the correct provision for "what is anticipatory bail".
+    correct = sorted(correct)
+    percentile = correct[max(0, int(len(correct) * 0.05) - 1)] if correct else low * 0.4
+    return low, round(max(0.02, min(percentile, low * 0.6)), 4)
 
-    # The two thresholds answer different questions and must not be tied together.
-    #   LOW_SCORE  — is the *best* hit good enough to answer at all, or should we abstain?
-    #   CITE_MIN_SCORE — may this individual hit be shown to the grader?
-    # The grader is the real gate, so the pre-filter should be generous. Clamping it up to the
-    # abstention floor made "what is anticipatory bail" return nothing at all, even though the
-    # correct provision (BNSS §483) was retrieved — its score simply sat below the floor.
-    ordered = sorted(correct_hit_scores)
-    percentile = ordered[max(0, int(len(ordered) * 0.05) - 1)] if ordered else low * 0.4
-    cite = round(max(0.02, min(percentile, low * 0.6)), 4)
 
-    print(f"  {bold('LOW_SCORE')}      = {low:.4f}   (below this: abstain and search the web)")
-    print(f"  {bold('CITE_MIN_SCORE')} = {cite:.4f}   (below this: never reaches the grader)")
-    would_abstain = sum(1 for s in answerable if s < low)
-    print(f"\n  sanity: {would_abstain}/{len(answerable)} gold queries would now abstain "
-          f"(want 0), {sum(1 for s in unanswerable if s >= low)}/{len(unanswerable)} "
-          f"off-topic queries would answer (want 0)")
-    kept = sum(1 for s in correct_hit_scores if s >= cite)
-    print(f"          {kept}/{len(correct_hit_scores)} correct hits survive the citation floor")
+def report(low: float, cite: float, answerable, correct, unanswerable) -> None:
+    print(f"  {bold('low')}  = {low:.4f}   below this the best hit is too weak: abstain")
+    print(f"  {bold('cite')} = {cite:.4f}   below this a hit never reaches the grader")
+    print(f"  gold questions that would abstain: {sum(s < low for s in answerable)}/"
+          f"{len(answerable)} (want 0); off-topic that would answer: "
+          f"{sum(s >= low for s in unanswerable)}/{len(unanswerable)} (want 0); correct hits "
+          f"kept: {sum(s >= cite for s in correct)}/{len(correct)}")
 
-    if dry_run:
+
+def ship(method: str, low: float, cite: float, extra: dict) -> None:
+    path = config.PACKAGED_THRESHOLDS
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data[method] = {"low": round(low, 4), "cite": round(cite, 4), **extra}
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    print(f"  shipped calibration updated: {path}")
+
+
+def select_method(engine, name: str) -> str:
+    """Put the engine into the ranking mode being calibrated, and return that mode's key.
+
+    ``fusion`` is ranking with the reranker down; ``keywords`` is with embeddings down too.
+    Each is what readers get during that outage, so each needs its own abstention cut.
+    """
+    async def unavailable(*_args, **_kwargs):
+        return None
+
+    if name == "rerank":
+        return rerank_method()
+    engine.reranker.score = unavailable
+    if name == "keywords":
+        engine.embedder.encode = unavailable
+        return FUSION_BM25_METHOD
+    return FUSION_METHOD
+
+
+async def main_async(args) -> int:
+    engine = get_engine()
+    await engine.warmup()
+    method = select_method(engine, args.method)
+    rule(f"measuring {method}")
+    answerable, correct, unanswerable = await measure(engine)
+    low, cite = choose(answerable, correct, unanswerable)
+    report(low, cite, answerable, correct, unanswerable)
+    if args.dry_run:
         print("\n  --dry-run: nothing written")
         return 0
-
-    save_thresholds(backend, model, low, cite, extra={
-        "gold_n": len(answerable), "offtopic_n": len(unanswerable),
-        "gold_min_top": round(min(answerable), 4),
-        "offtopic_max_top": round(max(unanswerable), 4) if unanswerable else None,
-    })
+    extra = {"calibrated_at": time.strftime("%Y-%m-%d"), "gold_n": len(answerable),
+             "offtopic_n": len(unanswerable)}
+    save_thresholds(method, low, cite, extra)
     print(f"\n  written to {config.THRESHOLDS_FILE}")
+    if args.ship:
+        ship(method, low, cite, extra)
     return 0
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--method", choices=["rerank", "fusion", "keywords"], default="rerank")
     ap.add_argument("--dry-run", action="store_true", help="measure without writing")
-    args = ap.parse_args()
-    return asyncio.run(main_async(args.dry_run))
+    ap.add_argument("--ship", action="store_true",
+                    help="also write knowyourrights/thresholds.json (commit it)")
+    return asyncio.run(main_async(ap.parse_args()))
 
 
 if __name__ == "__main__":

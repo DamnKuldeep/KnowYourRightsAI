@@ -7,6 +7,13 @@ NIM + OpenAI Agents SDK with web tools) reads the retrieved sections and writes 
 reply. This document is the complete handoff: what the database contains, how it was built, the
 exact contracts for querying it, and the rules the answer layer must follow.
 
+> **Status in this repository.** The answer layer described as "planned" here is the
+> `knowyourrights` package. Only `legal_db/` ships with the repo (via Git LFS); the other two
+> build artefacts below are produced by `notebooks/01-building-database.ipynb` and are not needed
+> to run the app. Since the build, the corpus has been repaired: the RTI Act was rebuilt from its
+> official text and one foreign Act was removed (`data/repair/removed.json`,
+> `scripts/repair_act.py`). Row counts below describe the original build.
+
 ---
 
 ## 1. The bundle

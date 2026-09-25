@@ -1,61 +1,47 @@
-# KnowYourRightsAI — CPU image, works on x86_64 and ARM64 (Graviton).
+# KnowYourRights — one container, no GPU, no model weights: every model runs behind an API.
 #
-# Deliberately does NOT bake in the corpus or the model weights:
+# The ~400 MB corpus is not baked in. It is already on the host after `git lfs pull`, so it is
+# mounted read-only (see docker-compose.yml) and a code change never re-copies it.
 #
-#   * the corpus is ~350 MB and already on the host after `git clone` — mount it read-only
-#   * bge-m3 is ~2.3 GB and belongs in a named volume, so it survives image rebuilds and is
-#     downloaded once rather than on every `docker build`
-#
-# Measured result: **3.34 GB**. Baking both in would put it near 6 GB. Most of what remains is
-# unavoidable — torch, transformers and sentence-transformers are large even in CPU form.
-#
-# Windows note: `docker run -v /d/path:/data:ro` from Git Bash silently mangles the mount into
-# `C:\Program Files\Git\data`. Use `docker compose` (which does no path translation) or prefix
-# the command with MSYS_NO_PATHCONV=1.
+# Chromium is installed for the pages that only render with JavaScript. Build with
+# --build-arg INSTALL_BROWSER=false for a smaller image that reads static pages only, and set
+# KYR_CRAWL_USE_BROWSER=false to match.
 
-FROM python:3.11-slim AS base
+FROM python:3.12-slim
+
+ARG INSTALL_BROWSER=true
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    HF_HOME=/models \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     KYR_HOST=0.0.0.0 \
     KYR_PORT=8000 \
     KYR_DATA_DIR=/data \
     KYR_RUNTIME_DIR=/runtime
 
-# curl for the healthcheck; libgomp1 is required by torch's CPU kernels on slim images.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
 
-# ── dependencies ──────────────────────────────────────────────────────────────────────
-# CPU-only torch first: the default wheel drags in ~2.5 GB of CUDA runtime that is useless
-# in a CPU container. Its own layer so code changes don't reinstall it.
-RUN pip install --index-url https://download.pytorch.org/whl/cpu torch
-
+# Dependencies first, in their own layer, so a code change does not reinstall them.
 COPY requirements.txt .
-# torch is already installed above; strip it so pip doesn't pull the CUDA wheel over the top.
-RUN grep -v '^torch' requirements.txt > /tmp/req.txt && pip install -r /tmp/req.txt
+RUN pip install -r requirements.txt \
+    && if [ "$INSTALL_BROWSER" = "true" ]; then \
+         python -m playwright install --with-deps chromium; \
+       fi \
+    && rm -rf /var/lib/apt/lists/*
 
-# ── application ───────────────────────────────────────────────────────────────────────
 COPY knowyourrights/ ./knowyourrights/
-COPY scripts/ ./scripts/
 
-# Run as a non-root user; the mounted volumes need to be writable by it.
+# Run as an unprivileged user; the runtime volume must be writable by it.
 RUN useradd --create-home --uid 10001 kyr \
-    && mkdir -p /models /runtime /data \
-    && chown -R kyr:kyr /app /models /runtime
+    && mkdir -p /runtime /data \
+    && chown -R kyr:kyr /app /runtime
 USER kyr
 
 EXPOSE 8000
 
-# Generous start period: on a cold CPU box the models take up to ~140 s to load, and the
-# server deliberately reports ready:false until they are warm.
-HEALTHCHECK --interval=30s --timeout=10s --start-period=240s --retries=5 \
-  CMD curl -fsS "http://localhost:${KYR_PORT}/api/health" || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD python -c "import urllib.request,sys; sys.exit(urllib.request.urlopen('http://localhost:8000/api/health', timeout=4).status != 200)"
 
 CMD ["python", "-m", "knowyourrights.server"]

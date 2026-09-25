@@ -1,40 +1,26 @@
-"""Cross-encoder reranking, local first, NIM as relief.
+"""Cross-encoder reranking over OpenRouter, and the thresholds that go with it.
 
-Unlike the embedder, the reranker is genuinely swappable — it reads text and never touches the
-corpus vectors — so it can move between backends freely. What is *not* portable is the score:
-
-* the local cross-encoder emits one logit that we squash with sigmoid into [0, 1];
-* NIM emits raw logits on a much wider scale (probe measured −15.9 … +6.8).
-
-Both are mapped through sigmoid here so callers see a single [0, 1] convention, but the two
-distributions are still shaped differently. That is why ``scripts/calibrate.py`` derives
-thresholds per backend and writes them to ``.runtime/thresholds.json`` — reusing the notebook's
-``LOW_SCORE=0.05`` across a different reranker would silently admit or drop citations.
+A reranker's scores live on its own scale, so the abstention and citation cut-offs are
+calibrated per ranking method (``scripts/calibrate.py``) and stored in
+``.runtime/thresholds.json`` under a key naming exactly what produced the scores. When the API is
+unavailable, :meth:`Reranker.score` returns None and records why; search then ranks on fused
+keyword/semantic scores under that method's own calibrated threshold.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-import math
 import time
 
 from .. import config
-from ..runtime import gpu, resources
+from ..llm import retrieval_api
 
 log = logging.getLogger(__name__)
 
 
-def sigmoid(x: float) -> float:
-    if x >= 0:
-        return 1.0 / (1.0 + math.exp(-min(x, 60.0)))
-    e = math.exp(max(x, -60.0))
-    return e / (1.0 + e)
-
-
 class Thresholds:
-    """Abstention and citation cut-offs for whichever reranker is actually in use."""
+    """Abstention and citation cut-offs for one ranking method."""
 
     def __init__(self, low: float, cite: float, source: str = "config") -> None:
         self.low = low
@@ -45,300 +31,100 @@ class Thresholds:
         return f"Thresholds(low={self.low:.3f}, cite={self.cite:.3f}, from={self.source!r})"
 
 
-def load_thresholds(backend: str, model: str | None) -> Thresholds:
-    """Calibrated values if we have them for this exact backend+model, else config defaults."""
-    key = f"{backend}:{model or '-'}"
-    try:
-        data = json.loads(config.THRESHOLDS_FILE.read_text(encoding="utf-8"))
-        entry = data.get(key)
-        if entry:
-            return Thresholds(float(entry["low"]), float(entry["cite"]),
-                              f"calibrated {entry.get('calibrated_at', '')}".strip())
-    except (OSError, ValueError, KeyError, TypeError):
-        pass
+def load_thresholds(method: str) -> Thresholds:
+    """Calibrated values for this ranking method, or the configured defaults.
+
+    A local calibration (``.runtime/thresholds.json``) wins over the one shipped with the
+    package. The shipped file matters: ``.runtime`` is never committed, and without it every
+    fresh deployment ran on uncalibrated defaults that silently dropped valid citations.
+    """
+    for path, origin in ((config.THRESHOLDS_FILE, "calibrated"),
+                         (config.PACKAGED_THRESHOLDS, "shipped calibration")):
+        try:
+            entry = json.loads(path.read_text(encoding="utf-8")).get(method)
+            if entry:
+                return Thresholds(float(entry["low"]), float(entry["cite"]),
+                                  f"{origin} {entry.get('calibrated_at', '')}".strip())
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
     return Thresholds(config.LOW_SCORE, config.CITE_MIN_SCORE, "config default (uncalibrated)")
 
 
-def save_thresholds(backend: str, model: str | None, low: float, cite: float,
-                    extra: dict | None = None) -> None:
+def save_thresholds(method: str, low: float, cite: float, extra: dict | None = None) -> None:
     config.ensure_runtime_dirs()
-    key = f"{backend}:{model or '-'}"
     try:
         data = json.loads(config.THRESHOLDS_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         data = {}
-    data[key] = {"low": round(low, 4), "cite": round(cite, 4),
-                 "calibrated_at": time.strftime("%Y-%m-%d"), **(extra or {})}
+    data[method] = {"low": round(low, 4), "cite": round(cite, 4),
+                    "calibrated_at": time.strftime("%Y-%m-%d"), **(extra or {})}
     config.THRESHOLDS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
-class Reranker:
-    """Local cross-encoder with automatic degradation to NIM, then to nothing."""
+def rerank_method() -> str:
+    """The threshold key for cross-encoder scores.
 
-    def __init__(self, plan: resources.ResourcePlan | None = None) -> None:
-        self._plan = plan
-        self._tokenizer = None
-        self._model = None
-        self._max_len: int | None = None
-        self._load_lock = asyncio.Lock()
-        self._local_failed: str | None = None
-        self._nim_failed: str | None = None
-        self._warm = False
+    What the model is shown moves its scores, so the document format is part of the key: adding
+    each section's citizen questions changed the score distribution enough to need its own cut.
+    """
+    return "api:" + config.RERANK_API_MODEL + ("+q" if config.RERANK_WITH_QUESTIONS else "")
+
+
+# Fused scores are not probabilities, so they get their own calibration. Which retrievers feed
+# the fusion changes the distribution: with no embeddings only BM25 lists are fused.
+FUSION_METHOD = "fusion"
+FUSION_BM25_METHOD = "fusion-bm25"
+
+
+class Reranker:
+    def __init__(self) -> None:
         self.calls = 0
         self.docs_scored = 0
-        self._budget_warned = False
+        self.failures = 0
+        self.last_error: str | None = None
 
     @property
-    def plan(self) -> resources.ResourcePlan:
-        if self._plan is None:
-            self._plan = resources.get_plan()
-        return self._plan
+    def available(self) -> bool:
+        return retrieval_api.available()
 
     @property
-    def backend(self) -> str:
-        """What we will actually use on the next call."""
-        want = self.plan.rerank_backend
-        if want == "api":
-            return "api" if config.OPENROUTER_API_KEY else "none"
-        if want == "local" and self._local_failed is None:
-            return "local"
-        if want in ("local", "nim") and self._nim_failed is None and config.NVIDIA_API_KEY:
-            return "nim"
-        return "none"
+    def unavailable_reason(self) -> str | None:
+        if not self.available:
+            return "no OPENROUTER_API_KEY is configured"
+        return self.last_error
 
-    @property
-    def model_name(self) -> str | None:
-        if self.backend == "none":
-            # The fusion scores are the ranking signal, so they get their own calibration — but
-            # *which* retrievers feed the fusion changes the distribution. `lite` fuses BM25
-            # lists alone; `cpu_lean` fuses dense and BM25. Sharing one key across both means
-            # calibrating either one silently mis-thresholds the other, so they are kept apart.
-            return "rrf" if self.plan.use_embedder else "rrf-bm25"
-        if self.backend == "api":
-            # Named so calibration cannot be shared with the local cross-encoder: this is a
-            # different model on a different score scale, and reusing a threshold across them
-            # breaks abstention silently. What the model is *shown* moves its scores too:
-            # adding each section's citizen questions took the stress set from 11/11 to 10/11
-            # under the old threshold, so the document format is part of the key.
-            return config.RERANK_API_MODEL + ("+q" if config.RERANK_WITH_QUESTIONS else "")
-        if self.backend == "local":
-            # Quantisation and a shorter input both move the score distribution without changing
-            # the model's name, so a threshold calibrated for one is wrong for the other — and
-            # wrong in the direction that matters: measured, int8 under float32's threshold let
-            # off-topic questions through 6 times out of 11 instead of 1. Encode both in the key
-            # so a calibration can never be silently reused across them.
-            name = self.plan.rerank_model
-            if self.plan.rerank_device == "cpu" and config.RERANK_QUANTIZE_CPU:
-                name += "+int8"
-            if config.RERANK_MAX_LEN > 0:
-                name += f"@{config.RERANK_MAX_LEN}"
-            if config.RERANK_WITH_QUESTIONS:
-                name += "+q"
-            return name
-        if self.backend == "nim":
-            from ..llm import registry
-
-            return registry.resolve("rerank")
-        return None
-
-    @property
-    def thresholds(self) -> Thresholds:
-        return load_thresholds(self.backend, self.model_name)
-
-    # ── local model ──────────────────────────────────────────────────────────────────
-    @staticmethod
-    def _position_limit(model) -> int:
-        """Cap at the *reranker's* own context, not the embedder's.
-
-        RoBERTa-family models reserve two position slots, and exceeding the limit throws a
-        CUDA index error rather than a clean Python one — so this must be right.
-        """
-        cfg = model.config
-        limit = int(getattr(cfg, "max_position_embeddings", 512) or 512)
-        if getattr(cfg, "model_type", "") in ("xlm-roberta", "roberta", "camembert"):
-            limit -= 2
-        limit = min(limit, config.EMBED_MAX_SEQ)
-        # An explicit cap is the CPU escape hatch: cost is ~linear in tokens, and relevance is
-        # usually decidable from the opening of a section rather than all 510 tokens of it.
-        if config.RERANK_MAX_LEN > 0:
-            limit = min(limit, config.RERANK_MAX_LEN)
-        return max(8, limit)
-
-    def _load_sync(self):
-        import torch
-        from transformers import AutoModelForSequenceClassification, AutoTokenizer
-
-        plan = self.plan
-        name = plan.rerank_model
-        started = time.time()
-        tokenizer = AutoTokenizer.from_pretrained(name, trust_remote_code=True)
-        try:
-            model = AutoModelForSequenceClassification.from_pretrained(
-                name, trust_remote_code=True, dtype=getattr(torch, plan.rerank_dtype))
-        except TypeError:
-            model = AutoModelForSequenceClassification.from_pretrained(
-                name, trust_remote_code=True, torch_dtype=getattr(torch, plan.rerank_dtype))
-        model = model.to(plan.rerank_device).eval()
-
-        # Dynamic int8 on CPU. The cross-encoder is ~99% of CPU retrieval time, and quantising
-        # its Linear layers is the one change that moves that number without removing the model
-        # — which matters because the model is what makes the system able to refuse a question
-        # it cannot answer. Failure here is not fatal: an unquantised reranker is merely slower.
-        quantised = False
-        if plan.rerank_device == "cpu" and config.RERANK_QUANTIZE_CPU:
-            try:
-                model = torch.ao.quantization.quantize_dynamic(
-                    model, {torch.nn.Linear}, dtype=torch.qint8)
-                quantised = True
-            except Exception as exc:                      # noqa: BLE001 — optimisation only
-                log.info("int8 quantisation unavailable (%s) — running float", exc)
-
-        log.info("reranker loaded: %s on %s/%s%s in %.1fs", name, plan.rerank_device,
-                 "int8" if quantised else plan.rerank_dtype,
-                 f" max_len={config.RERANK_MAX_LEN}" if config.RERANK_MAX_LEN else "",
-                 time.time() - started)
-        return tokenizer, model
-
-    async def _ensure_local(self) -> bool:
-        if self._model is not None:
-            return True
-        if self._local_failed is not None or not self.plan.rerank_model:
-            return False
-        async with self._load_lock:
-            if self._model is not None:
-                return True
-            if self._local_failed is not None:
-                return False
-            try:
-                self._tokenizer, self._model = await gpu.get_executor().run(self._load_sync)
-                self._max_len = self._position_limit(self._model)
-                gpu.get_executor().register_evict_hook(self._unload_sync)
-                return True
-            except Exception as exc:
-                self._local_failed = f"{type(exc).__name__}: {exc}"
-                log.warning("local reranker unavailable (%s) — falling back to %s",
-                            self._local_failed, "NIM" if config.NVIDIA_API_KEY else "RRF scores")
-                gpu.empty_cache()
-                return False
-
-    def _unload_sync(self) -> None:
-        if self._model is not None:
-            log.info("evicting reranker from %s", self.plan.rerank_device)
-            self._tokenizer = self._model = None
-            self._warm = False
-
-    def _score_sync(self, pairs):
-        import torch
-
-        encoded = self._tokenizer(list(pairs), padding=True, truncation=True,
-                                  max_length=self._max_len, return_tensors="pt")
-        # XLM-R / RoBERTa rerankers have no segment ids; passing them is an error.
-        encoded.pop("token_type_ids", None)
-        encoded = {k: v.to(self.plan.rerank_device) for k, v in encoded.items()}
-        with torch.inference_mode():
-            logits = self._model(**encoded).logits
-        if logits.ndim == 2 and logits.shape[1] > 1:
-            # Two-class head: the positive class is the relevance score.
-            return torch.softmax(logits.float(), dim=1)[:, -1].cpu().tolist()
-        return torch.sigmoid(logits.float().view(-1)).cpu().tolist()
-
-    # ── public API ───────────────────────────────────────────────────────────────────
     async def score(self, query: str, documents, *, deadline: float | None = None,
-                    on_pause=None, session: str = "") -> list[float] | None:
-        """Relevance in [0, 1] per document, or None if no reranker is available.
-
-        None is a meaningful answer: the caller falls back to fused RRF ranking with its own
-        threshold rather than pretending it has cross-encoder quality.
-        """
+                    on_pause=None) -> list[float] | None:
+        """Relevance in [0, 1] per document, in order, or None if the reranker is unavailable."""
         docs = [str(d or "") for d in documents]
         if not docs:
             return []
-
-        if self.plan.rerank_backend == "none":
-            # The profile says rank on fusion scores alone. Reaching for a remote reranker here
-            # would spend API calls the operator explicitly opted out of.
+        if not self.available:
             return None
-
-        if self.plan.rerank_backend == "api":
-            # The whole reason this backend exists: the same 8 documents cost 6,625 ms on one
-            # physical CPU core and ~830 ms here. Falling back to fused RRF on failure is
-            # deliberate — it is a real, calibrated ranking mode, so a dead endpoint costs
-            # ranking quality rather than the answer.
-            from ..llm import retrieval_api
-
-            if retrieval_api.session().cost_usd >= config.RETRIEVAL_API_BUDGET_USD > 0:
-                if not self._budget_warned:
-                    self._budget_warned = True
-                    log.warning("retrieval API budget of $%.2f is spent — ranking on fused RRF "
-                                "scores from here. Raise KYR_RETRIEVAL_API_BUDGET_USD to continue.",
-                                config.RETRIEVAL_API_BUDGET_USD)
-                return None
-            try:
-                scores = await retrieval_api.rerank(
-                    query, docs, on_pause=on_pause, deadline=deadline)
-                self.calls += 1
-                self.docs_scored += len(docs)
-                return scores
-            except retrieval_api.RetrievalApiError as exc:
-                log.warning("reranking API unavailable (%s) — ranking on fused RRF scores", exc)
-                return None
-
-        if self.plan.rerank_backend == "local" and await self._ensure_local():
-            pairs = [[query, d] for d in docs]
-            try:
-                scores = await gpu.get_executor().map_batches(
-                    self._score_sync, pairs, self.plan.rerank_batch, label="rerank")
-                self.calls += 1
-                self.docs_scored += len(docs)
-                return [float(s) for s in scores]
-            except gpu.GpuOutOfMemory as exc:
-                log.warning("reranker out of memory (%s) — trying NIM", exc)
-            except Exception as exc:
-                log.warning("local reranking failed (%s) — trying NIM", exc)
-
-        if self._nim_failed is None and config.NVIDIA_API_KEY:
-            try:
-                from ..llm.client import get_client
-
-                logits = await get_client().rerank(query, docs, deadline=deadline,
-                                                   on_pause=on_pause, session=session)
-                self.calls += 1
-                self.docs_scored += len(docs)
-                # Map NIM's wide logits onto the same [0,1] convention as the local head.
-                return [sigmoid(x) if x != float("-inf") else 0.0 for x in logits]
-            except Exception as exc:
-                self._nim_failed = f"{type(exc).__name__}: {exc}"
-                log.warning("NIM reranking unavailable (%s) — ranking will use RRF scores",
-                            self._nim_failed)
-
-        return None
-
-    async def warmup(self) -> bool:
-        if self.plan.rerank_backend != "local":
-            return True
-        if not await self._ensure_local():
-            return False
-        if self._warm:
-            return True
-        started = time.time()
-        await self.score("warmup query", ["a short document about warming up"])
-        self._warm = True
-        log.info("reranker warm in %.2fs", time.time() - started)
-        return True
+        try:
+            scores = await retrieval_api.rerank(query, docs, on_pause=on_pause, deadline=deadline)
+        except retrieval_api.RetrievalApiError as exc:
+            self.failures += 1
+            self.last_error = str(exc)[:200]
+            log.warning("reranking API unavailable (%s) — ranking on fused scores", self.last_error)
+            return None
+        self.calls += 1
+        self.docs_scored += len(docs)
+        self.last_error = None
+        return scores
 
     def status(self) -> dict:
-        thresholds = self.thresholds
+        thresholds = load_thresholds(rerank_method())
         return {
-            "backend": self.backend,
-            "model": self.model_name,
-            "device": self.plan.rerank_device if self.backend == "local" else "remote",
+            "model": config.RERANK_API_MODEL,
+            "available": self.available,
             "calls": self.calls,
             "docs_scored": self.docs_scored,
+            "failures": self.failures,
+            "last_error": self.last_error,
             "low_score": thresholds.low,
             "cite_min_score": thresholds.cite,
             "thresholds_source": thresholds.source,
-            "local_error": self._local_failed,
-            "nim_error": self._nim_failed,
         }
 
 

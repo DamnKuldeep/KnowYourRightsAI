@@ -15,6 +15,7 @@ const sourcesPane = $('#sources');
 const input = $('#input');
 const sendBtn = $('#send');
 const statEl = $('#stat');
+const quotaEl = $('#quota');
 
 const state = {
   sessionId: localStorage.getItem('kyr.session') || '',
@@ -27,6 +28,7 @@ const state = {
   answerText: '',
   timelineSteps: new Map(),
   lastQuestion: '',
+  locked: false,        // a usage limit was reached; no more questions from this page
 };
 
 /* ── escaping and a very small markdown subset ─────────────────────────────────── */
@@ -34,6 +36,11 @@ function esc(text) {
   return String(text ?? '')
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// Escaping stops markup, not a "javascript:" link. Only web addresses become links.
+function safeUrl(url) {
+  return /^https?:\/\//i.test(String(url || '')) ? esc(url) : '';
 }
 
 // Everything is escaped before any markup is added, so answer text can never inject HTML.
@@ -198,12 +205,13 @@ function addProcedure(data) {
   ].filter(([, v]) => v && String(v).trim())
    .map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('');
 
-  if (!facts && !data.portal_url) return;       // nothing worth a card of its own
+  const portal = safeUrl(data.portal_url);
+  if (!facts && !portal) return;                // nothing worth a card of its own
   const node = el('div', 'procedure');
   node.innerHTML = `<h3>At a glance</h3>`
     + (facts ? `<dl class="facts">${facts}</dl>` : '')
-    + (data.portal_url
-        ? `<p style="margin:10px 0 0"><a href="${esc(data.portal_url)}" target="_blank" rel="noopener noreferrer">Open the official portal →</a></p>`
+    + (portal
+        ? `<p class="portal"><a href="${portal}" target="_blank" rel="noopener noreferrer">Open the official portal →</a></p>`
         : '');
   turn.notices.appendChild(node);
   scrollDown();
@@ -249,8 +257,8 @@ function renderSources() {
     if (s.effective_date) badges.push(`<span class="badge">from ${esc(s.effective_date)}</span>`);
     if (s.category) badges.push(`<span class="badge">${esc(s.category)}</span>`);
 
-    const title = s.url
-      ? `<a href="${esc(s.url)}" target="_blank" rel="noopener noreferrer">${esc(s.title)}</a>`
+    const title = safeUrl(s.url)
+      ? `<a href="${safeUrl(s.url)}" target="_blank" rel="noopener noreferrer">${esc(s.title)}</a>`
       : esc(s.title);
 
     const mismatched = (s.jurisdiction === 'STATE' || s.jurisdiction === 'TERRITORY') &&
@@ -282,7 +290,7 @@ function flashSource(id) {
 
 /* ── the stream ────────────────────────────────────────────────────────────────── */
 async function ask(question) {
-  if (state.busy || !question.trim()) return;
+  if (state.busy || state.locked || !question.trim()) return;
   state.busy = true;
   state.lastQuestion = question;
   sendBtn.classList.add('stop');
@@ -306,7 +314,7 @@ async function ask(question) {
     return;
   }
   if (!response.ok || !response.body) {
-    finishTurn(`Server returned ${response.status}`);
+    finishTurn(await describeRefusal(response));
     return;
   }
 
@@ -333,8 +341,74 @@ async function ask(question) {
   finishTurn();
 }
 
+// A refused request carries {error: {kind, message}}. Usage limits get the popup; anything
+// else is shown as a notice under the question.
+async function describeRefusal(response) {
+  let error = null;
+  try { error = (await response.json()).error; } catch { /* not JSON */ }
+  if (!error) return `The server returned ${response.status}. Please try again.`;
+  if (error.kind === 'client_budget' || error.kind === 'daily_budget') {
+    showLimit(error.kind, error.message);
+  }
+  return error.message;
+}
+
+function showQueue(position) {
+  if (!turn) return;
+  let banner = turn.notices.querySelector('.queue-banner');
+  if (position <= 0) { banner?.remove(); return; }
+  if (!banner) {
+    banner = el('div', 'notice pause queue-banner');
+    turn.notices.prepend(banner);
+  }
+  banner.innerHTML = `<span aria-hidden="true">⏳</span><span class="text">The service is busy `
+    + `right now — you are <b>number ${position}</b> in line. Your question will start `
+    + `automatically.</span>`;
+}
+
+function showLimit(kind, message) {
+  const modal = $('#limit');
+  $('#limitTitle').textContent = kind === 'daily_budget'
+    ? "Today's limit has been reached" : 'Free usage limit reached';
+  $('#limitText').textContent = message;
+  modal.hidden = false;
+  $('#limitClose').focus();
+  // The allowance is spent for good (or until tomorrow); stop inviting more questions.
+  state.locked = true;
+  input.disabled = true;
+  input.placeholder = 'The free usage limit has been reached';
+}
+
+// Shown in the footer until the server has finished starting; checked a few times, then left.
+async function checkHealth(triesLeft) {
+  try {
+    const h = await (await fetch('/api/health')).json();
+    if (h.status === 'unavailable') { statEl.textContent = 'service unavailable — try again later'; return; }
+    if (h.ready) { if (statEl.textContent === 'starting up…') statEl.textContent = ''; return; }
+    statEl.textContent = 'starting up…';
+  } catch { return; }
+  if (triesLeft > 0) setTimeout(() => checkHealth(triesLeft - 1), 3000);
+}
+
+async function refreshQuota() {
+  try {
+    const q = await (await fetch('/api/quota')).json();
+    if (q.budget_usd) {
+      quotaEl.textContent = `$${q.remaining_usd.toFixed(2)} of $${q.budget_usd.toFixed(2)} `
+                          + 'free allowance left';
+    }
+    if (q.exhausted && !state.locked) {
+      showLimit('client_budget', 'You have used this free service\'s allowance for your '
+                + 'connection, so it cannot answer more questions for you.');
+    }
+  } catch { /* the footer is a courtesy; never fail over it */ }
+}
+
 function handleEvent(ev) {
   switch (ev.type) {
+    case 'queue': showQueue(ev.position); break;
+    case 'limit': showLimit(ev.kind, ev.message); break;
+
     case 'session':
       state.sessionId = ev.session_id;
       localStorage.setItem('kyr.session', ev.session_id);
@@ -437,6 +511,7 @@ function finishTurn(errorText) {
     turn.notices.querySelectorAll('.notice[data-timer]').forEach((n) => {
       clearInterval(Number(n.dataset.timer)); n.remove();
     });
+    turn.notices.querySelector('.queue-banner')?.remove();
     if (errorText) addNotice({ level: 'warn', text: errorText });
     if (state.answerEl) {
       // A rewrite that failed or was stopped never sends answer_revised; never leave the draft
@@ -453,7 +528,8 @@ function finishTurn(errorText) {
     if (!state.sources.size) renderSources();
   }
   turn = null;
-  input.focus();
+  refreshQuota();
+  if (!state.locked) input.focus();
 }
 
 function buildVerdict(text) {
@@ -518,7 +594,9 @@ document.addEventListener('click', (e) => {
   const chip = e.target.closest('.cite');
   if (chip) { flashSource(chip.dataset.cite); return; }
   const example = e.target.closest('.example');
-  if (example && !state.busy) { input.value = example.textContent.trim(); send(); }
+  if (example && !state.busy && !state.locked) {
+    input.value = example.textContent.trim(); send();
+  }
 });
 
 document.querySelectorAll('.segmented button').forEach((button) => {
@@ -560,21 +638,22 @@ $('#reset').onclick = async () => {
     document.documentElement.dataset.theme = 'dark';
   }
 
-  fetch('/api/health').then((r) => r.json()).then((h) => {
+  fetch('/api/config').then((r) => r.json()).then((c) => {
     const select = $('#state');
-    for (const name of h.states || []) {
+    for (const name of c.states || []) {
       const option = el('option');
       option.value = name; option.textContent = name;
       select.appendChild(option);
     }
-    if (state.userState) select.value = state.userState;
-    if (h.disclaimer) $('#disclaimer').textContent = h.disclaimer;
-    if (!h.ready) {
-      statEl.textContent = 'loading models…';
-      setTimeout(() => fetch('/api/health').then((r) => r.json())
-        .then((h2) => { if (h2.ready) statEl.textContent = ''; }), 8000);
-    }
+    // A saved choice that is no longer a valid state falls back to All India.
+    select.value = (c.states || []).includes(state.userState) ? state.userState : '';
+    state.userState = select.value;
+    if (c.disclaimer) $('#disclaimer').textContent = c.disclaimer;
   }).catch(() => {});
+  checkHealth(10);
+  refreshQuota();
+
+  $('#limitClose').addEventListener('click', () => { $('#limit').hidden = true; });
 
   // ── pipeline explainer ───────────────────────────────────────────────────────────────
   // Opened from the "?" beside the depth buttons. Closes on the X, on the backdrop, and on

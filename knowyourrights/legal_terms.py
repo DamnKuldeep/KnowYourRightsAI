@@ -22,6 +22,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+_POSH_ACT = ("Sexual Harassment of Women at Workplace (Prevention, Prohibition and Redressal) "
+             "Act, 2013")
+
 # ── acronym / alias -> exact act title present in the corpus ──────────────────────────
 ACRONYMS: dict[str, str] = {
     # information & governance
@@ -48,8 +51,8 @@ ACRONYMS: dict[str, str] = {
     "dv act": "Protection of Women from Domestic Violence Act, 2005",
     "pwdva": "Protection of Women from Domestic Violence Act, 2005",
     "domestic violence act": "Protection of Women from Domestic Violence Act, 2005",
-    "posh": "Sexual Harassment of Women at Workplace (Prevention, Prohibition and Redressal) Act, 2013",
-    "posh act": "Sexual Harassment of Women at Workplace (Prevention, Prohibition and Redressal) Act, 2013",
+    "posh": _POSH_ACT,
+    "posh act": _POSH_ACT,
     "hma": "Hindu Marriage Act, 1955",
     "hindu marriage act": "Hindu Marriage Act, 1955",
     "special marriage act": "Special Marriage Act, 1954",
@@ -86,7 +89,8 @@ ACRONYMS: dict[str, str] = {
     # rights & welfare
     "rte": "Right of Children to Free and Compulsory Education Act, 2009",
     "rte act": "Right of Children to Free and Compulsory Education Act, 2009",
-    "aadhaar act": "Aadhaar (Targeted Delivery of Financial and other Subsidies, Benefits and Services) Act, 2016",
+    "aadhaar act": ("Aadhaar (Targeted Delivery of Financial and other Subsidies, Benefits and "
+                    "Services) Act, 2016"),
     "transgender act": "Transgender Persons (Protection of Rights) Act, 2019",
     "mental healthcare act": "Mental Healthcare Act, 2017",
     "it act": "Information Technology Act, 2000",
@@ -109,10 +113,8 @@ CONCEPTS: dict[str, str] = {
     # carry little retrieval value anyway.
     # RTI roles. Unexpanded, "PIO" shares no token with the statute, which says "Central Public
     # Information Officer" throughout.
-    "pio": "Public Information Officer under the Right to Information Act",
     "cpio": "Central Public Information Officer under the Right to Information Act",
     "spio": "State Public Information Officer under the Right to Information Act",
-    "faa": "First Appellate Authority under the Right to Information Act",
     "dlsa": "District Legal Services Authority free legal aid",
     "nalsa": "National Legal Services Authority free legal aid",
     "pio": "Public Information Officer under the Right to Information Act, 2005",
@@ -131,6 +133,16 @@ class Repeal:
     note: str
 
 
+_CRPC = Repeal(
+    "Code of Criminal Procedure, 1973", "Bharatiya Nagarik Suraksha Sanhita, 2023", "2024-07-01",
+    "The CrPC was replaced by the Bharatiya Nagarik Suraksha Sanhita (BNSS) on 1 July 2024.",
+)
+_EVIDENCE_ACT = Repeal(
+    "Indian Evidence Act, 1872", "Bharatiya Sakshya Adhiniyam, 2023", "2024-07-01",
+    "The Indian Evidence Act was replaced by the Bharatiya Sakshya Adhiniyam (BSA) on 1 July "
+    "2024.",
+)
+
 # The colonial criminal codes are absent from the corpus by design. Anyone asking about them
 # needs the replacement provision plus an explicit statement that the substitution happened.
 REPEALED: dict[str, Repeal] = {
@@ -143,26 +155,11 @@ REPEALED: dict[str, Repeal] = {
         "Indian Penal Code, 1860", "Bharatiya Nyaya Sanhita, 2023", "2024-07-01",
         "The IPC was replaced by the Bharatiya Nyaya Sanhita (BNS) on 1 July 2024.",
     ),
-    "crpc": Repeal(
-        "Code of Criminal Procedure, 1973", "Bharatiya Nagarik Suraksha Sanhita, 2023", "2024-07-01",
-        "The CrPC was replaced by the Bharatiya Nagarik Suraksha Sanhita (BNSS) on 1 July 2024.",
-    ),
-    "cr.p.c": Repeal(
-        "Code of Criminal Procedure, 1973", "Bharatiya Nagarik Suraksha Sanhita, 2023", "2024-07-01",
-        "The CrPC was replaced by the Bharatiya Nagarik Suraksha Sanhita (BNSS) on 1 July 2024.",
-    ),
-    "criminal procedure code": Repeal(
-        "Code of Criminal Procedure, 1973", "Bharatiya Nagarik Suraksha Sanhita, 2023", "2024-07-01",
-        "The CrPC was replaced by the Bharatiya Nagarik Suraksha Sanhita (BNSS) on 1 July 2024.",
-    ),
-    "indian evidence act": Repeal(
-        "Indian Evidence Act, 1872", "Bharatiya Sakshya Adhiniyam, 2023", "2024-07-01",
-        "The Indian Evidence Act was replaced by the Bharatiya Sakshya Adhiniyam (BSA) on 1 July 2024.",
-    ),
-    "evidence act": Repeal(
-        "Indian Evidence Act, 1872", "Bharatiya Sakshya Adhiniyam, 2023", "2024-07-01",
-        "The Indian Evidence Act was replaced by the Bharatiya Sakshya Adhiniyam (BSA) on 1 July 2024.",
-    ),
+    "crpc": _CRPC,
+    "cr.p.c": _CRPC,
+    "criminal procedure code": _CRPC,
+    "indian evidence act": _EVIDENCE_ACT,
+    "evidence act": _EVIDENCE_ACT,
 }
 
 # Statutes people ask about that this corpus does not contain — each verified absent against
@@ -171,10 +168,12 @@ REPEALED: dict[str, Repeal] = {
 # Information Technology Acts, which are a real and completely different statute).
 NOT_IN_CORPUS: dict[str, str] = {
     "pmla": "The Prevention of Money Laundering Act, 2002 is not in this database.",
-    "prevention of money laundering": "The Prevention of Money Laundering Act, 2002 is not in this database.",
+    "prevention of money laundering": ("The Prevention of Money Laundering Act, 2002 is not in "
+                                       "this database."),
     "dpdp": "The Digital Personal Data Protection Act, 2023 is not in this database.",
     "dpdp act": "The Digital Personal Data Protection Act, 2023 is not in this database.",
-    "digital personal data protection": "The Digital Personal Data Protection Act, 2023 is not in this database.",
+    "digital personal data protection": ("The Digital Personal Data Protection Act, 2023 is not "
+                                         "in this database."),
 }
 
 
@@ -346,7 +345,8 @@ _BNS, _BNSS, _BSA = ("Bharatiya Nyaya Sanhita, 2023", "Bharatiya Nagarik Suraksh
 # BNS", which is false. Where an old number *does* exist in the new code, the same bug would
 # have silently returned a different offence.
 _MAP_ROWS = [
-    ("IPC", "34", _BNS, "3", "3(5)", "acts done by several persons in furtherance of common intention"),
+    ("IPC", "34", _BNS, "3", "3(5)",
+     "acts done by several persons in furtherance of common intention"),
     ("IPC", "120B", _BNS, "61", "61(2)", "criminal conspiracy"),
     ("IPC", "153A", _BNS, "196", "196", "promoting enmity between groups"),
     ("IPC", "279", _BNS, "281", "281", "rash driving on a public way"),
@@ -371,7 +371,8 @@ _MAP_ROWS = [
     ("CrPC", "50", _BNSS, "47", "47", "grounds of arrest and right to bail"),
     ("CrPC", "57", _BNSS, "58", "58", "not to be detained more than twenty-four hours"),
     ("CrPC", "125", _BNSS, "144", "144", "maintenance of wives, children and parents"),
-    ("CrPC", "144", _BNSS, "163", "163", "orders in urgent cases of nuisance or apprehended danger"),
+    ("CrPC", "144", _BNSS, "163", "163",
+     "orders in urgent cases of nuisance or apprehended danger"),
     ("CrPC", "154", _BNSS, "173", "173", "information in cognizable cases (FIR)"),
     ("CrPC", "156", _BNSS, "175", "175", "police power to investigate cognizable cases"),
     ("CrPC", "167", _BNSS, "187", "187", "procedure when investigation exceeds twenty-four hours"),
@@ -475,17 +476,21 @@ _DEVANAGARI_RE = re.compile(r"[ऀ-ॿ]")
 # Deliberately excludes anything that is also an English word. Hindi "the" (were), "main"
 # (I), "par" (on) and "to" all collide, and including "the" alone was enough to classify
 # "what is the punishment for cheating" as Hinglish.
-_HINGLISH_MARKERS = frozenset("""
-kya kyu kyun kaise kahan kaun kitna kitni nahi nahin mat hai hain tha thi hoga hogi
-karo kare karna kiya raha rahi rahe mujhe mera meri mere tum tumhara aap aapka aapko
-uska uski unka humara hamara kuch bhi toh phir agar lekin magar sakta sakti
-mein ka ki ke ko se wala wali bina saath liye gaya gayi diya bola bole chahiye
-""".split())
+_HINGLISH_MARKERS = frozenset([
+    "kya", "kyu", "kyun", "kaise", "kahan", "kaun", "kitna", "kitni", "nahi", "nahin",
+    "mat", "hai", "hain", "tha", "thi", "hoga", "hogi", "karo", "kare", "karna", "kiya",
+    "raha", "rahi", "rahe", "mujhe", "mera", "meri", "mere", "tum", "tumhara", "aap",
+    "aapka", "aapko", "uska", "uski", "unka", "humara", "hamara", "kuch", "bhi", "toh",
+    "phir", "agar", "lekin", "magar", "sakta", "sakti", "mein", "ka", "ki", "ke", "ko",
+    "se", "wala", "wali", "bina", "saath", "liye", "gaya", "gayi", "diya", "bola", "bole",
+    "chahiye",
+])
 
 # Unambiguous enough that one is signal even in a very short message.
-_HINGLISH_STRONG = frozenset("""
-kya kyun kaise kahan kaun nahi nahin hai hain mujhe mera meri chahiye karo raha rahi rahe
-""".split())
+_HINGLISH_STRONG = frozenset([
+    "kya", "kyun", "kaise", "kahan", "kaun", "nahi", "nahin", "hai", "hain", "mujhe",
+    "mera", "meri", "chahiye", "karo", "raha", "rahi", "rahe",
+])
 
 
 def detect_language(text: str) -> str:

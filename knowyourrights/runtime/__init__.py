@@ -1,1 +1,1 @@
-"""Process-level concerns: what this machine can run, how GPU work is serialised, and caches."""
+"""Process-level helpers: the on-disk cache and console output."""

@@ -18,7 +18,7 @@ import asyncio
 import logging
 import random
 import time
-from typing import Awaitable, Callable
+from collections.abc import Awaitable, Callable
 
 from .. import config
 
@@ -143,9 +143,6 @@ class LimiterRegistry:
 
     def status(self) -> list[dict]:
         return [b.status() for b in self._buckets.values()]
-
-    def any_throttled(self) -> bool:
-        return any(b.rpm < b.base_rpm for b in self._buckets.values())
 
 
 _REGISTRY: LimiterRegistry | None = None
