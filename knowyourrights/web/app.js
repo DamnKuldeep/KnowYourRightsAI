@@ -262,6 +262,7 @@ function renderSources() {
       <div class="title">${title}</div>
       ${s.domain ? `<div class="domain">${esc(s.domain)}</div>` : ''}
       <div class="snippet">${esc(s.snippet)}</div>
+      ${(s.caveats || []).map((c) => `<div class="warn-line">${esc(c)}</div>`).join('')}
       ${badges.length ? `<div class="meta">${badges.join('')}</div>` : ''}
       ${mismatched ? `<div class="warn-line">${esc(s.state)} law — it governs matters located
         in ${esc(s.state)}, such as a flat or workplace there, even though you selected

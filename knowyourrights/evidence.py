@@ -11,6 +11,8 @@ writer cites them inline and the UI turns them into clickable chips.
 
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
@@ -53,6 +55,11 @@ def tier_for_url(url: str) -> int:
     if host.endswith("wikipedia.org"):
         return config.TIER_WIKIPEDIA
     return config.TIER_WEB
+
+
+# "extends to the whole of India except the State of Jammu and Kashmir" — true of many central
+# Acts as enacted, and repealed as to that exception in 2019.
+_JK_EXCEPTION = re.compile(r"except\s+the\s+State\s+of\s+Jammu\s+and\s+Kashmir", re.I)
 
 
 @dataclass
@@ -155,6 +162,23 @@ class Evidence:
         """What the writer sees as the source's name."""
         return self.citation or self.title or self.url or self.id
 
+    @property
+    def caveats(self) -> list[str]:
+        """Known ways a statute's text in the corpus is out of date.
+
+        The corpus is a snapshot, and some text in it is no longer law. Quoting it with a
+        citation makes it look authoritative, which is worse than not quoting it — so the
+        correction travels with the source, to the writer and to the card the reader sees.
+        """
+        if not self.is_statute:
+            return []
+        notes = []
+        if _JK_EXCEPTION.search(self.text or ""):
+            notes.append("Out of date: the \"except the State of Jammu and Kashmir\" wording was "
+                         "removed by the Jammu and Kashmir Reorganisation Act, 2019. Central "
+                         "Acts now apply in Jammu & Kashmir and Ladakh.")
+        return notes
+
     def to_public(self) -> dict:
         """The shape the UI receives. Never includes raw prompt scaffolding."""
         return {
@@ -176,6 +200,7 @@ class Evidence:
             "jurisdiction_label": self.jurisdiction_label,
             "category": self.category,
             "source_snapshot": self.source_snapshot,
+            "caveats": self.caveats,
         }
 
 

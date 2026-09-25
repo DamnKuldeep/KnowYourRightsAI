@@ -262,7 +262,12 @@ async def extract_procedure(question: str, items: list[Evidence], *,
     sources = [i for i in items if i.kind in ("official", "web") and i.text]
     if not sources:
         return Procedure()
-    blocks = "\n\n".join(f"URL: {i.url}\n{i.text[:2200]}" for i in sources[:4])
+    # Up to 8 pages at 1,400 characters, rather than 4 at 2,200. The card and the answer have to
+    # be read from the same evidence or they disagree: the extractor used to stop at the fourth
+    # page, the RTI fee was on the fifth and sixth, and the card said "as prescribed in the RTI
+    # Rules" beside an answer that said ₹10. The fee is almost always near the top of a page, so
+    # breadth is worth more here than depth.
+    blocks = "\n\n".join(f"URL: {i.url}\n{i.text[:1400]}" for i in sources[:8])
     client = get_client()
     result = await client.chat_json(
         _messages(prompts.PROCEDURE_EXTRACTOR, f"QUESTION: {question}\n\nSOURCES:\n{blocks}"),
@@ -274,7 +279,29 @@ async def extract_procedure(question: str, items: list[Evidence], *,
     if result.portal_url and result.portal_url not in known:
         # Only offer a link we actually read — a plausible-looking invented URL is a real harm.
         result.portal_url = ""
+    # A fact without its value is worse than no fact: "Fee: as prescribed" tells the reader
+    # nothing and reads as a contradiction beside an answer that names the amount.
+    result.fees = result.fees if _states_a_value(result.fees, money=True) else ""
+    result.timeline = result.timeline if _states_a_value(result.timeline) else ""
     return result
+
+
+# An amount is a currency marker *next to* a number. A bare digit is not enough: "as prescribed
+# in the RTI Rules, 2012" contains one, and it is precisely the text this exists to reject.
+_AMOUNT = re.compile(r"(₹|\brs\.?|\binr)\s*\d|\d[\d,]*\s*(/-|rupees?\b)", re.I)
+_NO_CHARGE = re.compile(r"\b(free|no fee|nil|no charge|exempt(ed)?)\b", re.I)
+_DURATION = re.compile(r"\d+\s*(working\s+)?(hours?|days?|weeks?|months?|years?)\b", re.I)
+
+
+def _states_a_value(text: str, money: bool = False) -> bool:
+    """Does this field actually say something — an amount or "free" for a fee, a duration for
+    a time limit — rather than pointing somewhere else for the answer?"""
+    text = (text or "").strip()
+    if not text:
+        return False
+    if money:
+        return bool(_AMOUNT.search(text) or _NO_CHARGE.search(text))
+    return bool(_DURATION.search(text))
 
 
 # ── summariser ────────────────────────────────────────────────────────────────────────
@@ -330,6 +357,53 @@ def normalize_markers(text: str) -> str:
     return _COMPOUND_RE.sub(fix, text or "")
 
 
+_MD_LINK = re.compile(r"\[([^\[\]\n]{2,160})\]\((https?://[^\s)]+)\)")
+_TITLE_SPLIT = re.compile(r"\s*(?:::|\s\|\s|\s[-–—]\s)\s*")
+
+
+def tidy_link_labels(text: str) -> str:
+    """Shorten link text that is really a page's <title>.
+
+    Writers copy the source title straight into the link: "[RTI Online:: Home | Submit RTI
+    Request | Submit RTI First A](…)" — navigation breadcrumbs, cut off mid-word. The first
+    segment of such a title is the site's own name, which is what a reader wants to click.
+    """
+    def fix(m: re.Match) -> str:
+        label, url = m.group(1).strip(), m.group(2)
+        if not (_TITLE_SPLIT.search(label) or len(label) > 60):
+            return m.group(0)
+        short = _TITLE_SPLIT.split(label)[0].strip() or label
+        if len(short) > 60:
+            short = " ".join(short[:60].split()[:-1]) or short[:60]
+        return f"[{short}]({url})"
+
+    return _MD_LINK.sub(fix, text or "")
+
+
+_UNSTATED = re.compile(
+    r"\b(not|isn't|is not|are not)\s+(explicitly\s+|clearly\s+)?"
+    r"(stated|mentioned|specified|given|provided|available|found)\b.{0,40}\b(sources?|documents?)\b",
+    re.I)
+
+
+def drop_unstated_lines(text: str) -> str:
+    """Remove "Response time: Not stated in the provided sources." lines.
+
+    The writer is told to leave out anything its sources do not state, and still writes a line
+    saying so. That is noise at best, and at worst it reads as "the law says nothing about this"
+    when the reader's actual problem is that we did not find it. Only short labelled or list
+    lines are removed; a sentence of real prose that happens to mention sources is kept.
+    """
+    kept = []
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        is_list_or_label = bool(re.match(r"^([-*•]|\d+[.)])\s+|^\*\*[^*]{1,40}:?\*\*", stripped))
+        if is_list_or_label and len(stripped) < 180 and _UNSTATED.search(stripped):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def verify_citations(answer: str, items: list[Evidence]) -> tuple[str, list[str], int]:
     """Check every ``[S1]`` marker resolves to a source we actually supplied.
 
@@ -337,7 +411,7 @@ def verify_citations(answer: str, items: list[Evidence]) -> tuple[str, list[str]
     removed rather than shown: a citation the user cannot click is worse than no marker, and
     silently leaving it implies support that does not exist.
     """
-    answer = normalize_markers(answer)
+    answer = drop_unstated_lines(tidy_link_labels(normalize_markers(answer)))
     known = {item.id for item in items}
     found = _MARKER_RE.findall(answer or "")
     unsupported = sorted({m for m in found if m not in known})

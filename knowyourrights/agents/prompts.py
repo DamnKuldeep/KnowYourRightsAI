@@ -83,6 +83,12 @@ phrase instead and let the search find the page.
 
 Do not create two steps with the same query. One search per distinct thing you need to know.
 
+For a how-to question, the statute usually holds what the portal leaves out: the deadline the
+authority must meet and the appeal if it does not. So add a legal_db step for exactly that —
+"time limit for disposal of RTI request and first appeal", "time limit for consumer complaint
+and appeal" — alongside the steps for the procedure itself. A portal explains the form; the
+Act says how long they have and what to do when they miss it.
+
 For smalltalk / capability / out_of_scope: normalized_query="", answer_kind="none",
 sub_questions=[], steps=[].
 """.strip()
@@ -216,10 +222,15 @@ SHAPE — the ANSWER SHAPE you are given decides the format. Match it.
   supplied, use it as the backbone of your steps, and cite each step to its source:
     A one-line summary of what they are about to do.
     Then **numbered steps**, one action per step, in the order they happen.
-    Then, ONLY if your sources state a fee, a deadline or an appeal route, a short
-    "**What it costs and how long**" line with exactly those. If they state none, leave the
-    line out altogether — do not write it to say there is no fee or no deadline. "There is no
-    fee" is itself a factual claim, and one no source made.
+    Then a "**What it costs and how long**" section, one line each, covering EVERY one of these
+    that your sources state — check each source for them before you write, because readers need
+    all of them and an answer that stops at the fee leaves them stuck at the next step:
+      - **Fee:** the amount, and who is exempt from it (e.g. below-poverty-line applicants)
+      - **Response time:** how long the authority has to reply
+      - **If refused or no reply:** who hears the first appeal, and within how long
+      - **Further appeal:** the next level, if stated
+    Leave out any line your sources do not state — never write one to say there is no fee or
+    no deadline; "there is no fee" is itself a factual claim.
     Never write a procedure as a paragraph. Someone following it needs to find their place.
 
 - "rights" — lead with the direct answer ("Yes, but only if…" / "No — the police must…").
@@ -240,6 +251,8 @@ LAYOUT — markdown, and the line breaks matter:
 - Say each fact once. If the same fee or portal appears in several sources, state it once and
   cite the sources together: "₹10 [G1][G3]".
 - Write a link as a markdown link, [RTI Online](https://rtionline.gov.in), never a bare URL.
+  The link text is a short plain name — "RTI Online portal" — never the page's title copied
+  from the source, which is full of navigation like "Home | Submit Request | FAQ".
 
 LINKS — when a vetted source has a url and it is somewhere the person should actually go (a
 portal, a form, a government page), link it inline in markdown: [RTI Online portal](https://…).

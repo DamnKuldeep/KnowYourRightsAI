@@ -251,3 +251,40 @@ def test_writer_is_not_the_unreliable_free_model():
     """The free 120B broke 12 of 22 streams in one session, 5 of them after text had started."""
     from knowyourrights import config
     assert not config.is_free_model(config.WRITER_MODELS[0].id)
+
+
+# ── procedure card, links, and out-of-date statute text ───────────────────────────────
+@pytest.mark.parametrize("text,money,ok", [
+    ("As prescribed in the RTI Rules, 2012.", True, False),   # a year is not an amount
+    ("Payment can be made through internet banking", True, False),
+    ("Rs 10; free for BPL applicants", True, True),
+    ("₹10", True, True),
+    ("Free of charge", True, True),
+    ("30 days", False, True),
+    ("as soon as possible", False, False),
+])
+def test_card_facts_must_state_a_value(text, money, ok):
+    """Regression: the card said 'Fee: as prescribed in the RTI Rules' beside an answer that
+    said ₹10. A fact with no value is dropped rather than shown."""
+    from knowyourrights.agents.stages import _states_a_value
+    assert _states_a_value(text, money=money) is ok
+
+
+def test_page_titles_are_not_used_as_link_text():
+    from knowyourrights.agents.stages import tidy_link_labels
+    out = tidy_link_labels("Visit [RTI Online:: Home | Submit RTI Request | Submit RTI First A]"
+                           "(https://rtionline.gov.in/).")
+    assert out == "Visit [RTI Online](https://rtionline.gov.in/)."
+    assert tidy_link_labels("[RTI Online portal](https://rtionline.gov.in)") == \
+        "[RTI Online portal](https://rtionline.gov.in)"
+
+
+def test_the_2019_jk_change_travels_with_the_source():
+    """The corpus still carries the pre-2019 extent clause; the correction must reach both
+    the writer and the card, not depend on the model remembering a prompt rule."""
+    from knowyourrights.evidence import Evidence
+    ev = Evidence(id="S1", kind="statute", title="Right to Information Act, 2005",
+                  citation="Section 1", score=0.9, url="", source_type="central_act",
+                  text="It extends to the whole of India except the State of Jammu and Kashmir.")
+    assert ev.caveats and "2019" in ev.caveats[0]
+    assert ev.to_public()["caveats"] == ev.caveats

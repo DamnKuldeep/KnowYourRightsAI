@@ -78,6 +78,8 @@ def render(item: Evidence) -> str:
         # must be able to say "this is central law" or "this is Maharashtra's law" without
         # inferring it, because inferring it is exactly how a user gets misled.
         lines.append(f"jurisdiction: {item.jurisdiction} — {item.jurisdiction_label}")
+        for caveat in item.caveats:
+            lines.append(f"CORRECTION: {caveat}")
         status_bits = []
         if item.status:
             status_bits.append(item.status.replace("_", " "))
