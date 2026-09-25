@@ -167,7 +167,34 @@ def _rerank_document(row) -> str:
     """
     heading = _clean(getattr(row, "section_name", ""))
     body = _clean(getattr(row, "chunk_text", ""))
-    return f"{heading}\n{body}" if heading else body
+    questions = _citizen_questions(row) if config.RERANK_WITH_QUESTIONS else ""
+    parts = [p for p in (heading, questions, body) if p]
+    return "\n".join(parts)
+
+
+def _citizen_questions(row) -> str:
+    """The questions this section answers, as written for it when the corpus was built.
+
+    Statute text often buries its answer. RTI Section 7 opens "Subject to the proviso to
+    sub-section (2) of section 5 or the proviso to sub-section (3) of section 6…" before it ever
+    says "thirty days", so for "how long does the PIO have to reply" the cross-encoder scored it
+    0.240 against 0.667 for Section 11, which merely mentions "five days". Its build-time
+    questions include "How long does the government have to respond to my information
+    request?" — generated *from* the text, so this adds the section's own meaning in the
+    reader's words, not anything invented.
+
+    ``embed_text`` is heading, questions, keywords, chunk; this takes the lines between the
+    heading and the chunk, and drops the keyword line, which reads as noise to a cross-encoder.
+    """
+    embed = _clean(getattr(row, "embed_text", ""))
+    chunk = _clean(getattr(row, "chunk_text", ""))
+    if not embed:
+        return ""
+    head, _, rest = embed.partition("\n")
+    if chunk and rest.endswith(chunk):
+        rest = rest[: -len(chunk)]
+    lines = [ln.strip() for ln in rest.splitlines() if ln.strip()]
+    return "\n".join(ln for ln in lines if ln.endswith("?"))
 
 
 def _clean(value) -> str:
@@ -208,7 +235,8 @@ class SearchEngine:
 
     # ── candidate generation ─────────────────────────────────────────────────────────
     async def _ranked_lists(self, queries: list[str], fetch: int, act_filter: list[str],
-                            bm25: dict[str, float] | None = None) -> tuple[list, str, list[str]]:
+                            bm25: dict[str, float] | None = None
+                            ) -> tuple[list, str, list[str], float]:
         notes: list[str] = []
 
         vectors = await self.embedder.encode(queries)
@@ -337,7 +365,9 @@ class SearchEngine:
         # retrieval aid — it turns "file an RTI" into "file an Right to Information Act, 2005",
         # which helps BM25 and the bi-encoder but reads as broken English to a cross-encoder
         # trained on natural queries.
-        rerank_query = rerank_with or queries[0]
+        # Acronyms are named beside themselves for the cross-encoder — see legal_terms.annotate.
+        # A bare "RTI" let the Credit Information Companies Act outrank the RTI Act's appeal.
+        rerank_query = legal_terms.annotate(rerank_with or queries[0])
         scores = await self.reranker.score(
             rerank_query, [_rerank_document(c) for c in candidates],
             deadline=deadline, on_pause=on_pause, session=session,
@@ -366,10 +396,21 @@ class SearchEngine:
         # governs the person asking, so it has to be applied here rather than hoped for from
         # the model. Ordering only: the score shown to the user stays the honest one.
         prefer_general = not acts and _is_general_criminal(queries)
+        # Relative to this query's best score, and only for near-ties. It was a flat +0.25, tuned
+        # against the local cross-encoder whose relevant scores sit near 0.99 — there it decided
+        # between 0.994 and 0.992, which is its whole purpose. Cohere's relevant scores sit near
+        # 0.2-0.4, where the same +0.25 swamped them: Article 193 at 0.056 was lifted above
+        # Motor Vehicles Act sections at 0.334 for "driving without a licence penalty", and the
+        # right Act vanished from the answer. Scaled, the local behaviour is unchanged
+        # (0.25 x 0.99 ~ 0.25) and an irrelevant general-code row can no longer be promoted.
+        top_score = max(scores) if scores else 0.0
+        boost = config.GENERAL_CODE_BOOST * top_score
+        eligible = config.GENERAL_CODE_ELIGIBLE * top_score
 
         def boosted(candidate, score: float) -> float:
-            if prefer_general and _clean(getattr(candidate, "act_title", "")) in config.GENERAL_CODES:
-                return score + config.GENERAL_CODE_BOOST
+            if (prefer_general and score >= eligible
+                    and _clean(getattr(candidate, "act_title", "")) in config.GENERAL_CODES):
+                return score + boost
             return score
 
         # Carry (candidate, reported_score, ranking_score) together. The boost has to reach

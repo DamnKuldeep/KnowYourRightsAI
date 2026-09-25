@@ -117,8 +117,10 @@ class Reranker:
         if self.backend == "api":
             # Named so calibration cannot be shared with the local cross-encoder: this is a
             # different model on a different score scale, and reusing a threshold across them
-            # breaks abstention silently.
-            return config.RERANK_API_MODEL
+            # breaks abstention silently. What the model is *shown* moves its scores too:
+            # adding each section's citizen questions took the stress set from 11/11 to 10/11
+            # under the old threshold, so the document format is part of the key.
+            return config.RERANK_API_MODEL + ("+q" if config.RERANK_WITH_QUESTIONS else "")
         if self.backend == "local":
             # Quantisation and a shorter input both move the score distribution without changing
             # the model's name, so a threshold calibrated for one is wrong for the other — and
@@ -130,6 +132,8 @@ class Reranker:
                 name += "+int8"
             if config.RERANK_MAX_LEN > 0:
                 name += f"@{config.RERANK_MAX_LEN}"
+            if config.RERANK_WITH_QUESTIONS:
+                name += "+q"
             return name
         if self.backend == "nim":
             from ..llm import registry

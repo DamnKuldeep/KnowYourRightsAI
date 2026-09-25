@@ -84,3 +84,55 @@ def test_writer_prompt_knows_territory():
     from knowyourrights.agents import prompts
     text = prompts.WRITER if hasattr(prompts, "WRITER") else str(vars(prompts))
     assert "TERRITORY" in text
+
+
+# ── retrieval regressions from the corpus repair ──────────────────────────────────────
+def test_acronyms_are_named_beside_themselves_for_the_reranker():
+    """A bare "RTI" let the Credit Information Companies Act outrank RTI Section 19."""
+    from knowyourrights import legal_terms
+    assert legal_terms.annotate("my RTI was rejected") == \
+        "my RTI (Right to Information Act, 2005) was rejected"
+    assert "(FIR)" not in legal_terms.annotate("how do I file an FIR")
+    assert legal_terms.annotate("what is Article 21") == "what is Article 21"
+
+
+def test_rti_roles_imply_the_rti_act():
+    """"penalty on PIO" was treated as a general criminal question and BNS was boosted."""
+    from knowyourrights import legal_terms
+    for q in ("penalty on PIO", "the CPIO did not reply", "appeal to the first appellate authority"):
+        assert "Right to Information Act, 2005" in legal_terms.detect_acts(q), q
+
+
+def test_general_code_boost_is_relative_and_only_for_near_ties(monkeypatch):
+    """A flat +0.25 tuned on a ~0.99 score scale swamped Cohere's ~0.3 scale and lifted
+    Article 193 (0.056) over the Motor Vehicles Act (0.334)."""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent / "knowyourrights" / "retrieval" / "search.py"
+           ).read_text(encoding="utf-8")
+    assert "config.GENERAL_CODE_BOOST * top_score" in src
+    assert "score >= eligible" in src
+
+
+def test_reranker_sees_the_sections_own_citizen_questions():
+    from knowyourrights.retrieval.search import _citizen_questions
+    class Row:
+        chunk_text = "(1) Subject to the proviso ... within thirty days of the receipt"
+        embed_text = ("Right to Information Act, 2005 — Section 7 (Disposal of request)\n"
+                      "How long does the government have to respond?\n"
+                      "What if they do not reply?\n"
+                      "RTI deadline response time\n" + chunk_text)
+    q = _citizen_questions(Row())
+    assert "How long does the government have to respond?" in q
+    assert "RTI deadline" not in q, "the keyword line is noise to a cross-encoder"
+    assert "Subject to the proviso" not in q
+
+
+def test_rerank_calibration_is_keyed_to_the_document_format(monkeypatch):
+    from knowyourrights import config
+    from knowyourrights.retrieval.reranker import Reranker
+    from knowyourrights.runtime import resources
+    r = Reranker(resources.select_profile(requested="api"))
+    monkeypatch.setattr(config, "RERANK_WITH_QUESTIONS", True)
+    with_q = r.model_name
+    monkeypatch.setattr(config, "RERANK_WITH_QUESTIONS", False)
+    assert with_q != r.model_name, "a threshold must not be shared across document formats"

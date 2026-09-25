@@ -42,6 +42,9 @@ DISPLAY_COLUMNS = [
     "chunk_id", "unit_id", "citation", "act_title", "act_year", "section_label",
     "section_name", "chapter", "category", "status", "effective_date",
     "source_type", "source_snapshot", "chunk_text", "full_text",
+    # carries the citizen questions written for each section at build time; the reranker reads
+    # them (see search._rerank_document)
+    "embed_text",
 ]
 
 # The resident index: identity only, no text bodies.

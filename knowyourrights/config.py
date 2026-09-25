@@ -458,6 +458,13 @@ GENERAL_CODE_WEIGHT = env_float("KYR_GENERAL_CODE_WEIGHT", 2.0)
 # Applied to the *ordering* after reranking, not to the reported score. Large enough to beat
 # a near-tie, since sectoral and general provisions are often worded almost identically.
 GENERAL_CODE_BOOST = env_float("KYR_GENERAL_CODE_BOOST", 0.25)
+# Both are fractions of the query's best cross-encoder score, so they mean the same thing on
+# every reranker's scale. A general code must already score at least this fraction of the best
+# candidate to be boosted: the boost settles near-ties, it does not rescue irrelevant rows.
+GENERAL_CODE_ELIGIBLE = env_float("KYR_GENERAL_CODE_ELIGIBLE", 0.5)
+# Show the cross-encoder each section's citizen questions as well as its text. See
+# search._rerank_document for what this fixed and what it measured.
+RERANK_WITH_QUESTIONS = env_bool("KYR_RERANK_WITH_QUESTIONS", True)
 # Words that mean "this is a general criminal-law or policing question".
 CRIMINAL_TRIGGERS = (
     "police", "arrest", "arrested", "custody", "detain", "detention", "bail", "fir",

@@ -107,6 +107,12 @@ CONCEPTS: dict[str, str] = {
     "cji": "Chief Justice of India",
     # Bare "sc"/"hc" are deliberately absent: expanding them would mangle "SC/ST" and they
     # carry little retrieval value anyway.
+    # RTI roles. Unexpanded, "PIO" shares no token with the statute, which says "Central Public
+    # Information Officer" throughout.
+    "pio": "Public Information Officer under the Right to Information Act",
+    "cpio": "Central Public Information Officer under the Right to Information Act",
+    "spio": "State Public Information Officer under the Right to Information Act",
+    "faa": "First Appellate Authority under the Right to Information Act",
     "dlsa": "District Legal Services Authority free legal aid",
     "nalsa": "National Legal Services Authority free legal aid",
     "pio": "Public Information Officer under the Right to Information Act, 2005",
@@ -194,6 +200,7 @@ _EXPANSIONS: dict[str, str] = {
     **{k.lower(): v.new for k, v in REPEALED.items()},
 }
 _EXPAND_RE = _pattern(_EXPANSIONS)
+_ANNOTATE_RE = _pattern({**CONCEPTS, **ACRONYMS})
 
 
 def expand(text: str) -> str:
@@ -207,11 +214,53 @@ def expand(text: str) -> str:
     return re.sub(r"\s+", " ", out).strip()
 
 
+# Roles and bodies that exist under exactly one Act. Naming one names the Act, even though the
+# word itself is not an acronym for it: "penalty on the PIO" is an RTI question, and without this
+# it was treated as a general criminal one and the BNS was boosted over RTI Section 20 — which
+# the reranker had scored highest.
+IMPLIES_ACT: dict[str, str] = {
+    "pio": "Right to Information Act, 2005",
+    "cpio": "Right to Information Act, 2005",
+    "spio": "Right to Information Act, 2005",
+    "public information officer": "Right to Information Act, 2005",
+    "first appellate authority": "Right to Information Act, 2005",
+    "information commission": "Right to Information Act, 2005",
+    "information commissioner": "Right to Information Act, 2005",
+}
+_IMPLIES_RE = _pattern(IMPLIES_ACT)
+
+
+def annotate(text: str) -> str:
+    """Name what an acronym stands for *beside* it, for the cross-encoder.
+
+    The reranker used to see the raw query, because replacing "RTI" with "Right to Information
+    Act, 2005" reads as broken English ("my Right to Information Act, 2005 was rejected"). But a
+    bare "RTI" meant it could not tell the RTI Act from the Credit Information Companies Act:
+    "my RTI was rejected, how do I appeal" ranked the latter first. A parenthetical keeps the
+    sentence natural and gives the model the name: "my RTI (Right to Information Act, 2005)".
+    """
+    if not text:
+        return ""
+    def add(m: re.Match) -> str:
+        key = m.group(1).lower()
+        full = ACRONYMS.get(key) or CONCEPTS.get(key)
+        if not full or full.lower() == m.group(0).lower():
+            return m.group(0)
+        # "FIR (First Information Report (FIR) …)" — drop the acronym's own echo inside.
+        full = re.sub(rf"\s*\({re.escape(m.group(0))}\)", "", full, flags=re.I)
+        return f"{m.group(0)} ({full})"
+    return _ANNOTATE_RE.sub(add, text)
+
+
 def detect_acts(text: str) -> list[str]:
     """Canonical act titles explicitly named or implied by the text."""
     found: list[str] = []
     for match in _ACRONYM_RE.finditer(text or ""):
         title = ACRONYMS[match.group(1).lower()]
+        if title not in found:
+            found.append(title)
+    for match in _IMPLIES_RE.finditer(text or ""):
+        title = IMPLIES_ACT[match.group(1).lower()]
         if title not in found:
             found.append(title)
     for match in _REPEALED_RE.finditer(text or ""):
