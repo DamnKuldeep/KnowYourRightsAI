@@ -8,6 +8,7 @@ appended to ``.runtime/usage.jsonl`` so a session can be audited after the fact.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import logging
 import threading
 import time
@@ -19,7 +20,15 @@ from .. import config
 log = logging.getLogger(__name__)
 
 USAGE_FILE = config.RUNTIME_DIR / "usage.jsonl"
-DAILY_FILE = config.RUNTIME_DIR / "daily_usage.json"
+def daily_file() -> Path:
+    """Resolved on every use, never at import.
+
+    A module-level constant froze the path before the test suite could redirect RUNTIME_DIR, so
+    running the tests rewrote the real ``.runtime/daily_usage.json`` — measured: a file reading
+    ``{"openrouter": 1}`` came back as ``{"nim": 13}``. The registry's probe file had the same
+    bug once and it retired a healthy production model; this is the same fix.
+    """
+    return config.RUNTIME_DIR / "daily_usage.json"
 
 
 @dataclass
@@ -51,6 +60,7 @@ class Ledger:
     # bouncing the server.
     provider_day: str = ""
     provider_calls: Counter = field(default_factory=Counter)
+    cost_usd: float = 0.0            # billed, summed from each response's own usage.cost
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _persist: bool = True
 
@@ -63,16 +73,23 @@ class Ledger:
         return usage
 
     def record_call(self, model: str, *, seconds: float = 0.0, prompt_tokens: int = 0,
-                    completion_tokens: int = 0, session: str = "", stage: str = "") -> None:
+                    completion_tokens: int = 0, session: str = "", stage: str = "",
+                    cost_usd: float = 0.0) -> None:
         with self._lock:
             usage = self._usage(model)
             usage.calls += 1
             usage.seconds += seconds
             usage.prompt_tokens += prompt_tokens
             usage.completion_tokens += completion_tokens
+            # What the provider actually billed, from its own `usage.cost`. OpenRouter's account
+            # endpoint is eventually consistent — read straight after a run it reported $0.0003
+            # for turns that had provably cost $0.007 in reranking alone — so spend is summed
+            # here, call by call, from the figure each response carries.
+            self.cost_usd += max(0.0, float(cost_usd or 0.0))
         self._append({"t": time.time(), "kind": "call", "model": model, "stage": stage,
                       "session": session, "seconds": round(seconds, 3),
-                      "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens})
+                      "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                      "cost_usd": round(float(cost_usd or 0.0), 6)})
 
     def record_error(self, model: str, kind: str = "error", session: str = "",
                      stage: str = "", detail: str = "") -> None:
@@ -85,8 +102,14 @@ class Ledger:
         self._append({"t": time.time(), "kind": kind, "model": model, "stage": stage,
                       "session": session, "detail": detail[:300]})
 
-    def note_provider_call(self, provider: str) -> None:
-        """Count a call against the provider's daily allowance, rolling over at UTC midnight."""
+    def note_provider_call(self, provider: str, model: str = "") -> None:
+        """Count a call against the provider's daily allowance, rolling over at UTC midnight.
+
+        Only free-tier calls count. OpenRouter's 1,000/day cap covers ``:free`` models; a paid
+        call spends money, not allowance, and counting it here would lock paid models out.
+        """
+        if provider == "openrouter" and model and not config.is_free_model(model):
+            return
         today = time.strftime("%Y-%m-%d", time.gmtime())
         with self._lock:
             if self.provider_day != today:
@@ -108,7 +131,7 @@ class Ledger:
     def _persist_daily(self) -> None:
         try:
             config.ensure_runtime_dirs()
-            DAILY_FILE.write_text(json.dumps(
+            daily_file().write_text(json.dumps(
                 {"day": self.provider_day, "calls": dict(self.provider_calls)}), encoding="utf-8")
         except OSError:
             pass
@@ -116,7 +139,7 @@ class Ledger:
     def load_daily(self) -> None:
         """Restore today's counts on startup; a different day starts clean."""
         try:
-            data = json.loads(DAILY_FILE.read_text(encoding="utf-8"))
+            data = json.loads(daily_file().read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return
         today = time.strftime("%Y-%m-%d", time.gmtime())
@@ -169,6 +192,7 @@ class Ledger:
                 "budget_pressure": round(self.budget_pressure(), 3),
                 "provider_calls_today": dict(self.provider_calls),
                 "openrouter_remaining_today": self.daily_remaining("openrouter"),
+                "chat_cost_usd": round(self.cost_usd, 6),
             }
 
     def report(self) -> str:

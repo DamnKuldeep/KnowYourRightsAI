@@ -1,8 +1,17 @@
-"""The query embedder — local ``BAAI/bge-m3``, permanently.
+"""The query embedder — ``BAAI/bge-m3``, permanently, locally or over the API.
 
-This model is not a choice. The corpus was embedded with it, so swapping it means re-embedding
-all 38,890 chunks (DB README §8). When the hosted copy disappears from a catalogue, local is
-the only option, which is why nothing here reaches for the network.
+The *model* is not a choice. The corpus was embedded with it, so swapping it means re-embedding
+all 38,890 chunks (DB README §8). The *transport* is a choice, and there are two:
+
+* **local** — load the weights here. ~1090 MiB of VRAM in fp16, or ~2.3 GB of host RAM while
+  loading, which is the most likely way to wedge a busy laptop. No network, no per-call cost.
+* **api** — OpenRouter serves the same ``baai/bge-m3``. Verified against vectors already stored
+  in the corpus at cosine **1.0000** (unrelated rows: 0.60), so the two are interchangeable and
+  nothing needs re-embedding. Costs ~$0.01 per million tokens and needs no RAM at all.
+
+The API path falls back to the local model on any failure, never to nothing — returning None
+here means "no semantic search at all" to everything downstream, which is a much larger
+degradation than one slow call.
 
 Cost control, measured on an RTX 3050:
 
@@ -39,6 +48,8 @@ class Embedder:
         self._warm = False
         self.encodes = 0
         self.cache_hits = 0
+        self.api_calls = 0
+        self._api_failures = 0
 
     @property
     def plan(self) -> resources.ResourcePlan:
@@ -130,7 +141,18 @@ class Embedder:
         return await self.ensure_loaded()
 
     async def warmup(self) -> bool:
-        """Pay the ~1.9s CUDA warmup at startup instead of on the first question."""
+        """Pay the ~1.9s CUDA warmup at startup instead of on the first question.
+
+        Over the API there is no warmup to pay and nothing to load, so this does one real call
+        to prove the key, the model name and the vector width are all what we think they are —
+        failing at boot is far better than failing on someone's first question.
+        """
+        if self.plan.embed_backend == "api":
+            vectors = await self.encode(["warmup"], use_cache=False)
+            self._warm = vectors is not None
+            if not self._warm:
+                log.error("embedding API did not answer at warmup — retrieval will be keyword-only")
+            return self._warm
         if not await self.ensure_loaded():
             return False
         if self._warm:
@@ -183,19 +205,36 @@ class Embedder:
             todo = list(range(len(items)))
 
         if todo:
-            if not await self.ensure_loaded():
-                return None
             pending = [items[i] for i in todo]
-            try:
-                vectors = await gpu.get_executor().map_batches(
-                    self._encode_sync, pending, self.plan.embed_batch, label="embed",
-                )
-            except gpu.GpuOutOfMemory as exc:
-                log.error("embedding ran out of memory: %s", exc)
-                return None
-            except Exception as exc:
-                log.error("embedding failed: %s", exc)
-                return None
+            vectors = None
+
+            if self.plan.embed_backend == "api":
+                # Same model, different transport — OpenRouter's bge-m3 was verified against the
+                # stored corpus vectors at cosine 1.0000, so these are interchangeable with the
+                # ones in the index. On any failure fall through to the local model rather than
+                # returning None, because None means "no semantic search at all" downstream.
+                from ..llm import retrieval_api
+
+                try:
+                    vectors = await retrieval_api.embed(pending)
+                    self.api_calls += 1
+                except retrieval_api.RetrievalApiError as exc:
+                    self._api_failures += 1
+                    log.warning("embedding API unavailable (%s) — trying the local model", exc)
+
+            if vectors is None:
+                if not await self.ensure_loaded():
+                    return None
+                try:
+                    vectors = await gpu.get_executor().map_batches(
+                        self._encode_sync, pending, self.plan.embed_batch, label="embed",
+                    )
+                except gpu.GpuOutOfMemory as exc:
+                    log.error("embedding ran out of memory: %s", exc)
+                    return None
+                except Exception as exc:
+                    log.error("embedding failed: %s", exc)
+                    return None
 
             self.encodes += len(pending)
             for slot, vector in zip(todo, vectors):
@@ -216,7 +255,10 @@ class Embedder:
             "model": config.EMBED_MODEL,
             "loaded": self.loaded,
             "warm": self._warm,
-            "device": self.plan.embed_device,
+            "backend": self.plan.embed_backend,
+            "device": "api" if self.plan.embed_backend == "api" else self.plan.embed_device,
+            "api_calls": self.api_calls,
+            "api_failures": self._api_failures,
             "dtype": self.plan.embed_dtype,
             "encodes": self.encodes,
             "cache_hits": self.cache_hits,

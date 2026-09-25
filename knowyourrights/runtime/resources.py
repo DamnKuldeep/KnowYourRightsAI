@@ -57,7 +57,7 @@ class ResourcePlan:
     snapshot: ResourceSnapshot
     embed_device: str          # "cuda" | "cpu"
     embed_dtype: str           # "float16" | "float32"
-    rerank_backend: str        # "local" | "nim" | "none"
+    rerank_backend: str        # "local" | "api" | "nim" | "none"
     rerank_model: str | None
     rerank_device: str
     rerank_dtype: str
@@ -65,6 +65,7 @@ class ResourcePlan:
     rerank_batch: int
     ram_ok: bool               # enough RAM to survive the load spike?
     use_embedder: bool = True  # False in `lite`: BM25 only, no models at all
+    embed_backend: str = "local"   # "local" | "api" — carried from the profile
     reasons: tuple[str, ...] = field(default_factory=tuple)
 
     @property
@@ -79,12 +80,17 @@ class ResourcePlan:
 
     def describe(self) -> str:
         lines = [f"profile      : {self.name}  ({self.profile.note})"]
-        if self.use_embedder:
+        if not self.use_embedder:
+            lines.append("embedder     : none — BM25 keyword search only")
+        elif self.embed_backend == "api":
+            lines.append(f"embedder     : {config.EMBED_API_MODEL} over OpenRouter "
+                         f"(same model as the corpus; no local weights)")
+        else:
             lines.append(f"embedder     : {config.EMBED_MODEL} on "
                          f"{self.embed_device} / {self.embed_dtype}")
-        else:
-            lines.append("embedder     : none — BM25 keyword search only")
-        if self.rerank_backend == "local":
+        if self.rerank_backend == "api":
+            lines.append(f"reranker     : {config.RERANK_API_MODEL} over OpenRouter")
+        elif self.rerank_backend == "local":
             lines.append(f"reranker     : {self.rerank_model} on {self.rerank_device} / {self.rerank_dtype}")
         elif self.rerank_backend == "nim":
             lines.append(f"reranker     : NIM {config.NIM_RERANK_MODEL} (remote)")
@@ -227,6 +233,16 @@ def _build_plan(profile: config.Profile, snap: ResourceSnapshot,
     dtype = "float16" if on_gpu else "float32"
 
     rerank_backend = profile.rerank_backend
+    embed_backend = profile.embed_backend
+
+    # An API backend without a key is not a backend. Degrade rather than fail at first query.
+    if embed_backend == "api" and not config.OPENROUTER_API_KEY:
+        embed_backend = "local"
+        reasons.append("OPENROUTER_API_KEY is unset, so embedding falls back to the local model")
+    if rerank_backend == "api" and not config.OPENROUTER_API_KEY:
+        rerank_backend = "none"
+        reasons.append("OPENROUTER_API_KEY is unset, so reranking falls back to fused RRF scores")
+
     if rerank_backend == "nim" and not config.NVIDIA_API_KEY:
         rerank_backend = "none"
         reasons.append("NVIDIA_API_KEY is unset, so the NIM reranker is unavailable; "
@@ -240,6 +256,11 @@ def _build_plan(profile: config.Profile, snap: ResourceSnapshot,
             f"keyword-only until memory frees up."
         )
 
+    if embed_backend == "api" and rerank_backend in ("api", "none"):
+        reasons.append("api profile: no weights are loaded locally — retrieval runs over "
+                       "OpenRouter, so the RAM floor does not apply")
+        ram_ok = True
+
     if not profile.use_embedder:
         reasons.append("lite profile: no models are loaded — retrieval is BM25 only "
                        "(Recall@5 95% against 100%, but it fits in under 1 GB)")
@@ -252,6 +273,7 @@ def _build_plan(profile: config.Profile, snap: ResourceSnapshot,
         embed_device=device,
         embed_dtype=dtype,
         rerank_backend=rerank_backend,
+        embed_backend=embed_backend,
         rerank_model=profile.rerank_model if rerank_backend == "local" else None,
         rerank_device=device,
         rerank_dtype=dtype,

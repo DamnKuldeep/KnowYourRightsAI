@@ -296,6 +296,40 @@ async def summarise(turns_text: str, *, deadline: float | None = None,
 _MARKER_RE = re.compile(r"\[([A-Z]{1,2}\d{1,2})\]")
 
 
+# Anything bracketed that *starts* with a source id — "[S1(a)]", "[S3(1)]", "[S1(c)-(h)]",
+# "[S1, S2]" — but not a markdown link, whose "]" is followed by "(".
+_COMPOUND_RE = re.compile(r"\[([A-Z]{1,2}\d{1,2}[^\[\]\n]{0,40})\](?!\()")
+_ID_RE = re.compile(r"[A-Z]{1,2}\d{1,2}")
+_CLAUSE_RE = re.compile(r"\([^()]{1,8}\)")
+_JOINERS = re.compile(r"^[\s,;&\-–—/]*(?:and[\s,;&\-–—/]*)*$", re.I)
+
+
+def normalize_markers(text: str) -> str:
+    """Rewrite the citation shapes models invent into the one shape we can verify and link.
+
+    Seen live from the Hinglish writer: ``[S1(a)]``, ``[S3(1)]``, ``[S1(c)-(h)]``. The verifier
+    and the UI's chip renderer both only understand ``[S1]``, so those were neither checked nor
+    clickable — they rendered as raw text. The clause is dropped from the marker; the sentence
+    around it already names the section. ``[S1, S2]`` becomes ``[S1][S2]``.
+
+    Conservative: a bracket is only rewritten when, once the ids and short clause groups are
+    removed, nothing but separators is left. Anything with real words inside is left alone.
+    """
+    def fix(match: re.Match) -> str:
+        inner = match.group(1)
+        ids = _ID_RE.findall(inner)
+        rest = _CLAUSE_RE.sub("", _ID_RE.sub("", inner))
+        if not ids or not _JOINERS.match(rest):
+            return match.group(0)
+        seen: list[str] = []
+        for marker in ids:
+            if marker not in seen:
+                seen.append(marker)
+        return "".join(f"[{m}]" for m in seen)
+
+    return _COMPOUND_RE.sub(fix, text or "")
+
+
 def verify_citations(answer: str, items: list[Evidence]) -> tuple[str, list[str], int]:
     """Check every ``[S1]`` marker resolves to a source we actually supplied.
 
@@ -303,6 +337,7 @@ def verify_citations(answer: str, items: list[Evidence]) -> tuple[str, list[str]
     removed rather than shown: a citation the user cannot click is worse than no marker, and
     silently leaving it implies support that does not exist.
     """
+    answer = normalize_markers(answer)
     known = {item.id for item in items}
     found = _MARKER_RE.findall(answer or "")
     unsupported = sorted({m for m in found if m not in known})

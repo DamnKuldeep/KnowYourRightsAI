@@ -337,13 +337,25 @@ LANGUAGE_INSTRUCTION = {
 
 
 def is_state_law(act_title: str, state_prefixes) -> str | None:
-    """Return the state a title belongs to, if it looks like state law.
-
-    'Delhi ...' acts are genuinely central — Parliament legislates for the Delhi UT — so the
-    caller's prefix list deliberately excludes it (DB README §9).
-    """
+    """Return the state a title belongs to, if it looks like state-legislature law."""
     title = (act_title or "").strip()
     for state in state_prefixes:
         if title.startswith(state):
             return state
+    return None
+
+
+def territory_of(act_title: str, territory_prefixes) -> str | None:
+    """Return the Union Territory an Act is limited to, if Parliament passed it for one.
+
+    Kept separate from :func:`is_state_law` because the two are different facts about the same
+    reader-facing question. A Delhi Act *was* passed by Parliament (DB README §9) — so it is not
+    state law — but it still applies only in Delhi, so it is not all-India law either. Collapsing
+    the two into "central" is what put the Delhi Rent Act in front of someone asking about Mumbai
+    with a label saying it applied across India.
+    """
+    title = (act_title or "").strip()
+    for prefix, place in territory_prefixes:
+        if title.startswith(prefix):
+            return place
     return None

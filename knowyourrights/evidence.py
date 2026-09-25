@@ -73,7 +73,8 @@ class Evidence:
     status: str = ""
     effective_date: str = ""
     source_snapshot: str = ""
-    state: str | None = None
+    state: str | None = None          # the place this law is limited to, if any
+    union_territory: bool = False     # Parliament enacted it for that territory
     category: str = ""
     # grading
     relevant: bool | None = None
@@ -94,7 +95,12 @@ class Evidence:
 
     @property
     def jurisdiction(self) -> str:
-        """CENTRAL, STATE, CONSTITUTION or empty — never a guess.
+        """CENTRAL, STATE, TERRITORY, CONSTITUTION or empty — never a guess.
+
+        TERRITORY is an Act Parliament passed for a Union Territory: not state law, because a
+        state legislature did not make it, and not all-India law, because it only reaches that
+        territory. Labelling those CENTRAL is how the Delhi Rent Act reached someone in Mumbai
+        described as applying across India.
 
         Read from the Act's own title, because the corpus's ``jurisdiction`` column says
         ``central`` for every row including the state Acts that leaked into it (DB README §9).
@@ -105,7 +111,9 @@ class Evidence:
             return ""
         if self.source_type == "constitution":
             return "CONSTITUTION"
-        return "STATE" if self.state else "CENTRAL"
+        if self.state:
+            return "TERRITORY" if self.union_territory else "STATE"
+        return "CENTRAL"
 
     @property
     def jurisdiction_label(self) -> str:
@@ -114,6 +122,9 @@ class Evidence:
             return "Constitution of India — applies nationwide"
         if self.jurisdiction == "STATE":
             return f"{self.state} state law — applies only in {self.state}"
+        if self.jurisdiction == "TERRITORY":
+            return (f"Central Act for {self.state} only — Parliament passed it for {self.state}, "
+                    f"and it does not apply elsewhere in India")
         if self.jurisdiction == "CENTRAL":
             return "Central law — applies across India"
         return ""
@@ -122,7 +133,7 @@ class Evidence:
         """Does this apply where the user is? ``None`` when we cannot tell."""
         if self.jurisdiction in ("CENTRAL", "CONSTITUTION"):
             return True
-        if self.jurisdiction == "STATE":
+        if self.jurisdiction in ("STATE", "TERRITORY"):
             if not user_state:
                 return None
             return user_state.strip().lower() == (self.state or "").strip().lower()
@@ -160,6 +171,7 @@ class Evidence:
             "status": self.status,
             "effective_date": self.effective_date,
             "state": self.state,
+            "union_territory": self.union_territory,
             "jurisdiction": self.jurisdiction,
             "jurisdiction_label": self.jurisdiction_label,
             "category": self.category,
@@ -209,5 +221,6 @@ def from_hit(hit, query: str = "") -> Evidence:
         effective_date=hit.effective_date,
         source_snapshot=hit.source_snapshot,
         state=hit.state,
+        union_territory=getattr(hit, "union_territory", False),
         category=hit.category,
     )

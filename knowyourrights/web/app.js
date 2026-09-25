@@ -224,11 +224,15 @@ function renderSources() {
       badges.push('<span class="badge juris central">Central law · all India</span>');
     } else if (s.jurisdiction === 'CONSTITUTION') {
       badges.push('<span class="badge juris central">Constitution · all India</span>');
-    } else if (s.jurisdiction === 'STATE') {
+    } else if (s.jurisdiction === 'STATE' || s.jurisdiction === 'TERRITORY') {
+      // A Union Territory Act was passed by Parliament but still reaches only that territory,
+      // so it gets the same "only here" treatment as state law — the reader's question is
+      // "does this apply to me", not "who enacted it".
       const mismatch = userState && s.state &&
                        userState.toLowerCase() !== s.state.toLowerCase();
+      const kind = s.jurisdiction === 'TERRITORY' ? 'Central Act, ' : '';
       badges.push(`<span class="badge juris ${mismatch ? 'mismatch' : 'state'}">`
-        + `${esc(s.state)} only${mismatch ? ` — not ${esc(userState)}` : ''}</span>`);
+        + `${kind}${esc(s.state)} only</span>`);
     }
 
     if (s.status === 'in_force') badges.push('<span class="badge force">in force</span>');
@@ -240,7 +244,8 @@ function renderSources() {
       ? `<a href="${esc(s.url)}" target="_blank" rel="noopener noreferrer">${esc(s.title)}</a>`
       : esc(s.title);
 
-    const mismatched = s.jurisdiction === 'STATE' && userState && s.state &&
+    const mismatched = (s.jurisdiction === 'STATE' || s.jurisdiction === 'TERRITORY') &&
+                       userState && s.state &&
                        userState.toLowerCase() !== s.state.toLowerCase();
     return `<div class="src${mismatched ? ' mismatch' : ''}" id="src-${esc(s.id)}"
                  data-kind="${esc(s.kind)}">
@@ -250,8 +255,9 @@ function renderSources() {
       ${s.domain ? `<div class="domain">${esc(s.domain)}</div>` : ''}
       <div class="snippet">${esc(s.snippet)}</div>
       ${badges.length ? `<div class="meta">${badges.join('')}</div>` : ''}
-      ${mismatched ? `<div class="warn-line">This is ${esc(s.state)} law and does not
-        apply in ${esc(userState)}.</div>` : ''}
+      ${mismatched ? `<div class="warn-line">${esc(s.state)} law — it governs matters located
+        in ${esc(s.state)}, such as a flat or workplace there, even though you selected
+        ${esc(userState)}. It does not govern matters in ${esc(userState)}.</div>` : ''}
     </div>`;
   }).join('');
 }
@@ -395,6 +401,8 @@ function handleEvent(ev) {
       statEl.textContent = [
         `${ev.elapsed_s}s`, `${ev.llm_calls} calls`,
         ev.crawls ? `${ev.crawls} pages read` : '',
+        // What this question was billed, from each response's own usage.cost.
+        typeof ev.cost_usd === 'number' ? `$${ev.cost_usd.toFixed(4)}` : '',
         ev.throttled ? 'rate-limited' : '',
       ].filter(Boolean).join(' · ');
       break;

@@ -54,15 +54,36 @@ class Hit:
     chunk_text: str = ""
     score: float = 0.0
     rrf_score: float = 0.0
+    # The place this law is limited to, or None if it applies across India. Filled for state
+    # Acts *and* for Acts Parliament passed for a Union Territory — both are territorially
+    # limited, which is the fact a reader needs.
     state: str | None = None
+    union_territory: bool = False    # True when Parliament enacted it for that territory
+
+    @property
+    def is_territorial(self) -> bool:
+        """Applies only in one place — the question that decides whether it governs a reader."""
+        return self.state is not None
 
     @property
     def is_state_law(self) -> bool:
-        return self.state is not None
+        """Passed by a state legislature. Narrower than :attr:`is_territorial`."""
+        return self.state is not None and not self.union_territory
 
     @property
     def is_omitted(self) -> bool:
         return (self.status or "").lower() == "omitted"
+
+
+def _extent(act_title: str) -> dict:
+    """Where an Act applies, read from its title: a state, a Union Territory, or everywhere."""
+    state = legal_terms.is_state_law(act_title, config.STATE_PREFIXES)
+    if state:
+        return {"state": state, "union_territory": False}
+    territory = legal_terms.territory_of(act_title, config.TERRITORY_PREFIXES)
+    if territory:
+        return {"state": territory, "union_territory": True}
+    return {"state": None, "union_territory": False}
 
 
 @dataclass
@@ -430,7 +451,7 @@ class SearchEngine:
             score=round(float(score), 4),
             rrf_score=round(float(fused.get(row.chunk_id, 0.0)), 6),
             # Trust the title, never the `jurisdiction` column (DB README §9).
-            state=legal_terms.is_state_law(act_title, config.STATE_PREFIXES),
+            **_extent(act_title),
         )
 
     # ── exact lookup ─────────────────────────────────────────────────────────────────

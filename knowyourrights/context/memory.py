@@ -62,28 +62,69 @@ class Conversation:
         return self.turns[self._summarised_upto:max(self._summarised_upto, len(self.turns) - keep)]
 
     def set_summary(self, text: str, upto: int) -> None:
+        """Replace the summary. It is a *rolling* summary: each update is produced from the
+        previous summary plus the newly folded turns, so it stays one bounded paragraph.
+
+        It used to be appended to instead — old text, a newline, then the new text — and never
+        re-compressed, so it grew without limit and eventually consumed the entire history
+        budget.
+        """
         self.summary = text.strip()
-        self._summarised_upto = upto
+        self._summarised_upto = max(self._summarised_upto, upto)
 
     def history_block(self, max_tokens: int = 900) -> str:
-        """Compact recent context so the planner can resolve "it" and "that fine".
+        """Compact context so the planner and writer can resolve "it" and "that fine".
 
-        Citation markers are stripped from past answers. Ids are assigned per turn, so a
-        ``[S6]`` in yesterday's answer means something different — or nothing — today, and the
-        writer will happily copy it forward. Observed live: an answer cited [S6] and [S7] from
-        the previous turn and annotated its own uncertainty about them mid-sentence.
+        **Newest first.** The budget is spent on the most recent exchange before anything
+        older, and on the user's state before any of it. This used to be built oldest-first
+        and then trimmed by keeping the *start* — so once history passed ~900 tokens (the
+        second or third follow-up, with real answers) the most recent exchange and the user's
+        state were the first things cut. "What about the appeal?" lost the answer it referred to.
+
+        **The in-flight question is excluded.** The orchestrator records the user's message
+        before planning, so without this the current question appeared twice — once in its own
+        history and once as the question — in every prompt.
+
+        Citation markers are stripped from past answers. Ids are assigned per turn, so a ``[S6]``
+        in an earlier answer means something different — or nothing — now, and the writer will
+        copy it forward. Observed live.
         """
-        parts: list[str] = []
-        if self.summary:
-            parts.append(f"EARLIER IN THIS CONVERSATION:\n{_strip_markers(self.summary)}")
-        lines = [f"{t.role.upper()}: {_strip_markers(t.content)}"
-                 for t in self.recent() if t.content]
-        if lines:
-            parts.append("RECENT TURNS:\n" + "\n".join(lines))
-        if self.state:
-            parts.append(f"USER'S STATE: {self.state}")
-        block = "\n\n".join(parts)
-        return fit_to_tokens(block, max_tokens) if block else ""
+        turns = list(self.turns[self._summarised_upto:])
+        if turns and turns[-1].role == "user":
+            turns = turns[:-1]                      # the question being answered right now
+        turns = turns[-config.HISTORY_TURNS_VERBATIM * 2:]
+
+        head = f"USER'S STATE: {self.state}" if self.state else ""
+        budget = max(0, max_tokens - estimate_tokens(head))
+
+        # Walk backwards, keeping whole turns while they fit. Each past answer is capped on its
+        # own first: what a follow-up needs is what was answered, not all 3,000 characters of it,
+        # and one long answer should not be able to evict every turn before it.
+        kept: list[str] = []
+        for turn in reversed(turns):
+            if not turn.content:
+                continue
+            body = _strip_markers(turn.content)
+            if turn.role == "assistant":
+                body = fit_to_tokens(body, config.HISTORY_ANSWER_CAP_TOKENS)
+            line = f"{turn.role.upper()}: {body}"
+            cost = estimate_tokens(line) + 1
+            if cost > budget:
+                if not kept:
+                    # Always keep *something* of the latest exchange, trimmed to fit.
+                    kept.append(fit_to_tokens(line, budget))
+                break
+            kept.append(line)
+            budget -= cost
+        kept.reverse()
+
+        parts: list[str] = [head] if head else []
+        if self.summary and budget > 40:
+            parts.append("EARLIER IN THIS CONVERSATION:\n"
+                         + fit_to_tokens(_strip_markers(self.summary), budget))
+        if kept:
+            parts.append("RECENT TURNS:\n" + "\n".join(kept))
+        return "\n\n".join(parts)
 
     # ── evidence pool ────────────────────────────────────────────────────────────────
     def remember(self, item: Evidence) -> None:
@@ -98,15 +139,20 @@ class Conversation:
         Word overlap rather than embeddings: this runs on every turn and only needs to decide
         whether last turn's sections are worth re-showing, which does not justify a GPU call.
         """
-        words = {w for w in _words(question) if len(w) > 3}
+        words = {w for w in _words(question) if len(w) > 3} - _STOPWORDS
         if not words:
             return []
         scored: list[tuple[float, Evidence]] = []
         for item in self.pool.values():
             haystack = _words(f"{item.label()} {item.text[:600]}")
             overlap = len(words & haystack)
-            if overlap >= 2:
-                scored.append((overlap / len(words), item))
+            share = overlap / len(words)
+            # Two shared words was the whole test, and "legal" plus "under" clears that for
+            # almost any pair of legal texts — so rent-deposit pages were recalled for a
+            # domestic-violence question. Require a real share of the question's own words.
+            # (The grader now also sees everything recalled, so this is a pre-filter.)
+            if overlap >= 2 and share >= config.RECALL_MIN_SHARE:
+                scored.append((share, item))
         scored.sort(key=lambda pair: -pair[0])
         return [item for _, item in scored[:limit]]
 
@@ -122,6 +168,15 @@ class Conversation:
         self.summary = ""
         self.topic = ""
         self._summarised_upto = 0
+
+
+# Words that appear in nearly every legal question and prove nothing about topic.
+_STOPWORDS = frozenset({
+    "what", "which", "when", "where", "does", "have", "with", "that", "this", "from", "your",
+    "they", "them", "their", "there", "about", "under", "legal", "law", "laws", "india",
+    "indian", "right", "rights", "can", "will", "would", "should", "must", "been", "into",
+    "section", "act", "person", "provision", "case", "file", "make", "take", "also",
+})
 
 
 def _words(text: str) -> set[str]:

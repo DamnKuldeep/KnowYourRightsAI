@@ -82,7 +82,7 @@ async def run_stress(engine) -> dict:
     rows = []
     for case in STRESS:
         result = await engine.search([legal_terms.expand(case.query)], rerank_with=case.query)
-        flagged_state = any(h.is_state_law for h in result.hits)
+        flagged_state = any(h.is_territorial for h in result.hits)
         rows.append({
             "query": case.query, "abstain": result.abstain, "top": result.top_score,
             "state": flagged_state, "expect_state": case.expect_state,

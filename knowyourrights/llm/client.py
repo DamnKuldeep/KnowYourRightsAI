@@ -99,6 +99,14 @@ def _retry_after(response: httpx.Response) -> float | None:
     return None
 
 
+def _is_parameter_complaint(body: str) -> bool:
+    """Does a 400 blame one of our optional request fields rather than the model itself?"""
+    lowered = (body or "").lower()
+    return any(k in lowered for k in ("reasoning", "chat_template_kwargs", "unsupported param",
+                                      "unrecognized", "unknown field", "extra inputs",
+                                      "not permitted", "response_format"))
+
+
 def _is_unknown_model(response: httpx.Response, body: str) -> bool:
     # 410 Gone is how the catalogue reports a *retired* model — which is exactly the case the
     # alternates list exists for. (Observed live: llama-3.2-nv-rerankqa-1b-v2 now returns 410.)
@@ -122,6 +130,9 @@ class NimClient:
         self._limiters = get_limiters()
         self._ledger = get_ledger()
         self._rerank_url_cache: dict[str, str] = {}
+        # Models that answered 400 to an optional parameter (the `reasoning` switch). They are
+        # retried once without it and remembered, rather than treated as broken.
+        self._no_optional_params: set[str] = set()
 
     def _endpoint(self, provider: str) -> tuple[str, dict]:
         """Base URL and headers for a provider. Both speak OpenAI chat-completions."""
@@ -189,6 +200,17 @@ class NimClient:
                 raise NimUnavailable(f"{stage}: no usable model for role {role!r}")
             return nxt
 
+        # A 400 about an optional parameter is not a broken model. Some upstreams reject the
+        # `reasoning` switch outright; left to the generic handler below, that raised, and
+        # inside chat_json the exception was swallowed into the caller's *default* — so the
+        # stage silently returned a generic fallback plan on every single call instead of
+        # failing over. Retry the same model without the optional keys, once, and remember.
+        if (response.status_code in (400, 422) and model not in self._no_optional_params
+                and _is_parameter_complaint(body)):
+            self._no_optional_params.add(model)
+            log.info("%s rejected an optional parameter — retrying without it", model)
+            return spec
+
         # OpenRouter answers 402 when the free allowance is spent, and 403 when a model is
         # gated. Neither is retryable on that model, but the other provider may still work.
         if role is not None and response.status_code in (402, 403):
@@ -212,6 +234,16 @@ class NimClient:
                     return nxt
             await self._backoff(attempt, stage, deadline)
             return spec
+
+        # Any other 400 on a role-bound call means *this model* cannot serve the request. Try
+        # the next one. Raising here instead turns into a silent default inside chat_json.
+        if role is not None and response.status_code in (400, 422):
+            self._ledger.record_error(model, "bad_request", session, stage, body)
+            nxt = registry.mark_unavailable(model, f"HTTP {response.status_code}: {body[:80]}")
+            if nxt is not None and nxt.key != model:
+                log.warning("%s rejected the request (%s) — switching to %s",
+                            model, response.status_code, nxt.key)
+                return nxt
 
         # 401/403 and other client errors are configuration problems; retrying won't help.
         self._ledger.record_error(model, "error", session, stage, body)
@@ -250,7 +282,10 @@ class NimClient:
         # chat-template flag; OpenRouter has its own `reasoning` block and rejects unknown keys
         # on some upstreams, so each provider gets the form it understands.
         want_thinking = spec.thinking if thinking is None else thinking
-        if not want_thinking:
+        if stream and spec.provider == "openrouter":
+            # The final frame then carries `usage.cost`, which is how spend is measured.
+            payload["stream_options"] = {"include_usage": True}
+        if not want_thinking and spec.key not in self._no_optional_params:
             if spec.provider == "openrouter":
                 payload["reasoning"] = {"enabled": False}
             else:
@@ -278,7 +313,7 @@ class NimClient:
             model = spec.key
             base, headers = self._endpoint(spec.provider)
             await self._await_slot(model, spec.rpm, on_pause)
-            self._ledger.note_provider_call(spec.provider)
+            self._ledger.note_provider_call(spec.provider, spec.id)
             started = time.monotonic()
             try:
                 response = await self.client.post(
@@ -301,7 +336,7 @@ class NimClient:
                     model, seconds=time.monotonic() - started,
                     prompt_tokens=usage.get("prompt_tokens", 0),
                     completion_tokens=usage.get("completion_tokens", 0),
-                    session=session, stage=stage,
+                    session=session, stage=stage, cost_usd=usage.get("cost") or 0.0,
                 )
                 choices = data.get("choices") or []
                 if not choices:
@@ -373,6 +408,7 @@ class NimClient:
         session: str = "",
         thinking: bool | None = None,
         on_reasoning: Callable[[str], None] | None = None,
+        on_finish: Callable[[str], None] | None = None,
     ) -> AsyncIterator[str]:
         """Yield text deltas.
 
@@ -391,7 +427,7 @@ class NimClient:
             model = spec.key
             base, headers = self._endpoint(spec.provider)
             await self._await_slot(model, spec.rpm, on_pause)
-            self._ledger.note_provider_call(spec.provider)
+            self._ledger.note_provider_call(spec.provider, spec.id)
             started = time.monotonic()
             payload = self._chat_payload(spec, messages, temperature, max_tokens,
                                          stream=True, thinking=thinking)
@@ -406,32 +442,81 @@ class NimClient:
                         continue
 
                     emitted = 0
-                    async for line in response.aiter_lines():
-                        # OpenRouter sends ": OPENROUTER PROCESSING" comment frames as
-                        # keep-alives; SSE comments start with ':' and carry no payload.
-                        if not line or not line.startswith("data:"):
-                            continue
-                        chunk = line[5:].strip()
-                        if chunk == "[DONE]":
-                            break
-                        try:
-                            event = json.loads(chunk)
-                        except ValueError:
-                            continue
-                        for choice in event.get("choices") or []:
-                            delta = choice.get("delta") or {}
-                            thought = delta.get("reasoning_content")
-                            if thought and on_reasoning is not None:
-                                on_reasoning(thought)
-                            text = delta.get("content")
-                            if text:
-                                emitted += len(text)
-                                yield text
+                    stream_cost = 0.0
+                    finish: str | None = None
+                    saw_done = False
+                    stream_error = ""
+                    try:
+                        async for line in response.aiter_lines():
+                            # OpenRouter sends ": OPENROUTER PROCESSING" comment frames as
+                            # keep-alives; SSE comments start with ':' and carry no payload.
+                            if not line or not line.startswith("data:"):
+                                continue
+                            chunk = line[5:].strip()
+                            if chunk == "[DONE]":
+                                saw_done = True
+                                break
+                            try:
+                                event = json.loads(chunk)
+                            except ValueError:
+                                continue
+                            # A failure after the 200 arrives as an error frame, not a status.
+                            # Skipping it made an aborted answer look finished.
+                            if event.get("error"):
+                                stream_error = str(event["error"])[:200]
+                                break
+                            if event.get("usage"):
+                                stream_cost = float(event["usage"].get("cost") or 0.0)
+                            for choice in event.get("choices") or []:
+                                delta = choice.get("delta") or {}
+                                thought = delta.get("reasoning_content")
+                                if thought and on_reasoning is not None:
+                                    on_reasoning(thought)
+                                text = delta.get("content")
+                                if text:
+                                    emitted += len(text)
+                                    yield text
+                                if choice.get("finish_reason"):
+                                    finish = choice["finish_reason"]
+                    except (httpx.TimeoutException, httpx.TransportError) as exc:
+                        # Once text has gone out we cannot rewind. Retrying here opened a fresh
+                        # stream and re-yielded the answer from the start — the reader watched
+                        # it begin again mid-paragraph. Keep what arrived and say so instead.
+                        if emitted:
+                            self._ledger.record_error(model, "transport_midstream", session,
+                                                      stage, str(exc))
+                            if on_finish is not None:
+                                on_finish("interrupted")
+                            return
+                        raise
+
+                    if stream_error and not emitted:
+                        # Nothing reached the reader, so this is an ordinary failure: retry, or
+                        # move to the next model.
+                        self._ledger.record_error(model, "stream_error", session, stage,
+                                                  stream_error)
+                        nxt = registry.mark_unavailable(model, f"stream error: {stream_error[:60]}")
+                        if nxt is not None and nxt.key != model:
+                            spec = nxt
+                        await self._backoff(attempt, stage, deadline)
+                        continue
 
                     registry.mark_available(model)
                     self._ledger.record_call(model, seconds=time.monotonic() - started,
                                              completion_tokens=emitted // 4,
-                                             session=session, stage=stage)
+                                             session=session, stage=stage,
+                                             cost_usd=stream_cost)
+                    if on_finish is not None:
+                        if stream_error:
+                            on_finish("interrupted")
+                        elif finish == "length":
+                            on_finish("length")
+                        elif finish or saw_done:
+                            on_finish("stop")
+                        else:
+                            # The server closed the stream with neither [DONE] nor a finish
+                            # reason — the body just stopped. That is a truncation.
+                            on_finish("interrupted")
                     return
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 self._ledger.record_error(model, "transport", session, stage, str(exc))

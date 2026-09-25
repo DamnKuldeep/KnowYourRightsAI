@@ -86,6 +86,7 @@ class Reranker:
         self._warm = False
         self.calls = 0
         self.docs_scored = 0
+        self._budget_warned = False
 
     @property
     def plan(self) -> resources.ResourcePlan:
@@ -97,6 +98,8 @@ class Reranker:
     def backend(self) -> str:
         """What we will actually use on the next call."""
         want = self.plan.rerank_backend
+        if want == "api":
+            return "api" if config.OPENROUTER_API_KEY else "none"
         if want == "local" and self._local_failed is None:
             return "local"
         if want in ("local", "nim") and self._nim_failed is None and config.NVIDIA_API_KEY:
@@ -111,6 +114,11 @@ class Reranker:
             # lists alone; `cpu_lean` fuses dense and BM25. Sharing one key across both means
             # calibrating either one silently mis-thresholds the other, so they are kept apart.
             return "rrf" if self.plan.use_embedder else "rrf-bm25"
+        if self.backend == "api":
+            # Named so calibration cannot be shared with the local cross-encoder: this is a
+            # different model on a different score scale, and reusing a threshold across them
+            # breaks abstention silently.
+            return config.RERANK_API_MODEL
         if self.backend == "local":
             # Quantisation and a shorter input both move the score distribution without changing
             # the model's name, so a threshold calibrated for one is wrong for the other — and
@@ -246,6 +254,30 @@ class Reranker:
             # The profile says rank on fusion scores alone. Reaching for a remote reranker here
             # would spend API calls the operator explicitly opted out of.
             return None
+
+        if self.plan.rerank_backend == "api":
+            # The whole reason this backend exists: the same 8 documents cost 6,625 ms on one
+            # physical CPU core and ~830 ms here. Falling back to fused RRF on failure is
+            # deliberate — it is a real, calibrated ranking mode, so a dead endpoint costs
+            # ranking quality rather than the answer.
+            from ..llm import retrieval_api
+
+            if retrieval_api.session().cost_usd >= config.RETRIEVAL_API_BUDGET_USD > 0:
+                if not self._budget_warned:
+                    self._budget_warned = True
+                    log.warning("retrieval API budget of $%.2f is spent — ranking on fused RRF "
+                                "scores from here. Raise KYR_RETRIEVAL_API_BUDGET_USD to continue.",
+                                config.RETRIEVAL_API_BUDGET_USD)
+                return None
+            try:
+                scores = await retrieval_api.rerank(
+                    query, docs, on_pause=on_pause, deadline=deadline)
+                self.calls += 1
+                self.docs_scored += len(docs)
+                return scores
+            except retrieval_api.RetrievalApiError as exc:
+                log.warning("reranking API unavailable (%s) — ranking on fused RRF scores", exc)
+                return None
 
         if self.plan.rerank_backend == "local" and await self._ensure_local():
             pairs = [[query, d] for d in docs]

@@ -145,7 +145,7 @@ async def abstention_quality(engine) -> dict:
     state_cases = [c for c in STRESS if c.expect_state]
     for case in state_cases:
         r = await engine.search([legal_terms.expand(case.query)], rerank_with=case.query)
-        if any(h.is_state_law for h in r.hits):
+        if any(h.is_territorial for h in r.hits):
             state_flagged += 1
 
     return {

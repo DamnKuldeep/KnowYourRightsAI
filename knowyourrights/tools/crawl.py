@@ -278,9 +278,13 @@ class Crawler:
                 memory_threshold_percent=88.0,
                 max_session_permit=config.CRAWL_MAX_CONCURRENT,
             )
+            # Each page already carries its own page_timeout, so this is only a backstop for a
+            # hung dispatcher. It was CRAWL_TIMEOUT_S * 2 + 20 — seventy seconds — and because a
+            # batch timeout returns nothing, one stuck page discarded every page that had
+            # already loaded. A small margin over the per-page limit is all it needs.
             results = await asyncio.wait_for(
                 crawler.arun_many(urls=urls, config=run_config, dispatcher=dispatcher),
-                timeout=config.CRAWL_TIMEOUT_S * 2 + 20,
+                timeout=config.CRAWL_TIMEOUT_S + 8,
             )
         except asyncio.TimeoutError:
             self.failures += len(urls)

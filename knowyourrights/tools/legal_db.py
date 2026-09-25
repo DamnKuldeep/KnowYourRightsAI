@@ -51,6 +51,11 @@ async def search(query: str, *, top_k: int | None = None, variants: list[str] | 
                 f"[STATE LAW — this is {hit.state} legislation and applies only there; "
                 f"the database holds central law, so the user's own state may differ.]"
             )
+        elif hit.is_territorial:
+            notes.append(
+                f"[{hit.state.upper()} ONLY — Parliament passed this for {hit.state}, and it does "
+                f"not apply anywhere else in India. Do not present it as all-India law.]"
+            )
         if hit.is_omitted:
             notes.append("[OMITTED — this provision has been removed and is no longer in force.]")
         if notes:

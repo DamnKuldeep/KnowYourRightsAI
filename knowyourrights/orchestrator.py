@@ -83,6 +83,7 @@ class TurnState:
     # Ledger totals are process-lifetime; a turn needs its own delta or the UI reports the
     # server's whole history as the cost of one question.
     calls_at_start: int = 0
+    cost_at_start: float = 0.0          # same idea for dollars: this turn's spend is a delta
     plan: Plan | None = None
     evidence: list[Evidence] = field(default_factory=list)
     procedure: Procedure | None = None
@@ -90,6 +91,10 @@ class TurnState:
     answer: str = ""
     query_variants: list[str] | None = None
     verification_note: str = ""
+    # What the final answer was written from. Recorded by the writer and committed to the
+    # conversation exactly once, when the turn ends — see Orchestrator._commit.
+    final_evidence: list[Evidence] = field(default_factory=list)
+    committed: bool = False
     cancelled: asyncio.Event = field(default_factory=asyncio.Event)
     started: float = field(default_factory=time.monotonic)
 
@@ -99,6 +104,8 @@ class Orchestrator:
         self.client = get_client()
         self.ledger = get_ledger()
         self._active: dict[str, TurnState] = {}
+        # asyncio holds only weak references to tasks; keep ours until they complete.
+        self._background: set[asyncio.Task] = set()
 
     # ── public entry point ───────────────────────────────────────────────────────────
     async def stream(self, message: str, conversation: Conversation, *,
@@ -115,6 +122,7 @@ class Orchestrator:
             conversation=conversation,
             budget=TurnBudget.for_depth(depth if depth in config.DEPTHS else "standard"),
             calls_at_start=self.ledger.total_calls,
+            cost_at_start=_spend_so_far(self.ledger),
         )
         self._active[turn_id] = turn
 
@@ -170,6 +178,7 @@ class Orchestrator:
             log.exception("turn failed")
             emit(events.error(f"Something went wrong: {str(exc)[:200]}"))
         finally:
+            self._commit(turn)
             emit(events.usage(**self._usage(turn)))
             emit(events.done(elapsed_s=round(time.monotonic() - turn.started, 1)))
             emit(None)
@@ -178,19 +187,39 @@ class Orchestrator:
         conversation = turn.conversation
         conversation.add_user(turn.message)
 
-        # 1 — emergencies come before research, and before any model call. Patterns decide
-        # instantly; the meaning tier adds one embedding, which retrieval then reads from cache,
-        # so the paraphrases that patterns cannot reach cost the turn nothing. Never raises.
-        check = await safety.check(turn.message)
-        if check.urgent:
-            emit(events.safety(list(config.HELPLINES), check.reason))
+        # 1 — emergencies come before research. Patterns decide instantly, with no model and no
+        # network, so a literal disclosure gets its helpline card before anything else happens.
+        # The meaning tier needs one embedding (~0.4 s) and runs *alongside* the planner rather
+        # than in front of it: it used to block planning for that long on every single turn.
+        # Neither can delay the other — a rate-limited planner cannot hold back a helpline
+        # number, and the card is still out before research starts, which is the guarantee.
+        literal = safety.check_patterns(turn.message)
+        if literal.urgent:
+            emit(events.safety(list(config.HELPLINES), literal.reason))
+            safety_task = None
+        else:
+            safety_task = asyncio.create_task(safety.check(turn.message))
+
+            def _on_safety(task: asyncio.Task) -> None:
+                if task.cancelled() or task.exception() is not None:
+                    return
+                if task.result().urgent:
+                    emit(events.safety(list(config.HELPLINES), task.result().reason))
+
+            safety_task.add_done_callback(_on_safety)
 
         # 2 — plan
         emit(events.stage("plan", "Understanding your question"))
         history = conversation.history_block()
-        turn.plan = await stages.make_plan(
-            turn.message, history, forced_depth=requested_depth,
-            deadline=turn.budget.deadline, on_pause=on_pause, session=turn.session_id)
+        try:
+            turn.plan = await stages.make_plan(
+                turn.message, history, forced_depth=requested_depth,
+                deadline=turn.budget.deadline, on_pause=on_pause, session=turn.session_id)
+        finally:
+            if safety_task is not None:
+                # Settled before research begins, so the card always precedes it. Normally it
+                # finished long ago; the planner takes three times as long.
+                await asyncio.gather(safety_task, return_exceptions=True)
         plan = turn.plan
 
         # The planner's own depth choice governs unless the user forced one.
@@ -223,8 +252,19 @@ class Orchestrator:
             emit(events.tool("legal_db", "exact citation lookup", "done", count=len(exact)))
             turn.evidence.extend(exact)
 
-        # 4 — research rounds
-        await self._research(turn, emit, on_pause)
+        # 4 — research rounds. A quick question that names a provision is *answered* by the
+        # exact lookup, so it skips research entirely. It used to run a semantic search anyway,
+        # which mixed fuzzy hits in with the verbatim provision — and that is what then made
+        # the evidence gradable, so it paid for a grader call too. "What does Article 21 say"
+        # spent 2.7 s of its 4.4 s first-token time on work that could not change the answer.
+        if exact and turn.budget.depth == "quick":
+            assign_ids(turn.evidence)
+            emit(events.stage("grade", "Checking which sources are actually relevant", "done",
+                              detail="exact citation — no search or grading needed"))
+            for item in turn.evidence:
+                emit(events.source(item))
+        else:
+            await self._research(turn, emit, on_pause)
 
         # 5 — procedure extraction, when the question is a how-to
         if plan.answer_kind in ("procedure", "mixed") and not turn.budget.expired:
@@ -235,6 +275,20 @@ class Orchestrator:
         await self._self_verify(turn, emit, on_pause)
 
     # ── research loop ────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _recall(turn: TurnState) -> list[Evidence]:
+        """Sources vetted earlier in this conversation that may bear on this question.
+
+        Returned to the research round so they go through the grader with everything else.
+        Matched on the planner's standalone restatement: "and how long can they keep me"
+        shares almost no words with the sections it is really asking about.
+        """
+        plan = turn.plan
+        present = {e.dedupe_key() for e in turn.evidence}
+        recalled = [e for e in turn.conversation.recall(plan.normalized_query or turn.message)
+                    if e.dedupe_key() not in present]
+        return recalled[:3]
+
     async def _research(self, turn: TurnState, emit, on_pause) -> None:
         plan = turn.plan
         steps = list(plan.steps)
@@ -247,6 +301,8 @@ class Orchestrator:
                 emit(events.stage(f"round{round_no}", f"Digging deeper (round {round_no})"))
 
             gathered = await self._run_steps(turn, steps, emit, on_pause, seen_queries)
+            if round_no == 1:
+                gathered += self._recall(turn)
             turn.evidence = dedupe(turn.evidence + gathered)
             assign_ids(turn.evidence)
 
@@ -335,11 +391,14 @@ class Orchestrator:
                 if turn.plan and turn.plan.language != "en" and turn.plan.normalized_query:
                     query = turn.plan.normalized_query
 
-                # Reformulations are written once per turn, not once per step. A planner that
-                # emits three statute steps would otherwise cost three extra model calls for
-                # variants of the same question, and multi-query fusion already searches every
-                # variant against every step.
-                if turn.query_variants is None and turn.budget.depth != "quick":
+                # Reformulations are written once per turn, not once per step — and only in deep
+                # mode. It used to run at standard depth too, as a serial model call between the
+                # plan and the search. Measured, that call bought nothing: the gold set reaches
+                # Recall@5 100% searching only the question and its acronym expansion, with no
+                # model-written variants at all. It cost ~1 s of first-token time on every
+                # standard question. Deep mode keeps it, because multi-round gap-filling is where
+                # differently-phrased searches actually find new material.
+                if turn.query_variants is None and turn.budget.depth == "deep":
                     written = await stages.write_queries(
                         turn.plan.normalized_query or turn.message,
                         deadline=turn.budget.deadline, on_pause=on_pause,
@@ -459,10 +518,11 @@ class Orchestrator:
         plan = turn.plan
         conversation = turn.conversation
 
-        # Sections already vetted earlier in this conversation are free to reuse.
-        recalled = [e for e in conversation.recall(turn.message)
-                    if e.dedupe_key() not in {x.dedupe_key() for x in turn.evidence}]
-        items = assign_ids(dedupe(turn.evidence + recalled[:3]))
+        # Earlier turns' evidence is recalled during research, *before* grading — see
+        # _recall_into. It used to be added here, after the grader had run, so nothing checked
+        # it: a deposit question showed arrest provisions from two turns back, and a domestic-
+        # violence question listed "Recover Rental Security Deposit" pages as its sources.
+        items = assign_ids(dedupe(turn.evidence))
 
         history = conversation.history_block(600)
         context = prompts.writer_context(plan, conversation.state, turn.notes,
@@ -500,6 +560,7 @@ class Orchestrator:
         label = "Rewriting with the confirmed details" if revision else "Writing the answer"
         emit(events.stage("write", label))
         collected: list[str] = []
+        ending: list[str] = []
         try:
             stream = self.client.chat_stream(
                 [{"role": "system", "content": prompts.WRITER},
@@ -507,6 +568,7 @@ class Orchestrator:
                 role="writer", stage="write", deadline=turn.budget.deadline + 45,
                 on_pause=on_pause, session=turn.session_id,
                 on_reasoning=lambda delta: emit(events.reasoning(delta)),
+                on_finish=ending.append,
             )
             async for delta in stream:
                 if turn.cancelled.is_set():
@@ -527,12 +589,20 @@ class Orchestrator:
                 for line in digest.splitlines(keepends=True):
                     emit(events.token(line))
                 turn.answer = digest
-                conversation.add_assistant(digest, packed.included)
+                turn.final_evidence = list(packed.included)
                 emit(events.verdict(len(packed.included), [],
                                     coverage="written without the model", degraded=True))
                 return
 
         answer = "".join(collected)
+        # An answer that stopped early looks, on screen, exactly like one that finished. Say so —
+        # a reader who assumes they have the whole procedure may miss the step that was cut.
+        if answer.strip() and ending and ending[-1] == "length":
+            emit(events.notice("This answer reached its length limit and may be cut short. "
+                               "Ask a narrower follow-up for the rest.", level="warn"))
+        elif answer.strip() and ending and ending[-1] == "interrupted":
+            emit(events.notice("The connection dropped while this answer was being written, so "
+                               "it may be incomplete.", level="warn"))
         if not answer.strip():
             # The stream ended cleanly and produced nothing. No exception is raised for this, so
             # without an explicit check the turn completes "successfully": citations verify
@@ -548,7 +618,7 @@ class Orchestrator:
             for line in digest.splitlines(keepends=True):
                 emit(events.token(line))
             turn.answer = digest
-            conversation.add_assistant(digest, packed.included)
+            turn.final_evidence = list(packed.included)
             emit(events.verdict(len(packed.included), [],
                                 coverage="written without the model", degraded=True))
             emit(events.stage("write", label, "done"))
@@ -570,17 +640,51 @@ class Orchestrator:
                 level="warn"))
 
         emit(events.stage("write", label, "done"))
-        conversation.add_assistant(cleaned, packed.included)
+        turn.final_evidence = list(packed.included)
 
-        if conversation.needs_summary:
-            pending = conversation.pending_for_summary()
-            if pending:
-                text = "\n".join(f"{t.role}: {t.content}" for t in pending)
-                summary = await stages.summarise(text, session=turn.session_id)
-                if summary:
-                    conversation.set_summary(
-                        (conversation.summary + "\n" + summary).strip(),
-                        len(conversation.turns) - config.HISTORY_TURNS_VERBATIM * 2)
+    # ── committing the turn ──────────────────────────────────────────────────────────
+    def _commit(self, turn: TurnState) -> None:
+        """Record the answer in the conversation — once, whatever path the turn took.
+
+        This used to happen inside the writer, which is called twice in deep mode: once for the
+        draft and again after self-verification rewrites it. Each call stored its answer, so the
+        history held the question, the draft *and* the revision — and the draft was precisely the
+        text verification had just found wrong about a fee or a deadline, now being fed back
+        into later turns as if it were a real answer. Committing here, in the ``finally`` every
+        exit passes through, stores the final text exactly once. A turn the user stopped part
+        way keeps what they saw, because a follow-up may well refer to it.
+        """
+        if turn.committed or not turn.answer.strip():
+            return
+        turn.committed = True
+        conversation = turn.conversation
+        conversation.add_assistant(turn.answer, turn.final_evidence)
+        if conversation.needs_summary and conversation.pending_for_summary():
+            # Off the critical path. Awaiting it here held the turn open — the answer had
+            # finished streaming but the Stop button stayed up for another model call.
+            task = asyncio.create_task(self._summarise(conversation, turn.session_id))
+            self._background.add(task)
+            task.add_done_callback(self._background.discard)
+
+    async def _summarise(self, conversation: Conversation, session: str) -> None:
+        """Fold older turns into a rolling summary, bounded rather than ever-growing."""
+        pending = conversation.pending_for_summary()
+        if not pending:
+            return
+        # Captured before the await. Computing it afterwards could skip turns added meanwhile,
+        # which would then never be summarised at all.
+        upto = conversation._summarised_upto + len(pending)
+        previous = conversation.summary
+        text = "\n".join(f"{t.role}: {t.content}" for t in pending)
+        if previous:
+            text = f"SUMMARY SO FAR:\n{previous}\n\nNEW TURNS TO FOLD IN:\n{text}"
+        try:
+            summary = await stages.summarise(text, session=session)
+        except Exception as exc:                          # noqa: BLE001 — memory is optional
+            log.debug("background summary failed: %s", exc)
+            return
+        if summary:
+            conversation.set_summary(summary, upto)
 
     # ── self-verification ────────────────────────────────────────────────────────────
     async def _self_verify(self, turn: TurnState, emit, on_pause) -> None:
@@ -660,7 +764,7 @@ class Orchestrator:
                 collected.append(fallback)
                 emit(events.token(fallback))
         turn.answer = "".join(collected)
-        turn.conversation.add_assistant(turn.answer, [])
+        turn.final_evidence = []
 
     # ── reporting ────────────────────────────────────────────────────────────────────
     def _usage(self, turn: TurnState) -> dict:
@@ -681,7 +785,17 @@ class Orchestrator:
             "vram_free_mb": live.get("vram_free_mb"),
             "ram_available_mb": live.get("ram_available_mb"),
             "throttled": any(b.get("throttled") for b in self.client.status()["limiters"]),
+            # Billed dollars for this question — chat plus embedding and reranking — summed
+            # from each response's own usage.cost. The whole budget story rests on this number.
+            "cost_usd": round(max(0.0, _spend_so_far(self.ledger) - turn.cost_at_start), 6),
+            "cost_usd_session": round(_spend_so_far(self.ledger), 6),
         }
+
+
+def _spend_so_far(ledger) -> float:
+    """Dollars billed by this process so far: chat models plus retrieval API calls."""
+    from .llm import retrieval_api
+    return float(ledger.cost_usd) + float(retrieval_api.session().cost_usd)
 
 
 def _source_digest(items: list[Evidence], question: str) -> str:

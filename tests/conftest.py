@@ -54,5 +54,9 @@ def isolated_runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "CACHE_DIR", runtime / "cache")
     monkeypatch.setattr(config, "THRESHOLDS_FILE", runtime / "thresholds.json")
     monkeypatch.setattr(registry, "_state", None)
+    # The ledger is a process-wide singleton holding daily provider counts. Without a reset,
+    # one test's calls count against the next test's "allowance", and the counts get persisted.
+    from knowyourrights.llm import ledger
+    monkeypatch.setattr(ledger, "_LEDGER", None, raising=False)
     yield runtime
     registry._state = None

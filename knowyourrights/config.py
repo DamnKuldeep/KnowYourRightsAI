@@ -112,6 +112,16 @@ OPENROUTER_DAILY_RESERVE = env_int("OPENROUTER_DAILY_RESERVE", 60)
 PROVIDERS = ("nim", "openrouter")
 
 
+def is_free_model(model_id: str) -> bool:
+    """OpenRouter's 1,000-requests/day and ~20/min caps apply to ``:free`` variants only.
+
+    Paid requests are metered in money, not in that allowance. Treating every OpenRouter call as
+    free-tier traffic made the daily counter lock out *paid* models too — after ~155 questions a
+    day the router would have stopped using the fast stages it had just been told to prefer.
+    """
+    return model_id.endswith(":free") or model_id in ("openrouter/free",)
+
+
 def provider_available(name: str) -> bool:
     return bool(NVIDIA_API_KEY) if name == "nim" else bool(OPENROUTER_API_KEY)
 
@@ -145,45 +155,64 @@ class ModelSpec:
         return f"{self.provider}:{self.id}"
 
 
-# Order is measured, not assumed — see scripts/race_models.py. Two findings drove it:
+# Order is measured, not assumed — `python scripts/race_openrouter.py` reproduces it for about a
+# cent. The race uses the *real* planner prompt and requires the output to validate as a Plan,
+# and times the writer by first token, because that is what a reader feels. Toy prompts hid both.
 #
-#   * OpenRouter's free tier shares roughly 20 requests/minute across *all* free models, and
-#     the fast role fires 4-6 times per question. Racing them produced 429s almost immediately,
-#     so NVIDIA leads the fast list: its limit is 40/min **per model**, which is a much better
-#     fit for a chatty stage. OpenRouter is the fallback, which is exactly what it is good at.
-#   * Bigger is not better here. nemotron-3-ultra-550b is the largest free model available and
-#     took **21.5 s** for a two-sentence answer; nemotron-3-super-120b on NIM did the same job
-#     in 2.8 s. The 550B model is kept last as a availability backstop, not as a first choice.
+# OpenRouter is the primary provider; NVIDIA NIM stays at the end of each list as a free
+# failover with its own, independent rate limits.
 #
-# Measured medians (2 calls each, realistic prompts):
-#   fast   nim-lightning-30b 4.8 s · openrouter-lightning 3.6 s · nim-nano intermittent 410
-#   writer nim-super-120b 2.8 s · openrouter-super-120b 4.1 s · openrouter-ultra-550b 21.6 s
+# fast role — planner prompt, 2 calls each, output must validate:
+#   google/gemini-2.5-flash-lite         1,430 ms   2/2 valid   $0.00020/call
+#   inception/mercury-2.5                1,475 ms   2/2 valid   $0.00010/call
+#   nvidia/nemotron-3-nano-30b-a3b       1,912 ms   2/2 valid   $0.00011/call
+#   openai/gpt-oss-20b · deepseek-v4     ~7,000 ms  2/2 valid
+#   qwen3.7-flash · gpt-5-nano           7-12 s     1/2 and 0/2 valid — rejected
+#   nemotron-3.5-lightning:free         29,132 ms  2/2 valid   free, and unusable
+#
+# The free model is the most important row. The fast role runs 4-6 times a question, so putting
+# it on the free tier would both take ~30 s a stage *and* spend the shared ~20/min allowance the
+# writer needs. A paid model here costs about a tenth of a cent per question.
+#
+# writer role — streamed, time to first token:
+#   nvidia/nemotron-3-super-120b:free      411 ms first token   1,090 ms total   free
+#   qwen/qwen3.7-flash                     906 ms               3,157 ms          $0.00008
+#   google/gemini-2.5-flash-lite         1,096 ms               1,526 ms          $0.00022
+#   gemma-4-31b:free · qwen3.8-27b:free    rate-limited (429) during the race
+#
+# The writer is one call per turn, which the free tier carries comfortably — and here the free
+# 120B is not a compromise, it is the fastest option measured.
+
+# Paid OpenRouter models are metered in money, not by the free tier's ~20/min, so they get a
+# realistic ceiling; 429s still back off.
+OPENROUTER_PAID_RPM = env_int("OPENROUTER_PAID_RPM", 60)
 
 # Cheap, high-frequency structured stages: planning, query writing, grading, gap analysis,
 # verification. Runs several times per question, so throughput matters more than eloquence.
 FAST_MODELS: tuple[ModelSpec, ...] = (
+    ModelSpec("google/gemini-2.5-flash-lite", "openrouter", rpm=OPENROUTER_PAID_RPM,
+              ctx=1_048_576, max_out=1400, temperature=0.1),
+    ModelSpec("inception/mercury-2.5", "openrouter", rpm=OPENROUTER_PAID_RPM,
+              ctx=260_000, max_out=1400, temperature=0.1),
+    ModelSpec("nvidia/nemotron-3-nano-30b-a3b", "openrouter", rpm=OPENROUTER_PAID_RPM,
+              ctx=262_144, max_out=1400, temperature=0.1),
+    # free failover on independent limits
     ModelSpec("nvidia/nemotron-3-nano-30b-a3b", "nim", rpm=30, max_out=1400, temperature=0.1),
     ModelSpec("nvidia/nemotron-3.5-lightning-30b-a3b", "nim", rpm=30, max_out=1400,
               temperature=0.1),
-    ModelSpec("nvidia/nemotron-3.5-lightning:free", "openrouter", rpm=OPENROUTER_RPM,
-              ctx=1_000_000, max_out=1400, temperature=0.1),
-    ModelSpec("google/gemma-4-26b-a4b-it:free", "openrouter", rpm=OPENROUTER_RPM,
-              ctx=262_144, max_out=1400, temperature=0.1),
 )
 
-# The user-facing answer: one or two calls a turn, so quality is worth more than speed — but
-# not at 21 seconds. NIM's 120B leads on measured latency and OpenRouter covers the outage case.
+# The user-facing answer: one call a turn, streamed.
 WRITER_MODELS: tuple[ModelSpec, ...] = (
-    ModelSpec("nvidia/nemotron-3-super-120b-a12b", "nim", rpm=25, max_out=1600,
-              temperature=0.3),
-    ModelSpec("google/gemma-4-31b-it:free", "openrouter", rpm=OPENROUTER_RPM,
-              ctx=262_144, max_out=1800, temperature=0.3),
     ModelSpec("nvidia/nemotron-3-super-120b-a12b:free", "openrouter", rpm=OPENROUTER_RPM,
               ctx=262_144, max_out=1800, temperature=0.3),
-    ModelSpec("z-ai/glm-5.2:free", "openrouter", rpm=OPENROUTER_RPM,
-              ctx=256_000, max_out=1800, temperature=0.3),
-    ModelSpec("nvidia/nemotron-3-ultra-550b-a55b:free", "openrouter", rpm=OPENROUTER_RPM,
+    ModelSpec("qwen/qwen3.7-flash", "openrouter", rpm=OPENROUTER_PAID_RPM,
               ctx=1_000_000, max_out=1800, temperature=0.3),
+    ModelSpec("google/gemini-2.5-flash-lite", "openrouter", rpm=OPENROUTER_PAID_RPM,
+              ctx=1_048_576, max_out=1800, temperature=0.3),
+    # free failover on independent limits
+    ModelSpec("nvidia/nemotron-3-super-120b-a12b", "nim", rpm=25, max_out=1600,
+              temperature=0.3),
 )
 
 # Force a single model for experiments, as "provider:model-id".
@@ -225,6 +254,42 @@ EMBED_MODEL = env_str("KYR_EMBED_MODEL", "BAAI/bge-m3")
 EMBED_DIM = 1024
 EMBED_MAX_SEQ = env_int("KYR_EMBED_MAX_SEQ", 1024)
 
+# ── retrieval over the API ────────────────────────────────────────────────────────────
+# Both of these were local. Serving them over HTTP is the largest latency win available on a
+# small box — reranking 8 documents on one physical core measured 6,625 ms against ~830 ms over
+# the network — and it returns the 3.4 GB of RAM the two models held.
+#
+# The embedder is *the same model*, which is the only reason this is safe: OpenRouter's
+# `baai/bge-m3` was checked against vectors already in the corpus and matched at cosine 1.0000
+# (unrelated rows: 0.60). So no re-embedding of the 38,890 chunks is required. Verify it on any
+# machine with `python scripts/verify_embeddings.py` before trusting a deployment.
+EMBED_API_MODEL = env_str("KYR_EMBED_API_MODEL", "baai/bge-m3")
+
+# The reranker is a *different* model, so its scores live on a different scale and its
+# abstention thresholds must be recalibrated. The threshold key carries the model name, which is
+# what prevents a calibration being silently reused across the two.
+#   cohere/rerank-v3.5     ~830 ms   $0.001    /search   — faster
+#   qwen/qwen3-reranker-8b ~1190 ms  $0.000275 /search   — 3.6x cheaper
+RERANK_API_MODEL = env_str("KYR_RERANK_API_MODEL", "cohere/rerank-v3.5")
+
+# Short on purpose. A slow rerank should fall back to fused RRF scores and answer, not hold a
+# turn open — retrieval has a working degraded mode and using it beats waiting.
+RETRIEVAL_API_TIMEOUT_S = env_float("KYR_RETRIEVAL_API_TIMEOUT_S", 20.0)
+RETRIEVAL_API_EMBED_BATCH = env_int("KYR_RETRIEVAL_API_EMBED_BATCH", 64)
+# Embedding and reranking are *paid* endpoints, so the free tier's shared ~20/min does not apply
+# to them. It was 12 here at first, which is right for free chat and badly wrong for this: the
+# limiter spaced calls 5 s apart, the eval measured a 5 s median for what is a ~640 ms search,
+# and a deep turn (4 rounds × 2 searches × embed + rerank) would have spent over a minute
+# waiting on its own throttle. 429s are still handled — Retry-After plus AIMD back-off — so this
+# is a ceiling, not a promise the provider has made.
+RETRIEVAL_API_RPM = env_int("KYR_RETRIEVAL_API_RPM", 120)
+
+# Spend ceiling for embedding + reranking in one process, in US dollars. Retrieval is the only
+# metered-per-call part of the system, so this is where a runaway loop would actually cost
+# money. On reaching it the API degrades to local models, or to fused RRF if none are loadable —
+# the system keeps answering, just less well. 0 disables the ceiling.
+RETRIEVAL_API_BUDGET_USD = env_float("KYR_RETRIEVAL_API_BUDGET_USD", 2.0)
+
 # Cross-encoder cost is roughly linear in tokens and it dominates CPU retrieval — measured at
 # 6.6 s for 8 documents on one physical core, against 40 ms for the searches feeding it. These
 # two knobs exist for that case only; on a GPU the default 510 tokens in fp16 is already cheap.
@@ -262,12 +327,16 @@ class Profile:
     """
 
     name: str
-    rerank_backend: str            # "local" | "nim" | "none"
+    rerank_backend: str            # "local" | "api" | "nim" | "none"
     rerank_model: str | None
     model_vram_mb: int
     embed_batch: int
     rerank_batch: int
     note: str = ""
+    # "local" loads bge-m3 into this process; "api" calls OpenRouter's copy of the same model.
+    # Because it is the same model — verified at cosine 1.0000 against the stored vectors — this
+    # is a transport choice, not a retrieval-quality one.
+    embed_backend: str = "local"   # "local" | "api"
     # `lite` turns the embedder off entirely and runs on BM25 alone. Measured on the gold set:
     # Recall@5 90.5% and MRR 0.769 against 100% / 0.873 for the full pipeline, at ~60 ms instead
     # of ~400 ms, in under 1 GB of RAM. It works this well because the BM25 index covers
@@ -281,6 +350,19 @@ class Profile:
     def needs_models(self) -> bool:
         return self.use_embedder or self.rerank_backend == "local"
 
+
+# Everything over the network: no weights loaded, no GPU wanted, a few hundred MB of RAM for the
+# process itself. This is the deployment profile, and the reason it is first in the list is that
+# it is better than every local option on a machine without a GPU:
+#
+#   cpu       + local cross-encoder, pool 8   Recall@5 95.2%   6,625 ms rerank   3.4 GB RAM
+#   api       + cohere/rerank-v3.5            measured below     ~830 ms rerank   ~0 GB
+#
+# It is only selectable with an OpenRouter key, and it costs real money per search — a fraction
+# of a cent, bounded by RETRIEVAL_API_BUDGET_USD — so it is never chosen when no key is set.
+API = Profile("api", "api", None, model_vram_mb=0, embed_batch=64, rerank_batch=32,
+              embed_backend="api",
+              note="embedding and reranking over OpenRouter — no local weights, ~830 ms rerank")
 
 # Ordered best-first; the first profile that fits the probed machine wins.
 PROFILES: tuple[Profile, ...] = (
@@ -320,9 +402,14 @@ LITE = Profile("lite", "none", None, model_vram_mb=0, embed_batch=1, rerank_batc
                use_embedder=False,
                note="BM25 only — no models, <1 GB RAM, Recall@5 90.5% at ~60 ms")
 
-PROFILES = PROFILES + (CPU_LEAN,)
+PROFILES = PROFILES + (CPU_LEAN, API)
 
-PROFILE_REQUEST = env_str("KYR_PROFILE", "auto")          # auto | quality | balanced | lean | cpu
+# auto | api | quality | balanced | lean | cpu | cpu_lean | lite
+PROFILE_REQUEST = env_str("KYR_PROFILE", "auto")
+# Prefer the API profile during auto-selection when a key is configured and no GPU is usable.
+# Off by default so `auto` keeps its existing meaning on a developer machine; the installer sets
+# it explicitly for a deployment, where it is unambiguously the right choice.
+PREFER_API_PROFILE = env_bool("KYR_PREFER_API_PROFILE", False)
 # 1 GB left for the desktop. This is what makes `balanced` rather than `quality` the default
 # on a 4 GB laptop card that is also driving a display.
 VRAM_RESERVE_MB = env_int("KYR_VRAM_RESERVE_MB", 1024)
@@ -416,18 +503,29 @@ PAGE_CHUNKS_KEPT = env_int("KYR_PAGE_CHUNKS_KEPT", 3)      # top chunks kept per
 
 HISTORY_TURNS_VERBATIM = env_int("KYR_HISTORY_TURNS", 4)
 HISTORY_SUMMARY_TRIGGER = env_int("KYR_HISTORY_SUMMARY_TRIGGER", 8)
+# Each past answer is capped on its own before the history budget is spent. A follow-up needs
+# to know *what was answered*, not all of it — and without a per-turn cap one long answer
+# (they run to ~3,000 characters) evicted every turn before it.
+HISTORY_ANSWER_CAP_TOKENS = env_int("KYR_HISTORY_ANSWER_CAP_TOKENS", 220)
+# A past source is only offered back to a new question if it shares this fraction of the
+# question's content words. It is a pre-filter — the grader then judges everything recalled.
+RECALL_MIN_SHARE = env_float("KYR_RECALL_MIN_SHARE", 0.34)
 
 
 # ── web search & crawling ─────────────────────────────────────────────────────────────
 WEB_MAX_RESULTS = env_int("KYR_WEB_MAX_RESULTS", 5)
-WEB_TIMEOUT = env_float("KYR_WEB_TIMEOUT", 12.0)
+WEB_TIMEOUT = env_float("KYR_WEB_TIMEOUT", 8.0)
 WEB_CACHE_TTL = env_int("KYR_WEB_CACHE_TTL", 1800)
 WEB_MAX_PER_MIN = env_int("KYR_WEB_MAX_PER_MIN", 10)
 
 WIKI_MAX_RESULTS = env_int("KYR_WIKI_MAX_RESULTS", 2)
 WIKI_TIMEOUT = env_float("KYR_WIKI_TIMEOUT", 10.0)
 
-CRAWL_TIMEOUT_S = env_float("KYR_CRAWL_TIMEOUT_S", 25.0)
+# Per page. Measured, government pages load three at a time in ~4.4 s, so 25 s only ever served
+# the outlier — and one outlier held the whole answer: a deposit question took 38 s to its first
+# token where the same question normally takes 16. A page that has not answered in 10 s is
+# dropped, and the answer is written from the pages that did.
+CRAWL_TIMEOUT_S = env_float("KYR_CRAWL_TIMEOUT_S", 10.0)
 CRAWL_CACHE_TTL = env_int("KYR_CRAWL_CACHE_TTL", 86_400)
 CRAWL_MAX_CONCURRENT = env_int("KYR_CRAWL_MAX_CONCURRENT", 3)
 CRAWL_USE_BROWSER = env_bool("KYR_CRAWL_USE_BROWSER", True)   # escalate to Chromium when needed
@@ -487,12 +585,37 @@ STATE_PREFIXES = (
     "Uttar Pradesh", "Uttarakhand", "West Bengal", "Jammu", "Puducherry", "Pondicherry",
 )
 
+# Acts Parliament passed *for* a Union Territory. The DB README calls these "genuinely central",
+# and as to who enacted them that is true — but the label a reader sees answers a different
+# question, "does this apply to me?", and a Delhi Act applies only in Delhi whoever passed it.
+# Treating them as all-India law put the Delhi Rent Act at the top of a *Mumbai* deposit question
+# labelled "Central law — applies across India". 44 Acts in the corpus carry these prefixes.
+#
+# (prefix, the place it is limited to). Longest prefix first, so "National Capital Territory of
+# Delhi" is matched before "Delhi". The place names must match INDIAN_STATES below, because that
+# is what the user picks in the UI and what applies_in() compares against.
+TERRITORY_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("National Capital Territory of Delhi", "Delhi"),
+    ("New Delhi", "Delhi"),
+    ("Delhi", "Delhi"),
+    ("Chandigarh", "Chandigarh"),
+    ("Dadra and Nagar Haveli", "Dadra and Nagar Haveli and Daman and Diu"),
+    ("Daman and Diu", "Dadra and Nagar Haveli and Daman and Diu"),
+    ("Goa, Daman and Diu", "Goa"),
+    ("Andaman and Nicobar", "Andaman and Nicobar Islands"),
+    ("Lakshadweep", "Lakshadweep"),
+    ("Ladakh", "Ladakh"),
+)
+
+# What the user can pick as "where I am". States and Union Territories alike, because both
+# decide whether a territorially-limited Act governs them.
 INDIAN_STATES = (
-    "Andhra Pradesh", "Arunachal Pradesh", "Assam", "Bihar", "Chhattisgarh", "Delhi", "Goa",
+    "Andaman and Nicobar Islands", "Andhra Pradesh", "Arunachal Pradesh", "Assam", "Bihar",
+    "Chandigarh", "Chhattisgarh", "Dadra and Nagar Haveli and Daman and Diu", "Delhi", "Goa",
     "Gujarat", "Haryana", "Himachal Pradesh", "Jammu & Kashmir", "Jharkhand", "Karnataka",
-    "Kerala", "Ladakh", "Madhya Pradesh", "Maharashtra", "Manipur", "Meghalaya", "Mizoram",
-    "Nagaland", "Odisha", "Puducherry", "Punjab", "Rajasthan", "Sikkim", "Tamil Nadu",
-    "Telangana", "Tripura", "Uttar Pradesh", "Uttarakhand", "West Bengal",
+    "Kerala", "Ladakh", "Lakshadweep", "Madhya Pradesh", "Maharashtra", "Manipur", "Meghalaya",
+    "Mizoram", "Nagaland", "Odisha", "Puducherry", "Punjab", "Rajasthan", "Sikkim",
+    "Tamil Nadu", "Telangana", "Tripura", "Uttar Pradesh", "Uttarakhand", "West Bengal",
 )
 
 

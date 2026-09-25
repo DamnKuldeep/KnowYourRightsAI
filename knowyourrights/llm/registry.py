@@ -86,7 +86,7 @@ def spec(role: ModelRole) -> config.ModelSpec:
 
         # A provider whose daily allowance is spent is skipped rather than tried and refused.
         # OpenRouter's free tier is capped per day, so hitting it is a certainty, not an error.
-        affordable = [o for o in options if _within_budget(o.provider)]
+        affordable = [o for o in options if _within_budget(o.provider, o.id)]
         usable = affordable or options          # all spent: try anyway rather than do nothing
 
         pinned = state.get("resolved", {}).get(role)
@@ -109,9 +109,15 @@ def resolve(role: ModelRole) -> str:
 
 
 # ── availability bookkeeping ──────────────────────────────────────────────────────────
-def _within_budget(provider: str) -> bool:
-    """Does this provider have daily allowance left?"""
+def _within_budget(provider: str, model_id: str = "") -> bool:
+    """Does this model still have allowance left today?
+
+    Only OpenRouter's free models draw on the daily allowance. A spent allowance must remove
+    those and nothing else — paid models on the same provider carry on.
+    """
     if provider != "openrouter":
+        return True
+    if model_id and not config.is_free_model(model_id):
         return True
     from .ledger import get_ledger
 

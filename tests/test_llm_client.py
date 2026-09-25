@@ -184,19 +184,32 @@ async def test_openrouter_gets_its_own_auth_and_attribution_headers():
 
 
 @pytest.mark.asyncio
-async def test_daily_budget_takes_openrouter_out_of_rotation():
-    """OpenRouter's free tier is capped per day, so exhausting it is expected, not an error."""
+async def test_spent_free_allowance_removes_only_free_models():
+    """OpenRouter's 1,000/day cap covers ``:free`` models. Paid ones are metered in money.
+
+    Regression: every OpenRouter call used to count against the free allowance, and a spent
+    allowance removed *all* OpenRouter models — so ~6 paid fast calls a question would have
+    locked the router out of the models it had just been told to prefer, after ~155 questions.
+    """
     from knowyourrights.llm.ledger import get_ledger
 
     ledger = get_ledger()
     ledger.provider_calls.clear()
-    assert any(s.provider == "openrouter" for s in registry.candidates("fast"))
-
     ledger.provider_calls["openrouter"] = config.OPENROUTER_DAILY_LIMIT
     assert ledger.daily_exhausted("openrouter")
-    assert registry.spec("fast").provider == "nim", \
-        "a spent OpenRouter allowance must route to the other provider"
 
+    fast = registry.spec("fast")
+    assert fast.provider == "openrouter" and not config.is_free_model(fast.id),         "a spent *free* allowance must not take paid OpenRouter models out of rotation"
+
+    writer = registry.spec("writer")
+    assert not config.is_free_model(writer.id),         "with the free allowance spent, the writer must move off its free model"
+
+    # and paid calls must not have been drawing it down in the first place
+    ledger.provider_calls.clear()
+    ledger.note_provider_call("openrouter", "google/gemini-2.5-flash-lite")
+    assert ledger.provider_calls.get("openrouter", 0) == 0
+    ledger.note_provider_call("openrouter", "nvidia/nemotron-3-super-120b-a12b:free")
+    assert ledger.provider_calls.get("openrouter", 0) == 1
     ledger.provider_calls.clear()
 
 
@@ -289,7 +302,11 @@ async def test_auth_failure_is_not_retried():
 # ── thinking suppression ──────────────────────────────────────────────────────────────
 @pytest.mark.asyncio
 async def test_thinking_disabled_by_default():
-    """Measured 6x token saving on the structured stages; must be on the wire by default."""
+    """Measured 6x token saving on the structured stages; must be on the wire by default.
+
+    Each provider takes its own spelling of the switch — NVIDIA a chat-template flag, OpenRouter
+    a `reasoning` block — so check whichever the routed model actually needs.
+    """
     captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -298,11 +315,15 @@ async def test_thinking_disabled_by_default():
         return chat_response("ok")
 
     client = make_client(handler)
+    provider = registry.spec("fast").provider
     await client.chat([{"role": "user", "content": "hi"}], role="fast")
-    assert captured["chat_template_kwargs"] == {"thinking": False}
+    if provider == "openrouter":
+        assert captured["reasoning"] == {"enabled": False}
+    else:
+        assert captured["chat_template_kwargs"] == {"thinking": False}
 
     await client.chat([{"role": "user", "content": "hi"}], role="fast", thinking=True)
-    assert "chat_template_kwargs" not in captured, "explicit thinking=True must let the model reason"
+    assert "chat_template_kwargs" not in captured and "reasoning" not in captured,         "explicit thinking=True must let the model reason"
     await client.aclose()
 
 
@@ -364,4 +385,121 @@ async def test_chat_json_recovers_on_the_retry():
                                     Shape, Shape(kind="fallback"))
     assert result.kind == "legal_question"
     assert calls["n"] == 2
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_rejected_optional_parameter_retries_the_same_model_without_it():
+    """Regression: a 400 over the `reasoning` switch used to raise, and inside chat_json that
+    became the caller's *default* — a generic fallback plan, silently, on every call."""
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen.append(("reasoning" in body) or ("chat_template_kwargs" in body))
+        if seen[-1]:
+            return httpx.Response(400, json={"error": {"message": "Unsupported parameter: reasoning"}})
+        return chat_response("ok")
+
+    client = make_client(handler)
+    out = await client.chat([{"role": "user", "content": "hi"}], role="fast")
+    assert out == "ok"
+    assert seen[:2] == [True, False], "must retry the same model once, without the parameter"
+    seen.clear()
+    await client.chat([{"role": "user", "content": "hi"}], role="fast")
+    assert seen == [False], "the rejection must be remembered, not rediscovered every call"
+    await client.aclose()
+
+
+# ── streaming: how an answer ends ─────────────────────────────────────────────────────
+def _sse(*frames: str) -> bytes:
+    return "".join(f"data: {f}\n\n" for f in frames).encode()
+
+
+def _delta(text: str, finish: str | None = None) -> str:
+    choice = {"delta": {"content": text}}
+    if finish:
+        choice["finish_reason"] = finish
+    return json.dumps({"choices": [choice]})
+
+
+async def _drain(client, **kw) -> tuple[str, list[str]]:
+    ending: list[str] = []
+    out = []
+    async for piece in client.chat_stream([{"role": "user", "content": "q"}],
+                                          role="writer", on_finish=ending.append, **kw):
+        out.append(piece)
+    return "".join(out), ending
+
+
+@pytest.mark.asyncio
+async def test_a_normal_stream_reports_stop():
+    def handler(request):
+        return httpx.Response(200, content=_sse(_delta("Hello "), _delta("world", "stop"), "[DONE]"))
+    client = make_client(handler)
+    text, ending = await _drain(client)
+    assert text == "Hello world" and ending == ["stop"]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_hitting_the_token_limit_is_reported():
+    """Regression: finish_reason was never read, so a cut-off answer looked complete."""
+    def handler(request):
+        return httpx.Response(200, content=_sse(_delta("Step one. Step tw", "length"), "[DONE]"))
+    client = make_client(handler)
+    text, ending = await _drain(client)
+    assert ending == ["length"]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_stream_that_just_stops_is_reported_as_interrupted():
+    """Neither [DONE] nor a finish reason: the body ended early. That is a truncation."""
+    def handler(request):
+        return httpx.Response(200, content=_sse(_delta("Under Section 47 you")))
+    client = make_client(handler)
+    text, ending = await _drain(client)
+    assert text == "Under Section 47 you" and ending == ["interrupted"]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_connection_never_replays_the_answer():
+    """Regression, and the worst of these: a transport error after the first token was retried
+    by opening a fresh stream, which re-yielded the whole answer from the start."""
+    calls = []
+
+    class Dropping(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield _sse(_delta("Under Section 47 you must be told "))
+            raise httpx.ReadError("connection reset")
+
+    def handler(request):
+        calls.append(1)
+        return httpx.Response(200, stream=Dropping())
+
+    client = make_client(handler)
+    text, ending = await _drain(client)
+    assert len(calls) == 1, "must not open a second stream once text has been sent"
+    assert text == "Under Section 47 you must be told "
+    assert text.count("Section 47") == 1, "the answer must not start over"
+    assert ending == ["interrupted"]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_an_error_frame_before_any_text_fails_over():
+    """An error inside a 200 with nothing sent yet is an ordinary failure — try again."""
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        if len(calls) == 1:
+            return httpx.Response(200, content=_sse(json.dumps({"error": {"message": "overloaded"}})))
+        return httpx.Response(200, content=_sse(_delta("ok", "stop"), "[DONE]"))
+
+    client = make_client(handler)
+    text, ending = await _drain(client)
+    assert text == "ok" and ending == ["stop"] and len(calls) == 2
     await client.aclose()
