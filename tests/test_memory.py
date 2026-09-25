@@ -198,3 +198,56 @@ def test_jurisdiction_follows_the_matter_not_the_user():
     from knowyourrights.agents import prompts
     assert "WHERE THE MATTER IS" in prompts.WRITER
     assert "user lives" in prompts.WRITER
+
+
+# ── the deep-mode rewrite and the "All India" default ─────────────────────────────────
+def test_revision_is_swapped_in_not_streamed_over_the_draft():
+    """Regression: the rewrite streamed over the draft — the UI cleared the answer mid-read and
+    started again, and printed the sources notice a second time."""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent / "knowyourrights" / "orchestrator.py"
+           ).read_text(encoding="utf-8")
+    writer = src[src.index("async def _write_answer("):src.index("def _commit(")]
+    assert 'stage_id = "revise" if revision else "write"' in writer, \
+        "a rewrite must not reuse the 'write' stage id, which the UI clears on"
+    assert "emit_token = (lambda delta: None) if revision" in writer, \
+        "a rewrite must not stream tokens over the draft"
+    assert "if not revision:\n            emit(events.sources_final" in writer, \
+        "the sources notice must be emitted once per turn, not once per writer pass"
+    verify = src[src.index("async def _self_verify("):src.index("async def _concierge(")]
+    assert 'turn.answer = ""' not in verify, "the draft must survive a failed rewrite"
+
+
+def test_all_india_is_answered_for_all_india():
+    """Regression: with no state selected, an RTI question came back with Maharashtra and Delhi
+    portals and fees, because nothing said what "All India" meant."""
+    from knowyourrights.agents import prompts
+    from knowyourrights.agents.schemas import Plan
+
+    plan = Plan(kind="legal_question", depth="standard", answer_kind="procedure",
+                normalized_query="how to file an RTI", needs_state=False)
+    ctx = prompts.writer_context(plan, None, [], "2026-09-25")
+    assert "All India" in ctx and "one state" in ctx
+
+    plan.needs_state = True
+    ctx = prompts.writer_context(plan, None, [], "2026-09-25")
+    assert "asking which state" in ctx, "when it truly varies, the writer must ask"
+
+    ctx = prompts.writer_context(plan, "Kerala", [], "2026-09-25")
+    assert "All India" not in ctx
+
+
+def test_procedure_steps_appear_once():
+    """Regression: the card listed the steps and the answer repeated them. The answer now owns
+    the steps; the card carries only the facts."""
+    from pathlib import Path
+    js = (Path(__file__).resolve().parent.parent / "knowyourrights" / "web" / "app.js"
+          ).read_text(encoding="utf-8")
+    card = js[js.index("function addProcedure"):js.index("function renderSources")]
+    assert "<ol>" not in card and "data.steps" not in card
+
+
+def test_writer_is_not_the_unreliable_free_model():
+    """The free 120B broke 12 of 22 streams in one session, 5 of them after text had started."""
+    from knowyourrights import config
+    assert not config.is_free_model(config.WRITER_MODELS[0].id)

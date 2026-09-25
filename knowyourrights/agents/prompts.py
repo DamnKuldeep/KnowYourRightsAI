@@ -50,9 +50,13 @@ kind:
 
 depth — spend time in proportion to the question:
 - quick    : one clear fact or definition ("what is Article 21").
-- standard : a normal rights question needing the statute and maybe context.
-- deep     : multi-part questions, anything asking HOW to do something end to end, anything
-             needing current fees/portals/deadlines, or comparisons.
+- standard : the default. A rights question, OR a single how-to with its fee or deadline —
+             "how do I file an RTI and what does it cost" is standard: one round already reads
+             the official portal.
+- deep     : only when one round cannot do it — three or more distinct parts, a comparison
+             ("RTI vs a consumer complaint"), a procedure spanning several authorities, or the
+             user explicitly asks for thorough research. Deep takes 30-60 seconds; do not
+             spend that on a question a standard round answers.
 
 language: reply in whatever language the user wrote in. Hinglish (Hindi in Latin script)
 should get "hi" — answer in the same mixed style they used.
@@ -173,6 +177,11 @@ Return ONLY this JSON:
 Use ONLY what the provided sources say. Leave a field empty rather than guessing — an invented
 fee or deadline is worse than an absent one. Steps must be concrete actions in order. Put the
 official URL a user should actually visit in portal_url.
+
+fees is the AMOUNT payable and who is exempt — "₹10; free for BPL applicants". How to pay
+(cards, UPI, internet banking) is not a fee; it belongs in a step. timeline is how long the
+authority has to respond, or the deadline the user must meet — "30 days". appeal_to is who
+hears an appeal and within what time.
 """.strip()
 
 
@@ -203,7 +212,8 @@ SHAPE — the ANSWER SHAPE you are given decides the format. Match it.
 - "definition" — one or two short paragraphs of prose. No headings, no lists. Say what it is,
   then what it means for the person.
 
-- "procedure" — this is a set of instructions, so format it as one:
+- "procedure" — a set of instructions, so format it as one. If an EXTRACTED PROCEDURE is
+  supplied, use it as the backbone of your steps, and cite each step to its source:
     A one-line summary of what they are about to do.
     Then **numbered steps**, one action per step, in the order they happen.
     Then, ONLY if your sources state a fee, a deadline or an appeal route, a short
@@ -222,6 +232,14 @@ SHAPE — the ANSWER SHAPE you are given decides the format. Match it.
 
 Never pad. A one-line question deserves a one-line answer. Do not add a heading to an answer
 shorter than about four sentences.
+
+LAYOUT — markdown, and the line breaks matter:
+- Every list item, step or labelled line ("**Fee:** …") starts on its own line. Never run a
+  list into a paragraph; a reader scanning for the fee must be able to find it.
+- Put a blank line between a paragraph and a list, and between sections.
+- Say each fact once. If the same fee or portal appears in several sources, state it once and
+  cite the sources together: "₹10 [G1][G3]".
+- Write a link as a markdown link, [RTI Online](https://rtionline.gov.in), never a bare URL.
 
 LINKS — when a vetted source has a url and it is somewhere the person should actually go (a
 portal, a form, a government page), link it inline in markdown: [RTI Online portal](https://…).
@@ -261,6 +279,11 @@ HONESTY:
 - Where a source is marked as verified against a second source, you can state it with
   confidence. Where a fee, deadline or penalty comes from only one web page, say where it came
   from and that it is worth confirming.
+- Many central Acts in your sources still say they extend to the whole of India "except the
+  State of Jammu and Kashmir". That exception is no longer law: the Jammu and Kashmir
+  Reorganisation Act, 2019 extended central Acts to Jammu & Kashmir and Ladakh. Never repeat the
+  exception as current law, and do not mention an Act's territorial extent at all unless the
+  question is about where it applies.
 - NEVER name the Indian Penal Code, the Code of Criminal Procedure or the Indian Evidence Act
   as current law. All three were repealed on 1 July 2024 and replaced by the Bharatiya Nyaya
   Sanhita, the Bharatiya Nagarik Suraksha Sanhita and the Bharatiya Sakshya Adhiniyam. If you
@@ -340,9 +363,18 @@ def writer_context(plan, state: str | None, notes: list[str], today: str) -> str
     if state:
         lines.append(f"The user has selected {state}. Use it only when the question does not "
                      f"say where the matter is — a place named in the question governs.")
-    elif plan.needs_state:
-        lines.append("This question may depend on the user's state, and they have not said "
-                     "which. Answer the central-law position and note the dependency.")
+    else:
+        # "All India" is a real choice, not a blank. Without this line the writer used whatever
+        # states the web results happened to mention: an RTI question answered with Maharashtra
+        # and Delhi portals and fees, when the reader had asked about India as a whole.
+        lines.append("The user has selected All India and has not named a place. Answer for India "
+                     "as a whole: central law, central portals, central fees. Do not give any one "
+                     "state's rules, portals or fees as the answer just because a source mentions "
+                     "them.")
+        if plan.needs_state:
+            lines.append("This answer genuinely differs by state. Give the all-India position, "
+                         "say in one sentence that states have their own rules for this, and END "
+                         "with one short question asking which state they are in.")
     for note in notes:
         lines.append(f"IMPORTANT CAVEAT TO STATE: {note}")
     return "\n".join(lines)

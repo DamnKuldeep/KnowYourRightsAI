@@ -203,13 +203,20 @@ FAST_MODELS: tuple[ModelSpec, ...] = (
 )
 
 # The user-facing answer: one call a turn, streamed.
+#
+# The free 120B was first here on speed, and it was the wrong call. Over one session it failed
+# 12 times against 10 successes — 7 stream errors, and 5 connections dropped *after* text had
+# started, which is exactly what a reader saw as "the answer cuts off". A writer that breaks
+# half its streams is not fast, whatever its first-token time. qwen3.7-flash leads now: it
+# cited every step in both samples, reaches first token in ~0.9 s, and costs about a hundredth
+# of a cent an answer. The free model stays as a backstop, where its failures cost nothing.
 WRITER_MODELS: tuple[ModelSpec, ...] = (
-    ModelSpec("nvidia/nemotron-3-super-120b-a12b:free", "openrouter", rpm=OPENROUTER_RPM,
-              ctx=262_144, max_out=1800, temperature=0.3),
     ModelSpec("qwen/qwen3.7-flash", "openrouter", rpm=OPENROUTER_PAID_RPM,
               ctx=1_000_000, max_out=1800, temperature=0.3),
     ModelSpec("google/gemini-2.5-flash-lite", "openrouter", rpm=OPENROUTER_PAID_RPM,
               ctx=1_048_576, max_out=1800, temperature=0.3),
+    ModelSpec("nvidia/nemotron-3-super-120b-a12b:free", "openrouter", rpm=OPENROUTER_RPM,
+              ctx=262_144, max_out=1800, temperature=0.3),
     # free failover on independent limits
     ModelSpec("nvidia/nemotron-3-super-120b-a12b", "nim", rpm=25, max_out=1600,
               temperature=0.3),

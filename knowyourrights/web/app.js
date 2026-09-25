@@ -48,8 +48,13 @@ function renderMarkdown(src) {
     .replace(/`([^`]+)`/g, '<code>$1</code>')
     .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
              '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
-    .replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g,
-             '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>')
+    // A bare URL at the end of a sentence took the full stop with it — "rtionline.gov.in/."
+    // linked to a page that does not exist. Trailing punctuation stays outside the link.
+    .replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, (_, pre, url) => {
+      const tail = (url.match(/[.,;:!?]+$/) || [''])[0];
+      const href = tail ? url.slice(0, -tail.length) : url;
+      return `${pre}<a href="${href}" target="_blank" rel="noopener noreferrer">${href}</a>${tail}`;
+    })
     .replace(/\[([A-Z]{1,2}\d{1,2})\]/g,
              '<button class="cite" data-cite="$1" title="Show source $1">$1</button>');
 
@@ -180,9 +185,12 @@ function addSafety(data) {
   scrollDown(true);
 }
 
+// The card carries the *facts* — fee, time limit, appeal, documents, portal — and not the steps.
+// Every writer model measured writes the steps itself, as a cited numbered list, whatever it is
+// told; showing them here as well made each procedure read twice. The answer owns the steps and
+// the citations; the card is the at-a-glance summary beside it.
 function addProcedure(data) {
   if (!turn) return;
-  const steps = (data.steps || []).map((s) => `<li>${esc(s.text)}</li>`).join('');
   const facts = [
     ['Fee', data.fees], ['Time limit', data.timeline],
     ['Appeal to', data.appeal_to],
@@ -190,9 +198,9 @@ function addProcedure(data) {
   ].filter(([, v]) => v && String(v).trim())
    .map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('');
 
+  if (!facts && !data.portal_url) return;       // nothing worth a card of its own
   const node = el('div', 'procedure');
-  node.innerHTML = `<h3>${esc(data.title || 'How to do this')}</h3>`
-    + (steps ? `<ol>${steps}</ol>` : '')
+  node.innerHTML = `<h3>At a glance</h3>`
     + (facts ? `<dl class="facts">${facts}</dl>` : '')
     + (data.portal_url
         ? `<p style="margin:10px 0 0"><a href="${esc(data.portal_url)}" target="_blank" rel="noopener noreferrer">Open the official portal →</a></p>`
@@ -367,10 +375,11 @@ function handleEvent(ev) {
     case 'safety':    addSafety(ev); break;
 
     case 'stage':
-      // A rewrite after fact-checking must replace the draft, not append to it.
-      if (ev.id === 'write' && ev.status === 'running' && state.answerText) {
-        state.answerText = '';
-        if (state.answerEl) state.answerEl.innerHTML = '';
+      // A rewrite after fact-checking arrives as stage "revise" and is swapped in whole by
+      // `answer_revised`. The draft stays readable meanwhile, only visibly marked as being
+      // updated — clearing it made the answer vanish mid-read and start over.
+      if (ev.id === 'revise' && state.answerEl) {
+        state.answerEl.classList.toggle('revising', ev.status === 'running');
       }
       setStep(ev.id, ev.label, ev.status, ev.detail);
       break;
@@ -385,7 +394,10 @@ function handleEvent(ev) {
 
     case 'answer_revised':
       state.answerText = ev.text;
-      if (state.answerEl) state.answerEl.innerHTML = renderMarkdown(state.answerText);
+      if (state.answerEl) {
+        state.answerEl.classList.remove('revising');
+        state.answerEl.innerHTML = renderMarkdown(state.answerText);
+      }
       break;
 
     case 'verdict':
@@ -424,7 +436,12 @@ function finishTurn(errorText) {
       clearInterval(Number(n.dataset.timer)); n.remove();
     });
     if (errorText) addNotice({ level: 'warn', text: errorText });
-    if (state.answerEl) state.answerEl.innerHTML = renderMarkdown(state.answerText);
+    if (state.answerEl) {
+      // A rewrite that failed or was stopped never sends answer_revised; never leave the draft
+      // looking provisional once the turn is over.
+      state.answerEl.classList.remove('revising');
+      state.answerEl.innerHTML = renderMarkdown(state.answerText);
+    }
 
     const secs = ((Date.now() - turn.started) / 1000).toFixed(1);
     turn.label.textContent = `Research · ${secs}s`;

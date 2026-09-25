@@ -416,3 +416,11 @@ textarea::placeholder { color: var(--text-faint); }
   border-radius: var(--radius-sm);
 }
 .pipeline-foot b { color: var(--text); }
+
+/* A draft being rewritten with fact-checked details: still readable, visibly provisional.
+   It used to be wiped and re-streamed from nothing, which read as the answer breaking. */
+.answer.revising { opacity: .62; transition: opacity .25s ease; position: relative; }
+.answer.revising::after {
+  content: "Updating with confirmed details…";
+  display: block; margin-top: 10px; font-size: .78rem; color: var(--text-dim);
+}

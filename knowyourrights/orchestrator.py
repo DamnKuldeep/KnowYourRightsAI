@@ -532,13 +532,20 @@ class Orchestrator:
 
         # The packer is the last word on ids, so this is the set the writer may cite and the
         # set the UI must be able to resolve a chip against.
-        emit(events.sources_final(packed.included))
-
-        if packed.dropped:
-            emit(events.notice(
-                f"Using the {len(packed.included)} strongest sources; "
-                f"{len(packed.dropped)} more were set aside to stay within the context budget.",
-                level="info"))
+        #
+        # A revision is written *silently* and swapped in whole when it is done. It used to
+        # stream over the draft: the UI cleared the answer the reader was partway through and
+        # started again from nothing, with a second copy of the sources notice — the "stream
+        # cuts off and the UI stumbles" that was reported. Now the draft stays on screen, its
+        # source ids stay valid, and the corrected text replaces it in one step.
+        if not revision:
+            emit(events.sources_final(packed.included))
+            if packed.dropped:
+                emit(events.notice(
+                    f"Using the {len(packed.included)} strongest sources; "
+                    f"{len(packed.dropped)} more were set aside to stay within the context "
+                    f"budget.", level="info"))
+        emit_token = (lambda delta: None) if revision else (lambda delta: emit(events.token(delta)))
 
         sources_block = packed.text or packer.render_empty_note(turn.notes)
         procedure_block = ""
@@ -558,7 +565,10 @@ class Orchestrator:
                 f"{procedure_block}{verification_block}")
 
         label = "Rewriting with the confirmed details" if revision else "Writing the answer"
-        emit(events.stage("write", label))
+        # A different stage id for the rewrite: the UI clears the answer when a "write" stage
+        # starts, which is right for a fresh answer and exactly wrong for a revision.
+        stage_id = "revise" if revision else "write"
+        emit(events.stage(stage_id, label))
         collected: list[str] = []
         ending: list[str] = []
         try:
@@ -574,8 +584,15 @@ class Orchestrator:
                 if turn.cancelled.is_set():
                     break
                 collected.append(delta)
-                emit(events.token(delta))
+                emit_token(delta)
         except (NimError, NimDeadlineExceeded) as exc:
+            if revision and not collected:
+                log.warning("rewrite failed (%s) — keeping the draft", exc)
+                emit(events.stage(stage_id, label, "done", detail="kept the original answer"))
+                emit(events.notice("Could not rewrite with the confirmed details, so the answer "
+                                   "above is the original — treat its fees and deadlines as "
+                                   "worth double-checking.", level="warn"))
+                return
             if not collected:
                 # The research succeeded and only the prose failed. Handing back the provisions
                 # we actually found is far more useful than an error — measured during a
@@ -603,6 +620,10 @@ class Orchestrator:
         elif answer.strip() and ending and ending[-1] == "interrupted":
             emit(events.notice("The connection dropped while this answer was being written, so "
                                "it may be incomplete.", level="warn"))
+        if not answer.strip() and revision:
+            log.warning("rewrite came back empty — keeping the draft")
+            emit(events.stage(stage_id, label, "done", detail="kept the original answer"))
+            return
         if not answer.strip():
             # The stream ended cleanly and produced nothing. No exception is raised for this, so
             # without an explicit check the turn completes "successfully": citations verify
@@ -621,11 +642,15 @@ class Orchestrator:
             turn.final_evidence = list(packed.included)
             emit(events.verdict(len(packed.included), [],
                                 coverage="written without the model", degraded=True))
-            emit(events.stage("write", label, "done"))
+            emit(events.stage(stage_id, label, "done"))
             return
 
         cleaned, unsupported, verified = stages.verify_citations(answer, packed.included)
-        if cleaned != answer:
+        if revision:
+            # Sources first, so every chip in the new text resolves the moment it appears.
+            emit(events.sources_final(packed.included))
+            emit(events.Event("answer_revised", {"text": cleaned}))
+        elif cleaned != answer:
             # The prose already streamed; tell the UI to use the corrected text.
             emit(events.Event("answer_revised", {"text": cleaned}))
         turn.answer = cleaned
@@ -639,7 +664,7 @@ class Orchestrator:
                 f"Removed {len(unsupported)} citation marker(s) that did not match any source.",
                 level="warn"))
 
-        emit(events.stage("write", label, "done"))
+        emit(events.stage(stage_id, label, "done"))
         turn.final_evidence = list(packed.included)
 
     # ── committing the turn ──────────────────────────────────────────────────────────
@@ -742,7 +767,8 @@ class Orchestrator:
         turn.verification_note = stages.summarise_verification(claims, findings)
         emit(events.notice(f"Confirmed {len(claims)} detail(s) against official sources; "
                            f"rewriting with what they said.", level="info"))
-        turn.answer = ""
+        # The draft stays in turn.answer until a rewrite actually replaces it, so a rewrite that
+        # fails leaves the reader with the draft instead of nothing.
         await self._write_answer(turn, emit, on_pause, revision=True)
 
     async def _concierge(self, turn: TurnState, emit, on_pause) -> None:
