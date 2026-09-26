@@ -38,7 +38,7 @@ def step(x, y, n):
             + text(x, y + 4, str(n), 11.5, 700, "#ffffff"))
 
 
-def box(x, y, w, h, title, sub="", kind="code", pill=False, title_size=13):
+def box(x, y, w, h, title, sub="", kind="code", pill=False, title_size=13, sub_size=11):
     fill, stroke, dash = STYLES[kind]
     rx = h / 2 if pill else 9
     dash_attr = f' stroke-dasharray="{dash}"' if dash else ""
@@ -47,7 +47,7 @@ def box(x, y, w, h, title, sub="", kind="code", pill=False, title_size=13):
     cx = x + w / 2
     if sub:
         out.append(text(cx, y + h / 2 - 3, title, title_size, 620))
-        out.append(text(cx, y + h / 2 + 13, sub, 11, 400, DIM))
+        out.append(text(cx, y + h / 2 + 13, sub, sub_size, 400, DIM))
     else:
         out.append(text(cx, y + h / 2 + 4.5, title, title_size, 620))
     return "".join(out)
@@ -197,65 +197,72 @@ def retrieval():
 
 # ── 3. the system ─────────────────────────────────────────────────────────────────────────
 def system():
-    """Top to bottom, in the order things happen: the question comes in, passes the checks that
-    come before any spending, one turn runs, the turn uses three kinds of work, and the answer
-    streams back. Outside services sit below the server they are called from."""
-    C1, C2, C3, W = 40, 350, 660, 260          # three columns
-    mid = [x + W / 2 for x in (C1, C2, C3)]
+    """Read left to right, in the order things happen. Top row: the question passes three
+    checks and reaches the orchestrator (1–3); the answer streams back along the top (5). Below:
+    what one turn uses (4), and the outside services those call. The server is a tinted panel
+    rather than a bordered box, so no line has to cross a border."""
+    H, T, S = 58, 14, 12                     # box height, title and subtitle sizes
+    row_a, row_b, row_c, row_d = 72, 236, 340, 456
 
-    def band(y, n, label):
-        return step(66, y - 4, n) + text(84, y, label, 12, 650, DIM, "start")
+    def b(x, y, w, title, sub, kind="code"):
+        return box(x, y, w, H, title, sub, kind, title_size=T, sub_size=S)
 
-    b = [
-        box(C1, 24, W, 56, "Browser", "plain HTML + JavaScript"),
-        arrow([(C1 + W - 40, 80), (C1 + W - 40, 182)]),
-        step(C1 + W - 18, 104, 1), text(C1 + W + 2, 108, "your question", 11.5, 500, DIM, "start"),
-        # the server
-        '<rect x="28" y="124" width="904" height="484" rx="14" fill="none" stroke="#b9b2a7" '
-        'stroke-width="1.4"/>',
-        text(912, 146, "Server · FastAPI, one process", 12, 650, DIM, "end"),
-        band(170, 2, "Checks before spending"),
-        box(C1, 184, W, 58, "Sign-in", "signed cookie, when enabled"),
-        box(C2, 184, W, 58, "Limits", "rate · $ per visitor · $ per day"),
-        box(C3, 184, W, 58, "Queue", "5 answers at once, then a line"),
-        arrow([(C1 + W, 213), (C2 - 2, 213)]),
-        arrow([(C2 + W, 213), (C3 - 2, 213)]),
-        box(C2, 296, W, 58, "Orchestrator", "plan → research → write → check"),
-        step(C2 + 22, 325, 3),
-        arrow([(mid[2], 242), (mid[2], 325), (C2 + W + 2, 325)]),
-        f'<polyline points="{mid[1]},354 {mid[1]},382" fill="none" stroke="{ARROWS["ink"]}" '
-        f'stroke-width="1.5"/>',
-        f'<polyline points="{mid[0]},382 {mid[2]},382" fill="none" stroke="{ARROWS["ink"]}" '
-        f'stroke-width="1.5"/>',
-        arrow([(mid[0], 382), (mid[0], 406)]),
-        arrow([(mid[1], 382), (mid[1], 406)]),
-        arrow([(mid[2], 382), (mid[2], 406)]),
-        step(mid[1], 382, 4),
-        box(C1, 408, W, 58, "Model stages", "plan · grade · write · fact-check", "model"),
-        box(C2, 408, W, 58, "Web tools", "search · read pages · follow portals"),
-        box(C3, 408, W, 58, "Statute search", "meaning + keywords, reranked"),
-        box(C1, 516, W, 58, "Model client", "picks a model · fails over · counts cost"),
-        box(C3, 516, W, 58, "Legal corpus", "LanceDB on disk · 38,609 chunks", "store"),
-        arrow([(mid[0], 466), (mid[0], 514)]),
-        arrow([(mid[2], 466), (mid[2], 514)]),
-        text(mid[2] + 10, 494, "reads", 11, 500, DIM, "start"),
-        # the answer streams back
-        arrow([(C2, 340), (14, 340), (14, 52), (C1 - 2, 52)]),
-        step(190, 327, 5), text(208, 331, "the answer streams back", 11.5, 500, DIM, "start"),
+    def down(x, y1, y2, label="", dx=8):
+        return arrow([(x, y1), (x, y2 - 2)], label, at=(x + dx, (y1 + y2) / 2 + 4),
+                     anchor="start")
+
+    body = [
+        # the server panel, and its name in an empty corner
+        '<rect x="212" y="56" width="804" height="360" rx="16" fill="#f1efe9"/>',
+        text(232, 384, "The server", 13, 700, DIM, "start"),
+        text(232, 402, "FastAPI, one process", 11.5, 400, DIM, "start"),
+        # 1–3: in, through the checks, to the orchestrator
+        b(30, row_a, 150, "Browser", "HTML + JS"),
+        b(232, row_a, 150, "Sign-in", "signed cookie"),
+        b(420, row_a, 150, "Limits", "rate · $ per visitor"),
+        b(608, row_a, 150, "Queue", "5 at once, then wait"),
+        b(806, row_a, 190, "Orchestrator", "plan → research → write"),
+        arrow([(180, row_a + 29), (230, row_a + 29)]), step(205, row_a + 8, 1),
+        arrow([(382, row_a + 29), (418, row_a + 29)]),
+        arrow([(570, row_a + 29), (606, row_a + 29)]),
+        arrow([(758, row_a + 29), (804, row_a + 29)]), step(781, row_a + 8, 3),
+        # 2: the bracket under the checks
+        f'<path d="M240 146v8h510v-8" fill="none" stroke="{ARROWS["ink"]}" stroke-width="1.3"/>',
+        step(420, 176, 2),
+        text(438, 180, "checks before any money is spent", 12, 500, DIM, "start"),
+        # 5: the answer streams back, above everything
+        arrow([(901, row_a), (901, 30), (105, 30), (105, row_a - 2)]),
+        step(420, 16, 5),
+        text(438, 20, "the answer streams back: steps, sources, then the words", 12, 500, DIM,
+             "start"),
+        # 4: what one turn uses
+        f'<polyline points="901,130 901,208" fill="none" stroke="{ARROWS["ink"]}" '
+        'stroke-width="1.5"/>',
+        f'<polyline points="500,208 901,208" fill="none" stroke="{ARROWS["ink"]}" '
+        'stroke-width="1.5"/>',
+        down(500, 208, row_b), down(700, 208, row_b), down(901, 208, row_b),
+        step(760, 186, 4), text(778, 190, "what one turn uses", 12, 500, DIM, "start"),
+        b(410, row_b, 180, "Model stages", "plan · grade · write", "model"),
+        b(610, row_b, 180, "Web tools", "search · read · navigate"),
+        b(811, row_b, 180, "Statute search", "meaning + keywords"),
+        b(410, row_c, 180, "Model client", "routing · failover · cost"),
+        b(811, row_c, 180, "Legal corpus", "LanceDB · 38,609 chunks", "store"),
+        down(500, row_b + H, row_c),
+        down(901, row_b + H, row_c, "reads"),
         # outside
-        text(40, 634, "Outside services", 12, 650, DIM, "start"),
-        box(C1, 646, W, 58, "Model providers", "OpenRouter · NVIDIA NIM as backup", "api"),
-        box(C2, 646, W, 58, "The public web", "government sites · search · Wikipedia", "api"),
-        arrow([(mid[0], 574), (mid[0], 644)], "chat · embeddings · rerank", at=(mid[0] + 8, 618),
-              anchor="start"),
-        arrow([(mid[1], 466), (mid[1], 644)], "public addresses only", at=(mid[1] + 8, 618),
-              anchor="start"),
-        legend(40, 742, [("model", "uses a model"), ("code", "plain code"),
+        text(232, row_d + 26, "Outside services", 13, 700, DIM, "start"),
+        text(232, row_d + 44, "called over HTTPS", 11.5, 400, DIM, "start"),
+        b(410, row_d, 180, "Model providers", "OpenRouter · NIM backup", "api"),
+        b(610, row_d, 180, "The public web", "gov sites · search · wiki", "api"),
+        down(500, row_c + H, row_d, "chat · embed · rerank"),
+        down(700, row_b + H, row_d, "public URLs only"),
+        legend(30, 560, [("model", "uses a model"), ("code", "plain code"),
                          ("api", "outside service"), ("store", "stored data")]),
     ]
-    figure("system.svg", 960, 766, "The system, in order: a question passes sign-in, spending "
-           "limits and a queue; the orchestrator runs one turn using model stages, web tools and "
-           "statute search; the answer streams back.", "".join(b))
+    figure("system.svg", 1030, 584, "The system, in order: (1) a question leaves the browser, "
+           "(2) passes sign-in, spending limits and a queue, (3) reaches the orchestrator, which "
+           "(4) uses model stages, web tools and statute search, and (5) streams the answer back.",
+           "".join(body))
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ choices are in [EVALUATION.md](EVALUATION.md).
 
 ## The system
 
-<p align="center"><img src="docs/system.svg" width="780" alt="In order: (1) the browser sends a question; (2) sign-in, spending limits and a queue run before any money is spent; (3) the orchestrator runs one turn, (4) using model stages, web tools and statute search, which call model providers, the public web and the legal corpus; (5) the answer streams back."></p>
+<p align="center"><img src="docs/system.svg" width="880" alt="In order: (1) the browser sends a question; (2) sign-in, spending limits and a queue run before any money is spent; (3) the orchestrator runs one turn, (4) using model stages, web tools and statute search, which call model providers, the public web and the legal corpus; (5) the answer streams back."></p>
 
 Read it in the order of the numbers: a question arrives (1), passes the checks that come before
 any spending (2), and the orchestrator runs one turn (3) using model stages, web tools and
