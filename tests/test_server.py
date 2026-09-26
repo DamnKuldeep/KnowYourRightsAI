@@ -293,3 +293,44 @@ def test_the_admin_token_passes_the_gate(gated, monkeypatch):
     monkeypatch.setattr(config, "ADMIN_TOKEN", "tok-123")
     assert client.get("/api/quota", headers={"Authorization": "Bearer tok-123"}).status_code == 200
     assert client.get("/api/quota", headers={"Authorization": "Bearer wrong"}).status_code == 401
+
+
+# ── budget reset code ─────────────────────────────────────────────────────────────────
+def _spend_everything(services, client_key):
+    services.guard.book.charge(client_key, config.CLIENT_BUDGET_USD + 0.01)
+
+
+def test_the_reset_code_restores_an_exhausted_allowance(api, monkeypatch):
+    client, services = api
+    monkeypatch.setattr(config, "BUDGET_RESET_CODE", "reset-me")
+    key = services.guard.book.key("testclient")
+    _spend_everything(services, key)
+    assert ask(client).status_code == 403
+    assert client.get("/api/config").json()["budget_reset"] is True
+
+    wrong = client.post("/api/quota/reset", json={"code": "nope"})
+    assert wrong.status_code == 403 and wrong.json()["error"]["kind"] == "wrong_code"
+    ok = client.post("/api/quota/reset", json={"code": " reset-me "})
+    assert ok.status_code == 200 and ok.json()["exhausted"] is False
+    assert ask(client).status_code == 200
+
+
+def test_the_reset_code_clears_a_reached_daily_ceiling(api, monkeypatch):
+    client, services = api
+    monkeypatch.setattr(config, "BUDGET_RESET_CODE", "reset-me")
+    monkeypatch.setattr(config, "DAILY_BUDGET_USD", 0.5)
+    services.guard.book.charge(services.guard.book.key("someone else"), 0.6)
+    assert ask(client).json()["error"]["kind"] == "daily_budget"
+    assert client.post("/api/quota/reset", json={"code": "reset-me"}).status_code == 200
+    assert ask(client).status_code == 200
+
+
+def test_resetting_is_off_without_a_code_and_locks_out_guessing(api, monkeypatch):
+    client, _ = api
+    monkeypatch.setattr(config, "BUDGET_RESET_CODE", "")
+    assert client.post("/api/quota/reset", json={"code": "anything"}).status_code == 404
+    monkeypatch.setattr(config, "BUDGET_RESET_CODE", "reset-me")
+    for _ in range(10):
+        client.post("/api/quota/reset", json={"code": "guess"})
+    locked = client.post("/api/quota/reset", json={"code": "reset-me"})
+    assert locked.status_code == 429

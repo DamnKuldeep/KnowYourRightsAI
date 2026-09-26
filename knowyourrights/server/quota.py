@@ -96,6 +96,14 @@ class SpendBook:
             if time.monotonic() - self._saved_at >= self.SAVE_INTERVAL_S:
                 self._save()
 
+    def reset(self, key: str, *, day: bool = False) -> None:
+        """Forget what this client has spent and restart its window; optionally today's total."""
+        with self._lock:
+            self._data["clients"][key] = {"usd": 0.0, "since": time.time()}
+            if day:
+                self._data["daily_usd"] = 0.0
+            self._save()
+
     def flush(self) -> None:
         with self._lock:
             if self._dirty:
@@ -161,7 +169,7 @@ class Guard:
         self.rate = RateLimiter()
 
     def check(self, key: str) -> Verdict:
-        if config.DAILY_BUDGET_USD > 0 and self.book.daily_spent() >= config.DAILY_BUDGET_USD:
+        if self.day_exhausted():
             return Verdict(False, "daily_budget",
                            "This free service has reached today's usage limit. Please come back "
                            "tomorrow.")
@@ -172,6 +180,9 @@ class Guard:
             return Verdict(False, "rate", f"You are asking questions very quickly. Please wait "
                                           f"{wait} seconds and try again.", retry_after_s=wait)
         return Verdict(True)
+
+    def day_exhausted(self) -> bool:
+        return 0 < config.DAILY_BUDGET_USD <= self.book.daily_spent()
 
     def exhausted(self, key: str) -> bool:
         return 0 < config.CLIENT_BUDGET_USD <= self.book.spent(key)

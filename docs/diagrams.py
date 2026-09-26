@@ -32,6 +32,12 @@ def text(x, y, s, size=13, weight=400, fill=INK, anchor="middle", rotate=None):
             f'text-anchor="{anchor}"{turn}>{escape(s)}</text>')
 
 
+def step(x, y, n):
+    """A numbered badge, so prose can refer to a step by number."""
+    return (f'<circle cx="{x}" cy="{y}" r="11" fill="#1f6f5c"/>'
+            + text(x, y + 4, str(n), 11.5, 700, "#ffffff"))
+
+
 def box(x, y, w, h, title, sub="", kind="code", pill=False, title_size=13):
     fill, stroke, dash = STYLES[kind]
     rx = h / 2 if pill else 9
@@ -100,8 +106,7 @@ def pipeline():
         # research round
         f'<rect x="{L}" y="278" width="300" height="132" rx="11" fill="none" stroke="#b9b2a7" '
         f'stroke-width="1.4"/>',
-        text(CX, 301, "Research round", 13, 620),
-        text(CX, 301 + 0, "", 11),
+        text(CX, 301, "Research round · the plan picks, all in parallel", 12.5, 620),
         box(104, 316, 136, 36, "Statute search", title_size=12),
         box(250, 316, 126, 36, "Official sites", title_size=12),
         box(104, 362, 136, 36, "Web pages", title_size=12),
@@ -110,6 +115,9 @@ def pipeline():
         box(L, 534, 300, 56, "Writer", "streams the answer as it is written", "model"),
         box(L, 624, 300, 56, "Citation check", "every [S1] must match a source it was given"),
         box(140, 714, 200, 40, "Answer + sources", pill=True),
+        # numbered steps, outside the boxes so they never collide with centred text
+        step(68, 126, 1), step(68, 216, 2), step(68, 297, 3), step(68, 452, 4),
+        step(68, 562, 5), step(68, 652, 6),
         # main flow
         arrow([(CX, 64), (CX, 96)]),
         arrow([(CX, 154), (CX, 186)]),

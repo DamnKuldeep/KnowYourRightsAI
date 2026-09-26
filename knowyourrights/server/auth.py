@@ -48,6 +48,31 @@ def parse_users(raw: str) -> dict[str, str]:
     return users
 
 
+class Attempts:
+    """Wrong guesses per address. Past FAILURE_LIMIT within the window the address is locked out
+    until its oldest guess ages out. Used for sign-in and for the budget reset code."""
+
+    def __init__(self) -> None:
+        self.failures: dict[str, deque[float]] = {}
+
+    def locked_out(self, address: str, now: float | None = None) -> bool:
+        now = now or time.time()
+        recent = self.failures.get(address)
+        while recent and recent[0] < now - FAILURE_WINDOW_S:
+            recent.popleft()
+        return bool(recent) and len(recent) >= FAILURE_LIMIT
+
+    def record(self, address: str) -> None:
+        self.failures.setdefault(address, deque()).append(time.time())
+        if len(self.failures) > 10_000:         # a flood of addresses must not grow forever
+            self.failures.clear()
+
+
+def code_matches(supplied: str, expected: str) -> bool:
+    """A constant-time comparison; an unset code never matches."""
+    return bool(expected) and secrets.compare_digest(supplied.encode(), expected.encode())
+
+
 class Gate:
     def __init__(self, raw_users: str | None = None, secret: str | None = None,
                  days: float | None = None) -> None:
@@ -57,7 +82,7 @@ class Gate:
         self.key = (secret.encode() if secret.strip()
                     else hashlib.sha256(b"kyr-session\0" + raw.encode()).digest())
         self.ttl_s = (days if days is not None else config.LOGIN_DAYS) * 86400
-        self.failures: dict[str, deque[float]] = {}
+        self.attempts = Attempts()
 
     @property
     def enabled(self) -> bool:
@@ -91,11 +116,7 @@ class Gate:
 
     # ── passwords ─────────────────────────────────────────────────────────────────────
     def locked_out(self, address: str, now: float | None = None) -> bool:
-        now = now or time.time()
-        recent = self.failures.get(address)
-        while recent and recent[0] < now - FAILURE_WINDOW_S:
-            recent.popleft()
-        return bool(recent) and len(recent) >= FAILURE_LIMIT
+        return self.attempts.locked_out(address, now)
 
     def check(self, address: str, user: str, password: str) -> bool:
         expected = self.users.get(user)
@@ -103,9 +124,7 @@ class Gate:
         ok = secrets.compare_digest(password.encode(), (expected or "\0").encode()) and \
             expected is not None
         if not ok:
-            self.failures.setdefault(address, deque()).append(time.time())
-            if len(self.failures) > 10_000:         # a flood of addresses must not grow forever
-                self.failures.clear()
+            self.attempts.record(address)
         return ok
 
     def request_user(self, request: Request) -> str | None:

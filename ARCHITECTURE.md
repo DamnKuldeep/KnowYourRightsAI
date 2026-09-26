@@ -30,7 +30,7 @@ A request passes four gates before any money is spent:
 |---|---|---|
 | Sign-in | a signed, HttpOnly cookie; 10 wrong passwords lock an address for 15 min | off until `KYR_LOGIN_USERS` is set |
 | Validate | every field bounded; the state must be a known state (it is written into the prompt) | — |
-| Guards | questions per minute and in flight, per visitor; $ per visitor; $ per day for the site | 10/min, 2 · $1 · $5 |
+| Guards | questions per minute and in flight, per visitor; $ per visitor; $ per day for the site. An operator's reset code restores a spent allowance. | 10/min, 2 · $1 · $5 |
 | Admission queue | answers at once; later ones wait and see their place in line | 5 at once, 20 waiting, 180 s max |
 
 Visitors are identified by IP address, stored only as a salted hash. Every billed call charges
@@ -41,7 +41,7 @@ survives restarts. A running answer may finish, so a visitor can overshoot by on
 
 <p align="center"><img src="docs/pipeline.svg" width="640" alt="Safety gate, then planner, research round, grader, writer and citation check, with branches for emergencies, off-topic questions, named sections, how-to questions and deep-mode verification."></p>
 
-The planner picks a depth unless the reader forces one:
+Steps 2, 4 and 5 are model calls; 1, 3 and 6 are plain code, and so is every decision about what runs next. The planner picks a depth unless the reader forces one:
 
 | Depth | Research rounds | Pages read | Time budget | Also |
 |---|---:|---:|---:|---|
@@ -158,7 +158,7 @@ searches check them, and a corrected answer replaces the draft in one piece.
 
 | Risk | Measure |
 |---|---|
-| Strangers spending the budget | optional sign-in; per-visitor allowance and rate limit; daily ceiling; queue |
+| Strangers spending the budget | optional sign-in; per-visitor allowance and rate limit; daily ceiling; queue. The reset code is compared in constant time and, like passwords, locks an address out after 10 wrong tries. |
 | Prompt injection from web pages | page text is sanitised, injection phrases removed, and passed as labelled data; models cannot call tools |
 | Server-side request forgery | only public http(s) addresses are fetched; every resolved IP is checked, again after redirects |
 | Cross-site scripting | the UI escapes everything before rendering; links must be http(s); a Content-Security-Policy allows only the app's own scripts |

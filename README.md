@@ -109,6 +109,7 @@ Every setting is an environment variable (or a line in `.env`), listed with its 
 | `KYR_LOGIN_USERS` | — | `name:password,…` puts the whole site behind a sign-in page. |
 | `KYR_CLIENT_BUDGET_USD` | `1.0` | Spend allowed per visitor (IP address) before a "free limit reached" popup. |
 | `KYR_DAILY_BUDGET_USD` | `5.0` | Ceiling on the whole site's spend per day. |
+| `KYR_BUDGET_RESET_CODE` | — | A code that restores a spent allowance, entered from the usage dialog. |
 | `KYR_MAX_ACTIVE_TURNS` | `5` | Answers researched at once; later questions wait in a visible queue. |
 | `KYR_TRUST_PROXY_HEADERS` | `false` | Set `true` behind a reverse proxy or tunnel, or every visitor looks like one. |
 | `KYR_ADMIN_TOKEN` | — | Bearer token for the `/api/status` diagnostics. |
@@ -136,6 +137,7 @@ A 2 GB machine is enough.
 | `POST` | `/api/stop` · `/api/reset` | Stop the current answer · forget the conversation |
 | `POST` | `/api/feedback` | Rate an answer |
 | `GET` | `/api/config` · `/api/quota` | What the UI needs · this visitor's remaining allowance |
+| `POST` | `/api/quota/reset` | Restore the allowance with the reset code |
 | `GET` | `/api/health` · `/api/status` | Health for monitors · full diagnostics (admin) |
 | `GET` `POST` | `/login` · `POST /logout` | Sign in and out, when `KYR_LOGIN_USERS` is set |
 
@@ -145,7 +147,7 @@ Refusals return `{"error": {"kind", "message", "retry_after_s"}}` with a 4xx/5xx
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                                    # 228 tests, ~10 s, no network or API key needed
+pytest                                    # 231 tests, ~10 s, no network or API key needed
 ruff check knowyourrights scripts tests
 python docs/diagrams.py                   # rebuild the diagrams in docs/
 ```

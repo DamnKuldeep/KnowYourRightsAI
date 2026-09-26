@@ -19,7 +19,7 @@ in `config.py`.
 | Browser sweep, 15 question types | **15 / 15**, no JavaScript errors | `scripts/ui_check.py` |
 | Median statute search | **0.8 s** | `scripts/evaluate.py` |
 | Cost per answer | **$0.002–0.004**; deep ~$0.015 | billed usage |
-| Automated tests | **228** pass in ~10 s | `pytest` |
+| Automated tests | **231** pass in ~10 s | `pytest` |
 
 ## Test sets
 

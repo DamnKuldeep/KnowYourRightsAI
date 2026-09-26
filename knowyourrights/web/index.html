@@ -3,179 +3,237 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>KnowYourRights — Indian legal rights assistant</title>
-  <meta name="description" content="Plain-language answers about your rights under Indian law, with citations to the actual sections.">
+  <title>KnowYourRights — Indian law, cited to the section</title>
+  <meta name="description" content="Plain-language answers about your rights under Indian law, each claim linked to the section it comes from.">
   <link rel="stylesheet" href="/static/styles.css">
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>⚖️</text></svg>">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%230e6b5a'/><text x='16' y='23' font-size='19' font-family='Georgia,serif' font-weight='700' text-anchor='middle' fill='white'>§</text></svg>">
 </head>
 <body>
-<div class="app">
-  <header>
-    <div class="brand">
-      <h1>⚖️ KnowYourRights</h1>
-      <span class="sub">Indian law, in plain language, with citations</span>
-    </div>
-    <div class="controls">
-      <div class="segmented" role="group" aria-label="Research depth">
-        <button data-depth="auto"     aria-pressed="true"  title="Let the assistant decide how much research the question needs">Auto</button>
-        <button data-depth="quick"    aria-pressed="false" title="One fast lookup">Quick</button>
-        <button data-depth="deep"     aria-pressed="false" title="Multi-round research, reads official sites">Deep</button>
-      </div>
-      <button class="icon-btn" id="pipelineBtn" aria-label="What each mode does"
-              title="What each mode does" aria-expanded="false" aria-controls="pipeline">?</button>
-      <select id="state" aria-label="Your state">
-        <option value="">All India</option>
-      </select>
-      <button class="icon-btn" id="theme" aria-label="Toggle dark mode" title="Toggle dark mode">◐</button>
-      <button class="icon-btn" id="reset" aria-label="New conversation" title="New conversation">✚</button>
+<!-- Icons, drawn once and reused with <use>. Stroke icons take the button's text colour. -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v15H6.5A2.5 2.5 0 0 0 4 20.5zM4 20.5A2.5 2.5 0 0 0 6.5 23H20v-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
+  <symbol id="i-help" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9.2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M9.6 9.3a2.5 2.5 0 0 1 4.8.9c0 1.7-2.4 2.2-2.4 3.8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="12" cy="17.2" r="1.1" fill="currentColor"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+  <symbol id="i-new" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+  <symbol id="i-exit" viewBox="0 0 24 24"><path d="M15 4h3.5A1.5 1.5 0 0 1 20 5.5v13a1.5 1.5 0 0 1-1.5 1.5H15M10 16l-4-4 4-4M6 12h10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+  <symbol id="i-pin" viewBox="0 0 24 24"><path d="M12 21s-6.5-5.6-6.5-11a6.5 6.5 0 0 1 13 0c0 5.4-6.5 11-6.5 11z" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="12" cy="10" r="2.3" fill="none" stroke="currentColor" stroke-width="1.8"/></symbol>
+  <symbol id="i-send" viewBox="0 0 16 16"><path d="M8 13V3M8 3L3.5 7.5M8 3l4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-shuffle" viewBox="0 0 24 24"><path d="M4 12a8 8 0 0 1 13.7-5.6L20 8.5M20 4v4.5h-4.5M20 12a8 8 0 0 1-13.7 5.6L4 15.5M4 20v-4.5h4.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+</svg>
+
+<div class="app" data-sources="closed">
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="KnowYourRights, start page">
+      <span class="logo" aria-hidden="true">§</span>
+      <span class="brand-text"><span class="name">KnowYourRights</span>
+        <span class="tag">Indian law, cited to the section</span></span>
+    </a>
+    <nav class="actions" aria-label="Page actions">
+      <button class="pill-btn" id="sourcesBtn" type="button" aria-expanded="false"
+              aria-controls="sourcesPanel" title="Show the laws behind the answer">
+        <svg class="icon"><use href="#i-book"/></svg><span class="label">Sources</span>
+        <span class="count" id="sourcesCount" hidden>0</span>
+      </button>
+      <button class="icon-btn" id="pipelineBtn" type="button" aria-label="How it works"
+              title="How it works" aria-expanded="false" aria-controls="pipeline">
+        <svg class="icon"><use href="#i-help"/></svg></button>
+      <button class="icon-btn" id="theme" type="button" aria-label="Switch light or dark"
+              title="Switch light or dark">
+        <svg class="icon only-light"><use href="#i-moon"/></svg>
+        <svg class="icon only-dark"><use href="#i-sun"/></svg></button>
+      <button class="icon-btn" id="reset" type="button" aria-label="New conversation"
+              title="New conversation"><svg class="icon"><use href="#i-new"/></svg></button>
       <form id="signOut" method="post" action="/logout" hidden>
-        <button class="icon-btn" type="submit" aria-label="Sign out" title="Sign out">⏻</button>
+        <button class="icon-btn" type="submit" aria-label="Sign out" title="Sign out">
+          <svg class="icon"><use href="#i-exit"/></svg></button>
       </form>
-    </div>
+    </nav>
   </header>
 
-  <!-- What each depth actually runs. The numbers are the real budgets from config.DEPTHS, so
-       this panel and the orchestrator cannot drift apart silently. -->
-  <div class="pipeline" id="pipeline" hidden>
-    <div class="pipeline-inner">
-      <div class="pipeline-head">
-        <h2>What each mode does</h2>
-        <button class="icon-btn" id="pipelineClose" aria-label="Close">✕</button>
-      </div>
+  <div class="stage">
+    <div class="column">
+      <main class="thread" id="thread" role="log" aria-live="polite" aria-label="Conversation">
+        <div class="thread-inner" id="threadInner">
+          <!-- The empty state. Removed when the first question is sent, restored on "New
+               conversation". Suggestions are drawn from SUGGESTIONS in app.js. -->
+          <section class="welcome" id="welcome" aria-labelledby="welcomeTitle">
+            <p class="eyebrow">Indian law · plain language · every claim cited</p>
+            <h1 id="welcomeTitle">Know your rights, with the section that says so.</h1>
+            <p class="lede">Ask about the police, work, rent, shopping, family or government
+              services. Answers come from the Constitution, about 1,000 central Acts and the 2023
+              criminal codes, and every claim links to the section it rests on.</p>
 
-      <p class="pipeline-lede">Every mode runs the same retrieval core — the difference is how
-        many times it searches, whether it reads the open web, and how long it is allowed to
-        take. Nothing is hidden: the stage timeline above each answer shows exactly what ran.</p>
+            <div class="suggest-head">
+              <h2>Try asking</h2>
+              <button class="link-btn" id="shuffle" type="button">
+                <svg class="icon sm"><use href="#i-shuffle"/></svg>Other ideas</button>
+            </div>
+            <div class="suggestions" id="suggestions"></div>
 
-      <div class="pipeline-grid">
-        <section class="pl pl-quick">
-          <h3><span class="dot"></span>Quick</h3>
-          <p class="pl-when">One question, one answer. Best for “what does Article 21 say”.</p>
-          <ol class="pl-steps">
-            <li><b>Plan</b> — classify the question, detect its language</li>
-            <li><b>Retrieve once</b> — semantic + keyword search, fused, reranked</li>
-            <li><b>Grade</b> — drop sections that merely mention the Act</li>
-            <li><b>Write</b> — streamed, with [S1] citations</li>
-          </ol>
-          <dl class="pl-facts">
-            <div><dt>Search rounds</dt><dd>1</dd></div>
-            <div><dt>Reads the web</dt><dd>no</dd></div>
-            <div><dt>Time limit</dt><dd>25 s</dd></div>
-          </dl>
-        </section>
-
-        <section class="pl pl-standard">
-          <h3><span class="dot"></span>Auto <em>→ usually Standard</em></h3>
-          <p class="pl-when">The default. Picks Quick or Deep from the question itself.</p>
-          <ol class="pl-steps">
-            <li><b>Plan</b> — split into sub-questions, choose the sources</li>
-            <li><b>Retrieve + grade</b> — the statute, plus official web pages</li>
-            <li><b>Read</b> — up to 3 official pages when a procedure is asked for</li>
-            <li><b>Write</b> — streamed, with an at-a-glance card for procedures</li>
-          </ol>
-          <dl class="pl-facts">
-            <div><dt>Search rounds</dt><dd>1</dd></div>
-            <div><dt>Reads the web</dt><dd>up to 3 pages</dd></div>
-            <div><dt>Time limit</dt><dd>75 s</dd></div>
-          </dl>
-        </section>
-
-        <section class="pl pl-deep">
-          <h3><span class="dot"></span>Deep</h3>
-          <p class="pl-when">Procedures end to end — fees, deadlines, which office, how to appeal.</p>
-          <ol class="pl-steps">
-            <li><b>Plan</b> — split into sub-questions, rephrase each several ways</li>
-            <li><b>Retrieve + grade</b> — repeats while gaps remain</li>
-            <li><b>Navigate</b> — follows links inside government portals, 2 levels down</li>
-            <li><b>Gap analysis</b> — asks what is still unanswered, searches again</li>
-            <li><b>Self-verify</b> — re-checks claims it is unsure of against the web</li>
-            <li><b>Write, then revise</b> — rewrites if verification contradicts it</li>
-          </ol>
-          <dl class="pl-facts">
-            <div><dt>Search rounds</dt><dd>up to 4</dd></div>
-            <div><dt>Reads the web</dt><dd>up to 10 pages, 2 deep</dd></div>
-            <div><dt>Time limit</dt><dd>240 s</dd></div>
-          </dl>
-        </section>
-      </div>
-
-      <p class="pipeline-foot"><b>Always on, in every mode:</b> answers cite only retrieved text;
-        citations are checked to resolve before you see them; when nothing scores well enough the
-        assistant says so instead of guessing; and central law is labelled separately from state
-        law, because a state Act does not apply outside its state.</p>
-    </div>
-  </div>
-
-  <!-- Shown when this connection's free allowance, or the service's daily limit, is used up. -->
-  <div class="modal" id="limit" role="alertdialog" aria-modal="true"
-       aria-labelledby="limitTitle" aria-describedby="limitText" hidden>
-    <div class="modal-inner">
-      <h2 id="limitTitle">Free usage limit reached</h2>
-      <p id="limitText"></p>
-      <p class="modal-foot">For help with your situation, free legal aid is available from
-        NALSA on <b>15100</b>.</p>
-      <button class="primary" id="limitClose">OK</button>
-    </div>
-  </div>
-
-  <main>
-    <div class="thread" id="thread" role="log" aria-live="polite" aria-label="Conversation">
-      <div class="thread-inner" id="threadInner">
-        <!-- The empty state. Removed when the first question is sent, restored on "New
-             conversation". Suggestions are drawn from SUGGESTIONS in app.js. -->
-        <section class="welcome" id="welcome" aria-labelledby="welcomeTitle">
-          <p class="eyebrow">Indian law · plain language · every claim cited</p>
-          <h2 id="welcomeTitle">Know your rights, with the section that says so.</h2>
-          <p class="lede">Ask about the police, work, rent, shopping, family or government
-            services. Answers come from the Constitution, about 1,000 central Acts and the 2023
-            criminal codes, and each claim links to the section it rests on.</p>
-
-
-          <div class="suggest-head">
-            <h3>Try asking</h3>
-            <button class="link-btn" id="shuffle" type="button">↻ Other ideas</button>
+            <ul class="features" aria-label="What it does">
+              <li><span class="f-icon" aria-hidden="true">§</span>
+                <b>Cited to the section</b><span>Each claim links to the provision it rests on.</span></li>
+              <li><span class="f-icon" aria-hidden="true">✓</span>
+                <b>Current law</b><span>IPC, CrPC and Evidence Act questions answered under BNS,
+                BNSS and BSA.</span></li>
+              <li><span class="f-icon" aria-hidden="true">₹</span>
+                <b>Official procedures</b><span>Fees, deadlines and portals from government
+                sites.</span></li>
+              <li><span class="f-icon" aria-hidden="true">अ</span>
+                <b>Your language</b><span>English, हिन्दी or Hinglish.</span></li>
+            </ul>
+          </section>
+        </div>
+      </main>
+      <footer class="composer">
+        <div class="composer-inner">
+          <div class="composer-box">
+            <label class="sr-only" for="input">Your question</label>
+            <textarea id="input" rows="1" placeholder="Ask about your legal rights…" autocomplete="off"></textarea>
+            <div class="toolbar">
+              <div class="segmented" role="group" aria-label="How much research">
+                <button type="button" data-depth="auto" aria-pressed="true"
+                        title="Picks Quick, Standard or Deep from your question">Auto</button>
+                <button type="button" data-depth="quick" aria-pressed="false"
+                        title="One fast lookup, no web pages">Quick</button>
+                <button type="button" data-depth="deep" aria-pressed="false"
+                        title="Several rounds; reads and checks official sites">Deep</button>
+              </div>
+              <label class="state-pick" title="Where the matter is: decides which state's law applies">
+                <svg class="icon sm" aria-hidden="true"><use href="#i-pin"/></svg>
+                <span class="sr-only">State</span>
+                <select id="state"><option value="">All India</option></select>
+              </label>
+              <span class="hint">Enter to send · Shift+Enter for a new line</span>
+              <button class="send" id="send" type="button" aria-label="Send" title="Send (Enter)">
+                <svg width="16" height="16"><use href="#i-send"/></svg>
+              </button>
+            </div>
           </div>
-          <div class="suggestions" id="suggestions"></div>
-
-          <ul class="features" aria-label="What it does">
-            <li><span class="f-icon" aria-hidden="true">§</span>
-              <b>Cited to the section</b><span>Every claim links to the exact provision.</span></li>
-            <li><span class="f-icon" aria-hidden="true">⟳</span>
-              <b>Current law</b><span>IPC, CrPC and Evidence Act questions are answered under
-              BNS, BNSS and BSA.</span></li>
-            <li><span class="f-icon" aria-hidden="true">↗</span>
-              <b>Official procedures</b><span>Fees, deadlines and portals from government
-              sites.</span></li>
-            <li><span class="f-icon" aria-hidden="true">अ</span>
-              <b>Your language</b><span>English, हिन्दी or Hinglish.</span></li>
-          </ul>
-        </section>
-      </div>
+          <div class="footer">
+            <span class="disclaimer" id="disclaimer">General information about Indian law, not legal advice. For your situation, consult a lawyer — free legal aid is on 15100.</span>
+            <span class="stat" id="stat"></span>
+            <button class="link-btn quota" id="quota" type="button" hidden
+                    title="Your allowance, and how to reset it"></button>
+          </div>
+        </div>
+      </footer>
     </div>
 
-    <aside aria-label="Sources and citations" data-empty>
-      <h2>Sources</h2>
-      <div id="sources"><p class="empty">The laws behind each answer appear here: statutes first, then official sources. Select a <span class="cite-demo">S1</span> in an answer to jump to its source.</p></div>
+    <div class="scrim" id="scrim"></div>
+    <aside class="sources" id="sourcesPanel" aria-label="Sources">
+      <div class="sources-head">
+        <h2>Sources</h2>
+        <button class="icon-btn" id="sourcesClose" type="button" aria-label="Close sources"
+                title="Close"><svg class="icon"><use href="#i-close"/></svg></button>
+      </div>
+      <div id="sources"><p class="empty">The laws behind each answer appear here: statutes
+        first, then official pages. Select a citation like <span class="cite" data-cite="S1">S1</span>
+        in an answer to jump to it.</p></div>
     </aside>
-  </main>
+  </div>
 
-  <div class="composer">
-    <div class="composer-inner">
-      <div class="input-row">
-        <label class="sr-only" for="input">Your question</label>
-        <textarea id="input" rows="1" placeholder="Ask about your legal rights…" autocomplete="off"></textarea>
-        <button class="send" id="send" aria-label="Send" title="Send (Enter)">
-          <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <path d="M8 13V3M8 3L3.5 7.5M8 3l4.5 4.5" stroke="currentColor" stroke-width="1.8"
-                  stroke-linecap="round" stroke-linejoin="round"/>
-          </svg>
-        </button>
+
+  <!-- How it works. Budgets are filled in from /api/config, so the panel cannot drift from
+       what the server actually runs. -->
+  <div class="overlay" id="pipeline" hidden>
+    <div class="dialog wide" role="dialog" aria-modal="true" aria-labelledby="pipelineTitle">
+      <div class="dialog-head">
+        <h2 id="pipelineTitle">How answers are made</h2>
+        <button class="icon-btn" id="pipelineClose" type="button" aria-label="Close">
+          <svg class="icon"><use href="#i-close"/></svg></button>
       </div>
-      <div class="footer">
-        <span class="disclaimer" id="disclaimer">General information about Indian law, not legal advice. For your situation, consult a lawyer — free legal aid is on 15100.</span>
-        <span class="stat" id="stat"></span>
-        <span class="stat quota" id="quota"></span>
+
+      <h3 class="step-title"><span class="n">1</span>Choose how much research</h3>
+      <p class="dim">Auto, the default, reads your question and picks one of these three. The
+        Quick and Deep buttons below the question box force a choice.</p>
+      <div class="modes">
+        <section class="mode mode-quick">
+          <h4>Quick</h4>
+          <p>A direct lookup in the law. Best for “what does Article 21 say”.</p>
+          <dl>
+            <div><dt>Searches</dt><dd data-fact="quick.rounds"></dd></div>
+            <div><dt>Web pages read</dt><dd data-fact="quick.pages"></dd></div>
+            <div><dt>Time limit</dt><dd data-fact="quick.deadline"></dd></div>
+          </dl>
+        </section>
+        <section class="mode mode-standard">
+          <h4>Standard <em>Auto’s usual pick</em></h4>
+          <p>The law plus official sites. Best for most questions, and “how do I…”.</p>
+          <dl>
+            <div><dt>Searches</dt><dd data-fact="standard.rounds"></dd></div>
+            <div><dt>Web pages read</dt><dd data-fact="standard.pages"></dd></div>
+            <div><dt>Time limit</dt><dd data-fact="standard.deadline"></dd></div>
+          </dl>
+        </section>
+        <section class="mode mode-deep">
+          <h4>Deep</h4>
+          <p>Searches again while gaps remain, follows portal links, then re-checks fees and
+            deadlines. Best for comparing options.</p>
+          <dl>
+            <div><dt>Searches</dt><dd data-fact="deep.rounds"></dd></div>
+            <div><dt>Web pages read</dt><dd data-fact="deep.pages"></dd></div>
+            <div><dt>Time limit</dt><dd data-fact="deep.deadline"></dd></div>
+          </dl>
+        </section>
       </div>
+
+      <h3 class="step-title"><span class="n">2</span>What happens every time</h3>
+      <ul class="always">
+        <li><b>Safety first.</b> If you describe violence, self-harm or an arrest in progress,
+          helpline numbers appear before anything else.</li>
+        <li><b>The law is searched, not remembered.</b> By meaning and by keyword, then
+          re-ranked, across the Constitution, ~1,000 central Acts and the 2023 codes.</li>
+        <li><b>Every citation is checked.</b> A citation that does not match a source it was
+          given is removed before you see the answer.</li>
+        <li><b>It says when it doesn’t know.</b> If nothing in the law is close enough, it tells
+          you so instead of guessing.</li>
+        <li><b>Where you are matters.</b> State and Union Territory laws are labelled; for state
+          subjects such as rent, set your state with the pin below the question box.</li>
+      </ul>
+
+      <h3 class="step-title"><span class="n">3</span>Reading an answer</h3>
+      <dl class="legend">
+        <div><dt><span class="cite" data-cite="S1">S1</span></dt><dd>a section of an Act or
+          the Constitution</dd></div>
+        <div><dt><span class="cite" data-cite="G1">G1</span></dt><dd>an official government
+          page</dd></div>
+        <div><dt><span class="cite" data-cite="W1">W1</span></dt><dd>another web page, used for
+          context only</dd></div>
+        <div><dt><span class="legend-box">Research</span></dt><dd>every step that ran; open it
+          to see the searches</dd></div>
+        <div><dt><span class="legend-box glance">At a glance</span></dt><dd>fee, time limit,
+          appeal and portal for a procedure</dd></div>
+      </dl>
+      <p class="dim small">Select any citation to open it in the Sources panel. General
+        information, not legal advice: for your situation, free legal aid is on
+        <b>15100</b>.</p>
+    </div>
+  </div>
+
+  <!-- Usage: shown when an allowance runs out, or from the footer. -->
+  <div class="overlay" id="limit" hidden>
+    <div class="dialog" role="alertdialog" aria-modal="true" aria-labelledby="limitTitle"
+         aria-describedby="limitText">
+      <div class="dialog-head">
+        <h2 id="limitTitle">Your allowance</h2>
+        <button class="icon-btn" id="limitClose" type="button" aria-label="Close">
+          <svg class="icon"><use href="#i-close"/></svg></button>
+      </div>
+      <p id="limitText"></p>
+      <form class="reset-form" id="resetForm" hidden>
+        <label for="resetCode">Have a reset code?</label>
+        <div class="reset-row">
+          <input id="resetCode" type="password" autocomplete="off" maxlength="200"
+                 placeholder="Reset code" required>
+          <button class="primary" type="submit">Reset</button>
+        </div>
+        <p class="reset-msg" id="resetMsg" role="status"></p>
+      </form>
+      <p class="dim small">For help with your situation, free legal aid is available from
+        NALSA on <b>15100</b>.</p>
     </div>
   </div>
 </div>

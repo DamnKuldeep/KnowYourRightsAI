@@ -47,3 +47,7 @@ class FeedbackRequest(BaseModel):
     question: str = Field(default="", max_length=4000)
     answer: str = Field(default="", max_length=8000)
     comment: str = Field(default="", max_length=2000)
+
+
+class ResetRequest(BaseModel):
+    code: str = Field(min_length=1, max_length=200)

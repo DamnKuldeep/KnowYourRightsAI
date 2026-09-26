@@ -436,3 +436,6 @@ ADMIN_TOKEN = env_key("KYR_ADMIN_TOKEN")
 # Sign-in (server/auth.py). KYR_LOGIN_USERS is "name:password" pairs separated by commas; empty
 # leaves the site open. KYR_SESSION_SECRET, if set, signs the cookies. Sessions last this long.
 LOGIN_DAYS = env_float("KYR_LOGIN_DAYS", 30.0)
+# A code that resets a visitor's spent allowance (and today's total, if the daily ceiling was
+# reached). Empty disables resetting. Keep it out of the repository: set it in .env.
+BUDGET_RESET_CODE = os.environ.get("KYR_BUDGET_RESET_CODE", "").strip()

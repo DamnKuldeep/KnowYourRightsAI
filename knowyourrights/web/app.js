@@ -12,7 +12,9 @@ const $ = (sel) => document.querySelector(sel);
 const thread = $('#thread');
 const threadInner = $('#threadInner');
 const sourcesPane = $('#sources');
-const aside = sourcesPane.closest('aside');
+const app = $('.app');
+const sourcesBtn = $('#sourcesBtn');
+const sourcesCount = $('#sourcesCount');
 const input = $('#input');
 const sendBtn = $('#send');
 const statEl = $('#stat');
@@ -32,6 +34,8 @@ const state = {
   timelineSteps: new Map(),
   lastQuestion: '',
   locked: false,        // a usage limit was reached; no more questions from this page
+  config: {},           // /api/config: budgets, whether a reset code is accepted, the user
+  quota: null,          // the last /api/quota answer
 };
 
 /* ── escaping and a very small markdown subset ─────────────────────────────────── */
@@ -182,6 +186,7 @@ function startTurn(question) {
   state.answerText = '';
   state.timelineSteps.clear();
   sourcesPane.innerHTML = '<p class="empty">Searching…</p>';
+  setSourceCount(0);
 
   const userMsg = el('div', 'msg user', `<div class="body">${esc(question)}</div>`);
   threadInner.appendChild(userMsg);
@@ -289,7 +294,7 @@ function addProcedure(data) {
 const TIER_ORDER = { statute: 0, official: 1, 'legal portal': 2, background: 3, web: 4 };
 
 function renderSources() {
-  aside.toggleAttribute('data-empty', !state.sources.size);   // hidden on phones while empty
+  setSourceCount(state.sources.size);
   if (!state.sources.size) {
     sourcesPane.innerHTML = '<p class="empty">No strongly relevant source was found for this answer.</p>';
     return;
@@ -335,7 +340,7 @@ function renderSources() {
                        userState.toLowerCase() !== s.state.toLowerCase();
     return `<div class="src${mismatched ? ' mismatch' : ''}" id="src-${esc(s.id)}"
                  data-kind="${esc(s.kind)}">
-      <div class="top"><span class="id">${esc(s.id)}</span>
+      <div class="top"><span class="cite" data-cite="${esc(s.id)}">${esc(s.id)}</span>
         <span class="tier">${esc(s.tier_label)}</span></div>
       <div class="title">${title}</div>
       ${s.domain ? `<div class="domain">${esc(s.domain)}</div>` : ''}
@@ -349,7 +354,26 @@ function renderSources() {
   }).join('');
 }
 
+/* The drawer is closed by default and opens on request: the Sources button, the "N sources"
+   button under an answer, or a citation chip. */
+function setSourcesOpen(open) {
+  app.dataset.sources = open ? 'open' : 'closed';
+  sourcesBtn.setAttribute('aria-expanded', String(open));
+}
+
+function setSourceCount(n) {
+  const changed = sourcesCount.textContent !== String(n);
+  sourcesCount.textContent = String(n);
+  sourcesCount.hidden = !n;
+  if (changed && n) {                      // a small pulse says "new sources arrived"
+    sourcesCount.classList.remove('bump');
+    void sourcesCount.offsetWidth;
+    sourcesCount.classList.add('bump');
+  }
+}
+
 function flashSource(id) {
+  setSourcesOpen(true);
   const node = document.getElementById(`src-${id}`);
   if (!node) return;
   node.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
@@ -439,17 +463,67 @@ function showQueue(position) {
     + `automatically.</span>`;
 }
 
-function showLimit(kind, message) {
-  const modal = $('#limit');
-  $('#limitTitle').textContent = kind === 'daily_budget'
-    ? "Today's limit has been reached" : 'Free usage limit reached';
+/* The usage dialog: opened by a limit being reached, or from the allowance in the footer.
+   With a reset code configured on the server, it also restores the allowance. */
+function openUsage(title, message) {
+  $('#limitTitle').textContent = title;
   $('#limitText').textContent = message;
-  modal.hidden = false;
-  $('#limitClose').focus();
-  // The allowance is spent for good (or until tomorrow); stop inviting more questions.
+  $('#resetForm').hidden = !state.config.budget_reset;
+  $('#resetMsg').textContent = '';
+  $('#resetMsg').className = 'reset-msg';
+  $('#limit').hidden = false;
+  ($('#resetForm').hidden ? $('#limitClose') : $('#resetCode')).focus();
+}
+
+function showLimit(kind, message) {
+  openUsage(kind === 'daily_budget' ? "Today's limit has been reached"
+                                    : 'Free usage limit reached', message);
+  // The allowance is spent (until it resets); stop inviting more questions.
   state.locked = true;
   input.disabled = true;
   input.placeholder = 'The free usage limit has been reached';
+}
+
+function unlock() {
+  state.locked = false;
+  input.disabled = false;
+  input.placeholder = 'Ask about your legal rights…';
+}
+
+function describeQuota(q) {
+  if (!q?.budget_usd) return 'This service has no per-visitor limit.';
+  const reset = q.resets_after_hours ? ` It resets ${q.resets_after_hours} hours after your `
+                                       + 'first question.' : '';
+  return `You have $${q.remaining_usd.toFixed(2)} of your $${q.budget_usd.toFixed(2)} free `
+       + `allowance left. A typical answer costs well under a cent.${reset}`;
+}
+
+async function submitReset(event) {
+  event.preventDefault();
+  const msg = $('#resetMsg');
+  const code = $('#resetCode').value.trim();
+  if (!code) return;
+  try {
+    const response = await fetch('/api/quota/reset', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code }),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      msg.textContent = body.error?.message || 'That did not work. Please try again.';
+      msg.className = 'reset-msg bad';
+      return;
+    }
+    $('#resetCode').value = '';
+    msg.textContent = 'Done: your allowance is back to full.';
+    msg.className = 'reset-msg good';
+    $('#limitText').textContent = describeQuota(body);
+    unlock();
+    refreshQuota();
+  } catch (err) {
+    msg.textContent = `Could not reach the server: ${err.message}`;
+    msg.className = 'reset-msg bad';
+  }
 }
 
 // Shown in the footer until the server has finished starting; checked a few times, then left.
@@ -466,9 +540,10 @@ async function checkHealth(triesLeft) {
 async function refreshQuota() {
   try {
     const q = await (await fetch('/api/quota')).json();
+    state.quota = q;
     if (q.budget_usd) {
-      quotaEl.textContent = `$${q.remaining_usd.toFixed(2)} of $${q.budget_usd.toFixed(2)} `
-                          + 'free allowance left';
+      quotaEl.textContent = `$${q.remaining_usd.toFixed(2)} of $${q.budget_usd.toFixed(2)} left`;
+      quotaEl.hidden = false;
     }
     if (q.exhausted && !state.locked) {
       showLimit('client_budget', 'You have used this free service\'s allowance for your '
@@ -607,7 +682,14 @@ function finishTurn(errorText) {
 
 function buildVerdict(text) {
   const row = el('div', 'verdict');
-  row.innerHTML = `<span>${esc(text || '')}</span>`;
+  row.innerHTML = `<span class="checked">${esc(text || '')}</span>`;
+  const count = state.sources.size;
+  if (count) {
+    const open = el('button', 'open-sources', `${count} source${count === 1 ? '' : 's'}`);
+    open.type = 'button';
+    open.onclick = () => setSourcesOpen(true);
+    row.appendChild(open);
+  }
   const rate = el('div', 'rate');
   for (const [value, glyph, label] of [['up', '👍', 'Helpful'], ['down', '👎', 'Not helpful']]) {
     const button = el('button', null, glyph);
@@ -700,10 +782,26 @@ $('#reset').onclick = async () => {
   renderSuggestions();
   state.sources.clear();
   sourcesPane.innerHTML = SOURCES_EMPTY;
-  aside.toggleAttribute('data-empty', true);
+  setSourceCount(0);
+  setSourcesOpen(false);
   statEl.textContent = '';
   input.focus();
 };
+
+// The "How it works" panel shows the server's real budgets, not numbers typed into the page.
+function fillDepthFacts(depths) {
+  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  const format = {
+    rounds: (d) => (d.rounds > 1 ? `up to ${d.rounds}` : '1'),
+    pages: (d) => (!d.pages ? 'none'
+      : `up to ${d.pages}${d.link_depth > 1 ? `, ${plural(d.link_depth, 'link')} deep` : ''}`),
+    deadline: (d) => `${Math.round(d.deadline_s)} s`,
+  };
+  document.querySelectorAll('[data-fact]').forEach((node) => {
+    const [depth, fact] = node.dataset.fact.split('.');
+    if (depths[depth] && format[fact]) node.textContent = format[fact](depths[depth]);
+  });
+}
 
 /* ── boot ──────────────────────────────────────────────────────────────────────── */
 (function boot() {
@@ -714,6 +812,8 @@ $('#reset').onclick = async () => {
   }
 
   fetch('/api/config').then((r) => r.json()).then((c) => {
+    state.config = c;
+    fillDepthFacts(c.depths || {});
     const select = $('#state');
     for (const name of c.states || []) {
       const option = el('option');
@@ -735,7 +835,21 @@ $('#reset').onclick = async () => {
   checkHealth(10);
   refreshQuota();
 
-  $('#limitClose').addEventListener('click', () => { $('#limit').hidden = true; });
+  // ── dialogs and the sources drawer ───────────────────────────────────────────────
+  const closeUsage = () => { $('#limit').hidden = true; input.focus(); };
+  $('#limitClose').addEventListener('click', closeUsage);
+  $('#limit').addEventListener('click', (e) => { if (e.target === $('#limit')) closeUsage(); });
+  $('#resetForm').addEventListener('submit', submitReset);
+  quotaEl.addEventListener('click', () => openUsage('Your allowance', describeQuota(state.quota)));
+
+  sourcesBtn.addEventListener('click', () => setSourcesOpen(app.dataset.sources !== 'open'));
+  $('#sourcesClose').addEventListener('click', () => setSourcesOpen(false));
+  $('#scrim').addEventListener('click', () => setSourcesOpen(false));
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    if (!$('#limit').hidden) closeUsage();
+    else if (app.dataset.sources === 'open') setSourcesOpen(false);
+  });
 
   // ── pipeline explainer ───────────────────────────────────────────────────────────────
   // Opened from the "?" beside the depth buttons. Closes on the X, on the backdrop, and on

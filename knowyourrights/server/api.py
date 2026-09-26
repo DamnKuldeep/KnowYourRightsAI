@@ -37,7 +37,7 @@ from ..runtime.cache import get_cache
 from ..tools import crawl
 from . import auth
 from .admission import AdmissionQueue, ClientBusy, QueueFull, QueueTimeout, Ticket
-from .models import ChatRequest, FeedbackRequest, SessionRequest
+from .models import ChatRequest, FeedbackRequest, ResetRequest, SessionRequest
 from .quota import Guard, client_ip
 from .sessions import SessionStore
 
@@ -61,6 +61,7 @@ class Services:
     admission: AdmissionQueue = field(default_factory=AdmissionQueue)
     guard: Guard = field(default_factory=Guard)
     warmup: dict = field(default_factory=lambda: {"done": False, "database": None})
+    reset_attempts: auth.Attempts = field(default_factory=auth.Attempts)
 
 
 # ── lifecycle ─────────────────────────────────────────────────────────────────────────
@@ -268,8 +269,10 @@ async def public_config(request: Request) -> dict:
         "states": list(config.INDIAN_STATES),
         "disclaimer": config.DISCLAIMER,
         "depths": {name: {"rounds": d.max_rounds, "pages": d.max_crawls,
-                          "deadline_s": d.deadline_s} for name, d in config.DEPTHS.items()},
+                          "link_depth": d.nav_depth, "deadline_s": d.deadline_s}
+                   for name, d in config.DEPTHS.items()},
         "client_budget_usd": config.CLIENT_BUDGET_USD or None,
+        "budget_reset": bool(config.BUDGET_RESET_CODE),
     }
 
 
@@ -277,6 +280,28 @@ async def public_config(request: Request) -> dict:
 async def quota(request: Request) -> dict:
     services = _services(request)
     return services.guard.quota(services.guard.book.key(client_ip(request)))
+
+
+@app.post("/api/quota/reset")
+async def reset_quota(body: ResetRequest, request: Request):
+    """Restore this visitor's allowance with the operator's reset code. When the whole site's
+    daily ceiling has been reached as well, that is cleared too, or the reset would change
+    nothing the visitor can see."""
+    if not config.BUDGET_RESET_CODE:
+        raise HTTPException(status_code=404)
+    services = _services(request)
+    address = client_ip(request)
+    if services.reset_attempts.locked_out(address):
+        return _error(429, "rate", "Too many wrong codes. Try again in 15 minutes.", 900)
+    if not auth.code_matches(body.code.strip(), config.BUDGET_RESET_CODE):
+        services.reset_attempts.record(address)
+        log.warning("wrong budget reset code from %s", address)
+        return _error(403, "wrong_code", "That reset code is not right.")
+    client = services.guard.book.key(address)
+    day = services.guard.day_exhausted()
+    services.guard.book.reset(client, day=day)
+    log.info("allowance reset for %s%s", address, " and today's total" if day else "")
+    return {"ok": True, **services.guard.quota(client)}
 
 
 @app.get("/api/health")
