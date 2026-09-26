@@ -1,14 +1,14 @@
-"""Builds the KnowYourRights brand assets from glyph outlines.
+"""Builds the KnowYourRights brand assets.
 
     python docs/logo.py path/to/LibreBaskerville[wght].ttf
 
-The mark is a speech bubble (a plain-language answer) holding a § (the section it rests on), with
-a saffron bookmark ribbon (the citation that marks the place). The favicon keeps the § and the
-ribbon without the bubble, which blurs at 16 px.
+The mark is a speech bubble (a plain-language answer) holding balanced scales (the law), whose
+saffron finial, with the app's green and white, nods to India without using any national emblem.
+The favicon drops the bubble, which blurs at 16 px, and keeps the scales.
 
-Letters are drawn as paths from Libre Baskerville (SIL Open Font License,
-github.com/google/fonts/tree/main/ofl/librebaskerville), so the files look the same everywhere and
-need no font. PNGs are rendered with Playwright, already a dependency of the app.
+The scales are plain geometry. Letters are drawn as paths from Libre Baskerville (SIL Open Font
+License, github.com/google/fonts/tree/main/ofl/librebaskerville), so the files look the same
+everywhere and need no font. PNGs are rendered with Playwright, already a dependency of the app.
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ import shutil
 import sys
 from pathlib import Path
 
-from fontTools.pens.boundsPen import BoundsPen
 from fontTools.pens.svgPathPen import SVGPathPen
 from fontTools.pens.transformPen import TransformPen
 from fontTools.ttLib import TTFont
@@ -49,15 +48,6 @@ class Type:
     def _name(self, ch: str) -> str:
         return self.cmap[ord(ch)]
 
-    def glyph_centered(self, ch: str, cx: float, cy: float, height: float) -> str:
-        """One character scaled so its ink is `height` tall, centred on (cx, cy)."""
-        name = self._name(ch)
-        bounds = BoundsPen(self.glyphs)
-        self.glyphs[name].draw(bounds)
-        x0, y0, x1, y1 = bounds.bounds
-        s = height / (y1 - y0)
-        return self._path(name, (s, 0, 0, -s, cx - (x0 + x1) / 2 * s, cy + (y0 + y1) / 2 * s))
-
     def line(self, text: str, x: float, baseline: float, size: float,
              tracking: float = 0) -> tuple[str, float]:
         """A run of text starting at x; returns (paths, width). `tracking` is in em."""
@@ -80,21 +70,40 @@ def svg(w, h, body, label, defs=GRADIENT):
             f'<defs>{defs}</defs>{body}</svg>\n')
 
 
-def mark_body(bold: Type, x=0, y=0, size=512) -> str:
+def scales(cx: float, top: float, span: float, ink: str, *, stroke: float, pan: float,
+           drop: float, post: float, base: float) -> str:
+    """Balanced scales: a saffron finial, a beam, a post on a base, and two strung pans."""
+    beam_y, left, right = top + 22, cx - span / 2, cx + span / 2
+    pan_y = beam_y + drop
+
+    def hanging(x: float) -> str:
+        return (f'<path d="M{x - pan} {pan_y}h{2 * pan}a{pan} {pan * .78} 0 0 1-{2 * pan} 0z" '
+                f'fill="{ink}"/><path d="M{x} {beam_y}L{x - pan + 6} {pan_y}M{x} {beam_y}'
+                f'L{x + pan - 6} {pan_y}" stroke="{ink}" stroke-width="{stroke * .55}" '
+                'stroke-linecap="round" fill="none"/>')
+
+    return (f'<rect x="{cx - stroke / 2}" y="{beam_y}" width="{stroke}" height="{post}" '
+            f'rx="{stroke / 2}" fill="{ink}"/>'
+            f'<rect x="{cx - base / 2}" y="{beam_y + post - 4}" width="{base}" '
+            f'height="{stroke * 1.2}" rx="{stroke * .6}" fill="{ink}"/>'
+            f'<rect x="{left}" y="{beam_y - stroke / 2}" width="{span}" height="{stroke}" '
+            f'rx="{stroke / 2}" fill="{ink}"/>' + hanging(left) + hanging(right)
+            + f'<circle cx="{cx}" cy="{top}" r="{stroke * 1.15}" fill="{SAFFRON}"/>')
+
+
+def mark_body(x=0, y=0, size=512) -> str:
     """The app icon, drawn on a 512 grid and placed at (x, y) with the given size."""
-    k = size / 512
-    return (f'<g transform="translate({x} {y}) scale({k})">'
+    return (f'<g transform="translate({x} {y}) scale({size / 512})">'
             '<rect width="512" height="512" rx="116" fill="url(#kyr-g)"/>'
-            '<path fill="#fff" d="M164 92h184a84 84 0 0 1 84 84v120a84 84 0 0 1-84 84H240l-92 70 '
-            '16-72a84 84 0 0 1-80-84V176a84 84 0 0 1 84-84z"/>'
-            f'<path fill="{SAFFRON}" d="M352 92h44v96l-22-18-22 18z"/>'
-            f'<g fill="{GREEN}">{bold.glyph_centered("§", 248, 236, 200)}</g></g>')
+            '<path fill="#fff" d="M160 84h192a88 88 0 0 1 88 88v132a88 88 0 0 1-88 88H244l-96 70 '
+            '16-72a88 88 0 0 1-84-88V172a88 88 0 0 1 88-88z"/>'
+            + scales(256, 150, 222, GREEN, stroke=19, pan=46, drop=86, post=148, base=112)
+            + '</g>')
 
 
-def favicon_body(bold: Type) -> str:
+def favicon_body() -> str:
     return ('<rect width="512" height="512" rx="116" fill="url(#kyr-g)"/>'
-            f'<path fill="{SAFFRON}" d="M356 0h64v150l-32-26-32 26z"/>'
-            f'<g fill="#fff">{bold.glyph_centered("§", 236, 262, 340)}</g>')
+            + scales(256, 116, 316, "#ffffff", stroke=28, pan=62, drop=116, post=214, base=164))
 
 
 def lockup(bold: Type, regular: Type, dark: bool) -> str:
@@ -105,7 +114,7 @@ def lockup(bold: Type, regular: Type, dark: bool) -> str:
     right, w2 = bold.line("Rights", 150 + w1, 84, 58)
     tag, w3 = regular.line("INDIAN LAW, CITED TO THE SECTION", 153, 124, 17.5, tracking=0.16)
     width = int(150 + max(w1 + w2, w3) + 12)
-    body = (mark_body(bold, 0, 8, 124) + f'<g fill="{ink}">{know}</g>'
+    body = (mark_body(0, 8, 124) + f'<g fill="{ink}">{know}</g>'
             f'<g fill="{rights}">{right}</g><g fill="{dim}">{tag}</g>')
     return svg(width, 140, body, "KnowYourRights: Indian law, cited to the section")
 
@@ -120,7 +129,7 @@ def social(bold: Type, regular: Type) -> str:
     body = ('<rect width="1280" height="640" fill="url(#kyr-g)"/>'
             '<circle cx="1180" cy="-40" r="330" fill="#ffffff" opacity=".05"/>'
             '<circle cx="1260" cy="700" r="260" fill="#ffffff" opacity=".04"/>'
-            + mark_body(bold, 110, 190, 260).replace('fill="url(#kyr-g)"', 'fill="#0b5448"')
+            + mark_body(110, 190, 260).replace('fill="url(#kyr-g)"', 'fill="#0b5448"')
             + f'<g transform="translate({x} 300)" fill="#ffffff">{know}</g>'
             f'<g transform="translate({x} 300)" fill="{SAFFRON}">{right}</g>'
             f'<g transform="translate({x + 3} 372)" fill="#d7eee7">{tag}</g>'
@@ -150,8 +159,8 @@ def main(font_path: str) -> None:
     bold, regular = Type(Path(font_path), 700), Type(Path(font_path), 400)
     BRAND.mkdir(parents=True, exist_ok=True)
     files = {
-        "mark.svg": svg(512, 512, mark_body(bold), "KnowYourRights"),
-        "favicon.svg": svg(512, 512, favicon_body(bold), "KnowYourRights"),
+        "mark.svg": svg(512, 512, mark_body(), "KnowYourRights"),
+        "favicon.svg": svg(512, 512, favicon_body(), "KnowYourRights"),
         "logo-light.svg": lockup(bold, regular, dark=False),
         "logo-dark.svg": lockup(bold, regular, dark=True),
         "social.svg": social(bold, regular),
