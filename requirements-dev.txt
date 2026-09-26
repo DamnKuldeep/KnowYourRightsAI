@@ -7,3 +7,4 @@ ruff>=0.6
 
 # scripts/repair_act.py reads official Act PDFs
 pypdf>=4.0
+fonttools>=4.50          # docs/logo.py: brand assets from glyph outlines

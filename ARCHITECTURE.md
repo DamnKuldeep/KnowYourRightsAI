@@ -21,10 +21,12 @@ choices are in [EVALUATION.md](EVALUATION.md).
 
 ## The system
 
-<p align="center"><img src="docs/system.svg" width="860" alt="Requests pass sign-in, validation, spending guards and an admission queue before the orchestrator runs a turn, using model stages, statute search, web tools and a model client, and streams the result back to the browser."></p>
+<p align="center"><img src="docs/system.svg" width="780" alt="In order: (1) the browser sends a question; (2) sign-in, spending limits and a queue run before any money is spent; (3) the orchestrator runs one turn, (4) using model stages, web tools and statute search, which call model providers, the public web and the legal corpus; (5) the answer streams back."></p>
 
-One process holds everything in memory (sessions, queue, limits), so it runs as a single worker.
-A request passes four gates before any money is spent:
+Read it in the order of the numbers: a question arrives (1), passes the checks that come before
+any spending (2), and the orchestrator runs one turn (3) using model stages, web tools and
+statute search (4) while the answer streams back (5). One process holds everything in memory
+(sessions, queue, limits), so it runs as a single worker. The checks in step 2:
 
 | Gate | What it enforces | Default |
 |---|---|---|

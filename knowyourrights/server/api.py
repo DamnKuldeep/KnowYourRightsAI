@@ -391,6 +391,12 @@ if config.WEB_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(config.WEB_DIR)), name="static")
 
 
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon() -> FileResponse:
+    """Browsers ask for this path whatever the page declares."""
+    return FileResponse(config.WEB_DIR / "favicon-32.png", media_type="image/png")
+
+
 @app.get("/")
 async def index() -> FileResponse:
     page = config.WEB_DIR / "index.html"

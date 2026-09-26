@@ -1,6 +1,9 @@
 <div align="center">
 
-# ⚖️ KnowYourRights
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/brand/logo-dark.svg">
+  <img src="docs/brand/logo-light.svg" alt="KnowYourRights" width="440">
+</picture>
 
 **Plain-language answers about Indian law, each claim linked to the section it comes from.**
 
@@ -150,6 +153,7 @@ pip install -r requirements-dev.txt
 pytest                                    # 231 tests, ~10 s, no network or API key needed
 ruff check knowyourrights scripts tests
 python docs/diagrams.py                   # rebuild the diagrams in docs/
+python docs/logo.py <LibreBaskerville.ttf>  # rebuild the logo, favicons and social image
 ```
 
 These scripts measure the real system and cost a few cents each:
@@ -177,7 +181,7 @@ knowyourrights/
 scripts/         evaluation, calibration, corpus repair, terminal client
 tests/           the test suite
 data/            the LanceDB corpus (Git LFS)
-docs/            screenshot and diagrams
+docs/            screenshot, diagrams (diagrams.py) and the logo (brand/, logo.py)
 ```
 
 ## Limitations

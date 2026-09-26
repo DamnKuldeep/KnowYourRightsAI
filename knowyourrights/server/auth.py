@@ -31,7 +31,8 @@ from .. import config
 
 COOKIE = "kyr_session"
 OPEN_PATHS = frozenset({"/login", "/logout", "/api/health", "/static/styles.css",
-                        "/favicon.ico"})
+                        "/static/mark.svg", "/static/favicon.svg", "/static/favicon-32.png",
+                        "/static/apple-touch-icon.png", "/favicon.ico"})
 NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,40}$")
 FAILURE_LIMIT = 10              # wrong passwords per address...
 FAILURE_WINDOW_S = 15 * 60      # ...within this many seconds, before sign-in is refused
@@ -171,13 +172,18 @@ LOGIN_HTML = """<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Sign in — KnowYourRights</title>
   <meta name="robots" content="noindex">
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+  <meta name="theme-color" content="#0e6b5a">
   <link rel="stylesheet" href="/static/styles.css">
   <style>
     .login-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center;
       padding: 16px; }
     .login-card { width: 100%; max-width: 360px; background: var(--surface);
       border: 1px solid var(--border); border-radius: var(--radius); padding: 28px 24px; }
-    .login-card h1 { margin: 0 0 4px; font-size: 1.3rem; }
+    .login-card .login-logo { display: block; width: 52px; height: 52px; margin: 0 0 14px;
+      border-radius: 13px; }
+    .login-card h1 { margin: 0 0 4px; font: 600 1.45rem/1.25 var(--serif); }
     .login-card p.sub { margin: 0 0 20px; color: var(--text-dim); font-size: .9rem; }
     .login-card label { display: block; font-size: .85rem; margin: 12px 0 4px; }
     .login-card input { width: 100%; box-sizing: border-box; padding: 9px 10px; font: inherit;
@@ -194,7 +200,8 @@ LOGIN_HTML = """<!doctype html>
 <body>
 <main class="login-wrap">
   <form class="login-card" method="post" action="/login">
-    <h1>&#9878;&#65039; KnowYourRights</h1>
+    <img class="login-logo" src="/static/mark.svg" alt="">
+    <h1>KnowYourRights</h1>
     <p class="sub">Sign in to continue.</p>
     {{notice}}
     <label for="user">Username</label>

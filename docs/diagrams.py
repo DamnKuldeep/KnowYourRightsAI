@@ -197,54 +197,65 @@ def retrieval():
 
 # ── 3. the system ─────────────────────────────────────────────────────────────────────────
 def system():
-    GX, GW = 244, 200               # request gates
-    MX, MW = 498, 192               # modules, inside their dashed group
-    EX, EW = 790, 156               # outside services
+    """Top to bottom, in the order things happen: the question comes in, passes the checks that
+    come before any spending, one turn runs, the turn uses three kinds of work, and the answer
+    streams back. Outside services sit below the server they are called from."""
+    C1, C2, C3, W = 40, 350, 660, 260          # three columns
+    mid = [x + W / 2 for x in (C1, C2, C3)]
+
+    def band(y, n, label):
+        return step(66, y - 4, n) + text(84, y, label, 12, 650, DIM, "start")
+
     b = [
-        box(24, 72, 170, 56, "Browser", "plain HTML + JS"),
-        '<rect x="224" y="24" width="500" height="472" rx="13" fill="none" stroke="#b9b2a7" '
+        box(C1, 24, W, 56, "Browser", "plain HTML + JavaScript"),
+        arrow([(C1 + W - 40, 80), (C1 + W - 40, 182)]),
+        step(C1 + W - 18, 104, 1), text(C1 + W + 2, 108, "your question", 11.5, 500, DIM, "start"),
+        # the server
+        '<rect x="28" y="124" width="904" height="484" rx="14" fill="none" stroke="#b9b2a7" '
         'stroke-width="1.4"/>',
-        text(240, 48, "Server · FastAPI, one process", 12, 650, DIM, "start"),
-        box(GX, 72, GW, 56, "Sign-in", "signed cookie, 30 days"),
-        box(GX, 150, GW, 56, "Validate", "every field bounded"),
-        box(GX, 228, GW, 56, "Guards", "rate · $ per visitor · $ per day"),
-        box(GX, 306, GW, 56, "Admission queue", "5 answers at once, then a line"),
-        box(GX, 404, GW, 56, "Spend book", "per visitor and per day", "store"),
-        arrow([(GX + 100, 128), (GX + 100, 148)]),
-        arrow([(GX + 100, 206), (GX + 100, 226)]),
-        arrow([(GX + 100, 284), (GX + 100, 304)]),
-        arrow([(194, 100), (GX - 2, 100)], "POST", at=(219, 92)),
-        box(484, 72, 220, 56, "Orchestrator", "plan → research → write → verify", "model"),
-        arrow([(GX + GW, 334), (464, 334), (464, 100), (482, 100)]),
-        # modules the orchestrator calls
-        '<rect x="484" y="150" width="220" height="264" rx="11" fill="none" stroke="#d9d3c9" '
-        'stroke-width="1.3" stroke-dasharray="4 4"/>',
-        arrow([(594, 128), (594, 148)]),
-        box(MX, 166, MW, 48, "Model stages", "plan · grade · write", "model", title_size=12.5),
-        box(MX, 226, MW, 48, "Statute search", "hybrid, reranked", title_size=12.5),
-        box(MX, 286, MW, 48, "Web tools", "search · read · navigate", title_size=12.5),
-        box(MX, 346, MW, 48, "Model client", "routing · failover · cost", title_size=12.5),
+        text(912, 146, "Server · FastAPI, one process", 12, 650, DIM, "end"),
+        band(170, 2, "Checks before spending"),
+        box(C1, 184, W, 58, "Sign-in", "signed cookie, when enabled"),
+        box(C2, 184, W, 58, "Limits", "rate · $ per visitor · $ per day"),
+        box(C3, 184, W, 58, "Queue", "5 answers at once, then a line"),
+        arrow([(C1 + W, 213), (C2 - 2, 213)]),
+        arrow([(C2 + W, 213), (C3 - 2, 213)]),
+        box(C2, 296, W, 58, "Orchestrator", "plan → research → write → check"),
+        step(C2 + 22, 325, 3),
+        arrow([(mid[2], 242), (mid[2], 325), (C2 + W + 2, 325)]),
+        f'<polyline points="{mid[1]},354 {mid[1]},382" fill="none" stroke="{ARROWS["ink"]}" '
+        f'stroke-width="1.5"/>',
+        f'<polyline points="{mid[0]},382 {mid[2]},382" fill="none" stroke="{ARROWS["ink"]}" '
+        f'stroke-width="1.5"/>',
+        arrow([(mid[0], 382), (mid[0], 406)]),
+        arrow([(mid[1], 382), (mid[1], 406)]),
+        arrow([(mid[2], 382), (mid[2], 406)]),
+        step(mid[1], 382, 4),
+        box(C1, 408, W, 58, "Model stages", "plan · grade · write · fact-check", "model"),
+        box(C2, 408, W, 58, "Web tools", "search · read pages · follow portals"),
+        box(C3, 408, W, 58, "Statute search", "meaning + keywords, reranked"),
+        box(C1, 516, W, 58, "Model client", "picks a model · fails over · counts cost"),
+        box(C3, 516, W, 58, "Legal corpus", "LanceDB on disk · 38,609 chunks", "store"),
+        arrow([(mid[0], 466), (mid[0], 514)]),
+        arrow([(mid[2], 466), (mid[2], 514)]),
+        text(mid[2] + 10, 494, "reads", 11, 500, DIM, "start"),
         # the answer streams back
-        arrow([(594, 72), (594, 12), (109, 12), (109, 70)], "SSE: steps, sources, then the answer "
-              "word by word", at=(350, 4)),
+        arrow([(C2, 340), (14, 340), (14, 52), (C1 - 2, 52)]),
+        step(190, 327, 5), text(208, 331, "the answer streams back", 11.5, 500, DIM, "start"),
         # outside
-        box(EX, 226, EW, 48, "Legal corpus", "LanceDB on disk", "store", title_size=12.5),
-        box(EX, 286, EW, 48, "The web", "public URLs only", "api", title_size=12.5),
-        box(EX, 346, EW, 48, "OpenRouter", "chat · embed · rerank", "api", title_size=12.5),
-        box(EX, 424, EW, 48, "NVIDIA NIM", "backup chat", "api", title_size=12.5),
-        arrow([(MX + MW, 250), (EX - 2, 250)], "vector + BM25", at=(747, 242)),
-        arrow([(MX + MW, 310), (EX - 2, 310)]),
-        arrow([(MX + MW, 370), (EX - 2, 370)], "HTTPS", at=(747, 362)),
-        arrow([(MX + MW, 382), (740, 382), (740, 448), (EX - 2, 448)], "if it fails",
-              at=(746, 418), anchor="start", dashed=True),
-        arrow([(594, 414), (594, 432), (GX + GW + 2, 432)], "charges each call",
-              at=(520, 450), dashed=True),
-        legend(40, 520, [("model", "uses a model"), ("code", "plain code"),
-                         ("api", "outside service"), ("store", "stored state")]),
+        text(40, 634, "Outside services", 12, 650, DIM, "start"),
+        box(C1, 646, W, 58, "Model providers", "OpenRouter · NVIDIA NIM as backup", "api"),
+        box(C2, 646, W, 58, "The public web", "government sites · search · Wikipedia", "api"),
+        arrow([(mid[0], 574), (mid[0], 644)], "chat · embeddings · rerank", at=(mid[0] + 8, 618),
+              anchor="start"),
+        arrow([(mid[1], 466), (mid[1], 644)], "public addresses only", at=(mid[1] + 8, 618),
+              anchor="start"),
+        legend(40, 742, [("model", "uses a model"), ("code", "plain code"),
+                         ("api", "outside service"), ("store", "stored data")]),
     ]
-    figure("system.svg", 970, 572, "The system: requests pass sign-in, validation, spending "
-           "guards and a queue before the orchestrator runs a turn and streams it back.",
-           "".join(b), top=26)
+    figure("system.svg", 960, 766, "The system, in order: a question passes sign-in, spending "
+           "limits and a queue; the orchestrator runs one turn using model stages, web tools and "
+           "statute search; the answer streams back.", "".join(b))
 
 
 if __name__ == "__main__":
