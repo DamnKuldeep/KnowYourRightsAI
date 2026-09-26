@@ -17,7 +17,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import secrets
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -25,7 +24,7 @@ from dataclasses import dataclass, field
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .. import __version__, config, events
@@ -36,6 +35,7 @@ from ..orchestrator import get_orchestrator
 from ..retrieval.search import get_engine
 from ..runtime.cache import get_cache
 from ..tools import crawl
+from . import auth
 from .admission import AdmissionQueue, ClientBusy, QueueFull, QueueTimeout, Ticket
 from .models import ChatRequest, FeedbackRequest, SessionRequest
 from .quota import Guard, client_ip
@@ -138,11 +138,25 @@ async def _shut_down(services: Services) -> None:
 
 app = FastAPI(title="KnowYourRights", version=__version__, docs_url=None, redoc_url=None,
               openapi_url=None, lifespan=lifespan)
+_gate: auth.Gate | None = None
+
+
+def auth_gate() -> auth.Gate:
+    """The sign-in gate, built from the environment on first use."""
+    global _gate
+    if _gate is None:
+        _gate = auth.Gate()
+    return _gate
 
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
-    response = await call_next(request)
+    gate = auth_gate()
+    if (gate.enabled and request.url.path not in auth.OPEN_PATHS
+            and not gate.request_user(request) and not auth.admin_bearer(request)):
+        response = auth.refuse(request)
+    else:
+        response = await call_next(request)
     for header, value in SECURITY_HEADERS.items():
         response.headers.setdefault(header, value)
     return response
@@ -246,10 +260,11 @@ async def feedback(body: FeedbackRequest, request: Request):
 
 # ── information ───────────────────────────────────────────────────────────────────────
 @app.get("/api/config")
-async def public_config() -> dict:
+async def public_config(request: Request) -> dict:
     """Everything the UI renders that the server decides."""
     return {
         "version": __version__,
+        "user": auth_gate().request_user(request),
         "states": list(config.INDIAN_STATES),
         "disclaimer": config.DISCLAIMER,
         "depths": {name: {"rounds": d.max_rounds, "pages": d.max_crawls,
@@ -302,13 +317,48 @@ async def status(request: Request) -> dict:
 
 def _require_admin(request: Request) -> None:
     if config.ADMIN_TOKEN:
-        supplied = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
-        if secrets.compare_digest(supplied, config.ADMIN_TOKEN):
+        if auth.admin_bearer(request):
             return
     elif (not config.TRUST_PROXY_HEADERS and "x-forwarded-for" not in request.headers
           and request.client and request.client.host in ("127.0.0.1", "::1")):
         return
     raise HTTPException(status_code=404)
+
+
+# ── sign-in ───────────────────────────────────────────────────────────────────────────
+@app.get("/login")
+async def login_form(request: Request):
+    gate = auth_gate()
+    if not gate.enabled or gate.request_user(request):
+        return RedirectResponse("/", status_code=303)
+    return auth.login_page()
+
+
+@app.post("/login")
+async def login(request: Request):
+    gate = auth_gate()
+    if not gate.enabled:
+        return RedirectResponse("/", status_code=303)
+    address = client_ip(request)
+    if gate.locked_out(address):
+        return auth.login_page("Too many wrong passwords. Try again in 15 minutes.", status=429)
+    form = await auth.read_form(request)
+    user = form.get("user", "").strip()
+    if not gate.check(address, user, form.get("password", "")):
+        log.warning("failed sign-in for %r from %s", user[:40], address)
+        return auth.login_page("Wrong username or password.", user=user, status=401)
+    log.info("signed in: %s from %s", user, address)
+    response = RedirectResponse("/", status_code=303)
+    response.set_cookie(auth.COOKIE, gate.issue(user), max_age=int(gate.ttl_s), httponly=True,
+                        secure=auth.is_https(request), samesite="lax", path="/")
+    return response
+
+
+@app.post("/logout")
+async def logout() -> RedirectResponse:
+    response = RedirectResponse("/login", status_code=303)
+    response.delete_cookie(auth.COOKIE, path="/")
+    return response
 
 
 # ── the UI ────────────────────────────────────────────────────────────────────────────

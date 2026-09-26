@@ -346,6 +346,10 @@ async function ask(question) {
 async function describeRefusal(response) {
   let error = null;
   try { error = (await response.json()).error; } catch { /* not JSON */ }
+  if (error?.kind === 'auth') {           // signed out, or the session expired
+    window.location.href = '/login';
+    return error.message;
+  }
   if (!error) return `The server returned ${response.status}. Please try again.`;
   if (error.kind === 'client_budget' || error.kind === 'daily_budget') {
     showLimit(error.kind, error.message);
@@ -649,6 +653,11 @@ $('#reset').onclick = async () => {
     select.value = (c.states || []).includes(state.userState) ? state.userState : '';
     state.userState = select.value;
     if (c.disclaimer) $('#disclaimer').textContent = c.disclaimer;
+    if (c.user) {
+      const signOut = $('#signOut');
+      signOut.hidden = false;
+      signOut.querySelector('button').title = `Signed in as ${c.user}. Sign out`;
+    }
   }).catch(() => {});
   checkHealth(10);
   refreshQuota();

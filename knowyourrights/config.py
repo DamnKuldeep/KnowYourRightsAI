@@ -433,3 +433,6 @@ DAILY_BUDGET_USD = env_float("KYR_DAILY_BUDGET_USD", 5.0)
 TRUST_PROXY_HEADERS = env_bool("KYR_TRUST_PROXY_HEADERS", False)
 # Bearer token for /api/status. Without one, that endpoint answers only from this machine.
 ADMIN_TOKEN = env_key("KYR_ADMIN_TOKEN")
+# Sign-in (server/auth.py). KYR_LOGIN_USERS is "name:password" pairs separated by commas; empty
+# leaves the site open. KYR_SESSION_SECRET, if set, signs the cookies. Sessions last this long.
+LOGIN_DAYS = env_float("KYR_LOGIN_DAYS", 30.0)

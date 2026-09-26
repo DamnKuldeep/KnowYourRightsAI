@@ -60,7 +60,7 @@ Constitution, ~1,000 central Acts and the 2023 criminal codes. Details are in
 | Retrieval | LanceDB (vector + BM25), `baai/bge-m3` embeddings, `cohere/rerank-v3.5` reranking, via OpenRouter |
 | Web research | crawl4ai (HTTP, Chromium when needed), ddgs search, Wikipedia API |
 | Frontend | Plain HTML, CSS and JavaScript: no framework, no build step |
-| Quality | pytest (221 tests, fully mocked), ruff, GitHub Actions |
+| Quality | pytest (228 tests, fully mocked), ruff, GitHub Actions |
 
 No model runs locally, so there is no GPU requirement and the process needs a few hundred MB of
 memory.
@@ -116,17 +116,21 @@ Settings are environment variables (or `.env`); every one is listed with its def
 | `KYR_DAILY_BUDGET_USD` | `5.0` | Ceiling on the whole service's spend per day. |
 | `KYR_TRUST_PROXY_HEADERS` | `false` | Set `true` behind a reverse proxy or tunnel. |
 | `KYR_ADMIN_TOKEN` | — | Bearer token for `/api/status`. |
+| `KYR_LOGIN_USERS` | — | `name:password,…`: require sign-in for everything but `/api/health`. |
 | `KYR_HOST` / `KYR_PORT` | `127.0.0.1` / `8000` | Where the server listens. |
 
 **Running it publicly.** At most five answers are researched at once. Later questions wait in a
 first-come queue and are shown their place in line. Each client may spend $1 before being told
 the free allowance is used up, and the service stops for the day at $5. A typical answer costs
-$0.002–0.004; a deep one about $0.015.
+$0.002–0.004; a deep one about $0.015. To keep the site to people you choose, set
+`KYR_LOGIN_USERS`: visitors then see a sign-in page, sessions last 30 days, and ten wrong
+passwords from one address lock it out for 15 minutes.
 
 ## API
 
 | Method | Path | |
 |---|---|---|
+| `GET` `POST` | `/login`, `POST` `/logout` | Sign in and out, when `KYR_LOGIN_USERS` is set |
 | `POST` | `/api/chat` | Ask a question; the answer streams back as server-sent events |
 | `POST` | `/api/stop` | Stop the answer being written |
 | `POST` | `/api/reset` | Forget the conversation |
@@ -146,7 +150,7 @@ A chat stream carries typed events: `stage` and `tool` (progress), `source` and
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                                      # 221 tests, ~10 s: no network, keys or corpus needed
+pytest                                      # 228 tests, ~10 s: no network, keys or corpus needed
 ruff check knowyourrights scripts tests
 ```
 

@@ -37,6 +37,7 @@ def api(monkeypatch):
     services = app_module.Services()
     app_module.app.state.services = services
     monkeypatch.setattr(app_module, "get_orchestrator", lambda: FakeOrchestrator())
+    monkeypatch.setattr(app_module, "_gate", app_module.auth.Gate(raw_users=""))  # open site
     return TestClient(app_module.app), services
 
 
@@ -217,3 +218,78 @@ async def test_a_reader_who_leaves_the_queue_frees_their_place():
     assert await waiting.__anext__() == 1
     await waiting.aclose()
     assert queue.stats()["waiting"] == 0
+
+
+# ── sign-in ───────────────────────────────────────────────────────────────────────────
+@pytest.fixture
+def gated(api, monkeypatch):
+    from knowyourrights.server import auth
+    gate = auth.Gate(raw_users="admin:s3cret-pass,guest:other:pw", secret="", days=1)
+    monkeypatch.setattr(app_module, "_gate", gate)
+    client, _ = api
+    return client, gate
+
+
+def test_login_users_are_parsed_and_malformed_pairs_skipped():
+    from knowyourrights.server.auth import parse_users
+    assert parse_users(" admin:a:b , bad , :x, ok:, we ird:y, g:p") == {"admin": "a:b", "g": "p"}
+
+
+def test_without_accounts_the_site_is_open(api):
+    client, _ = api
+    assert client.get("/api/quota").status_code == 200
+    assert client.get("/login", follow_redirects=False).status_code == 303
+
+
+def test_signed_out_requests_are_refused(gated):
+    client, _ = gated
+    assert client.get("/", follow_redirects=False).headers["location"] == "/login"
+    refused = ask(client)
+    assert refused.status_code == 401 and refused.json()["error"]["kind"] == "auth"
+    assert client.get("/static/app.js", follow_redirects=False).status_code == 303
+    # What stays open: the form, its stylesheet and the health check.
+    assert "Sign in" in client.get("/login").text
+    assert client.get("/api/health").status_code in (200, 503)
+
+
+def test_signing_in_opens_the_site_until_signing_out(gated):
+    client, _ = gated
+    wrong = client.post("/login", data={"user": "admin", "password": "nope"})
+    assert wrong.status_code == 401 and "Wrong username or password" in wrong.text
+    ok = client.post("/login", data={"user": "admin", "password": "s3cret-pass"},
+                     follow_redirects=False)
+    assert ok.status_code == 303 and "httponly" in ok.headers["set-cookie"].lower()
+    assert ask(client).status_code == 200
+    assert client.get("/api/config").json()["user"] == "admin"
+    client.post("/logout")
+    assert ask(client).status_code == 401
+
+
+def test_forged_expired_and_revoked_cookies_are_rejected(gated):
+    from knowyourrights.server import auth
+    _, gate = gated
+    token = gate.issue("admin", now=1_000)
+    assert gate.user_for(token, now=1_001) == "admin"
+    assert gate.user_for(token, now=1_000 + 86_401) is None               # expired
+    body, mac = token.rsplit(".", 1)
+    forged = auth.Gate(raw_users="admin:s3cret-pass").issue("guest").rsplit(".", 1)[0]
+    assert gate.user_for(forged + "." + mac, now=1_001) is None           # body swapped
+    assert gate.user_for(body + "." + "0" * 64, now=1_001) is None        # bad signature
+    changed = auth.Gate(raw_users="admin:new-pass,guest:other:pw", secret="", days=1)
+    assert changed.user_for(token, now=1_001) is None                     # password changed
+    assert gate.user_for("garbage", now=1_001) is None
+
+
+def test_repeated_wrong_passwords_lock_the_address_out(gated):
+    client, _ = gated
+    for _ in range(10):
+        client.post("/login", data={"user": "admin", "password": "guess"})
+    locked = client.post("/login", data={"user": "admin", "password": "s3cret-pass"})
+    assert locked.status_code == 429 and "Too many" in locked.text
+
+
+def test_the_admin_token_passes_the_gate(gated, monkeypatch):
+    client, _ = gated
+    monkeypatch.setattr(config, "ADMIN_TOKEN", "tok-123")
+    assert client.get("/api/quota", headers={"Authorization": "Bearer tok-123"}).status_code == 200
+    assert client.get("/api/quota", headers={"Authorization": "Bearer wrong"}).status_code == 401

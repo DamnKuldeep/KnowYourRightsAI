@@ -3,6 +3,15 @@
 All notable changes, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+- **Sign-in.** `KYR_LOGIN_USERS=name:password,…` puts every page and endpoint except
+  `/api/health` behind a sign-in page. Sessions are an HttpOnly, signed cookie lasting
+  `KYR_LOGIN_DAYS` (30); changing an account's password ends its sessions. Ten wrong passwords
+  from one address lock sign-in for 15 minutes. The admin bearer token still passes, and a
+  sign-out button appears in the header. Unset, the site stays open as before.
+
 ## [1.0.0] — 2026-09-26
 
 A codebase audit and restructure for public deployment. Retrieval quality is unchanged
