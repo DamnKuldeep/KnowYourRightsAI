@@ -121,32 +121,46 @@
   <main>
     <div class="thread" id="thread" role="log" aria-live="polite" aria-label="Conversation">
       <div class="thread-inner" id="threadInner">
-        <div class="msg">
-          <div class="answer">
-            <p><strong>Ask about your rights under Indian law.</strong> I search the Constitution,
-            about 1,000 central Acts, and the 2024 criminal codes (BNS, BNSS, BSA) that replaced
-            the IPC, CrPC and Evidence Act — then cite the exact section.</p>
-            <p>For procedures I can also read official government sites for the current fee,
-            deadline and portal. Ask in English, Hindi, or Hinglish.</p>
+        <!-- The empty state. Removed when the first question is sent, restored on "New
+             conversation". Suggestions are drawn from SUGGESTIONS in app.js. -->
+        <section class="welcome" id="welcome" aria-labelledby="welcomeTitle">
+          <p class="eyebrow">Indian law · plain language · every claim cited</p>
+          <h2 id="welcomeTitle">Know your rights, with the section that says so.</h2>
+          <p class="lede">Ask about the police, work, rent, shopping, family or government
+            services. Answers come from the Constitution, about 1,000 central Acts and the 2023
+            criminal codes, and each claim links to the section it rests on.</p>
+
+
+          <div class="suggest-head">
+            <h3>Try asking</h3>
+            <button class="link-btn" id="shuffle" type="button">↻ Other ideas</button>
           </div>
-        </div>
+          <div class="suggestions" id="suggestions"></div>
+
+          <ul class="features" aria-label="What it does">
+            <li><span class="f-icon" aria-hidden="true">§</span>
+              <b>Cited to the section</b><span>Every claim links to the exact provision.</span></li>
+            <li><span class="f-icon" aria-hidden="true">⟳</span>
+              <b>Current law</b><span>IPC, CrPC and Evidence Act questions are answered under
+              BNS, BNSS and BSA.</span></li>
+            <li><span class="f-icon" aria-hidden="true">↗</span>
+              <b>Official procedures</b><span>Fees, deadlines and portals from government
+              sites.</span></li>
+            <li><span class="f-icon" aria-hidden="true">अ</span>
+              <b>Your language</b><span>English, हिन्दी or Hinglish.</span></li>
+          </ul>
+        </section>
       </div>
     </div>
 
-    <aside aria-label="Sources and citations">
+    <aside aria-label="Sources and citations" data-empty>
       <h2>Sources</h2>
-      <div id="sources"><p class="empty">Ask a question and the laws I cite will appear here — statute first, then official sources.</p></div>
+      <div id="sources"><p class="empty">The laws behind each answer appear here: statutes first, then official sources. Select a <span class="cite-demo">S1</span> in an answer to jump to its source.</p></div>
     </aside>
   </main>
 
   <div class="composer">
     <div class="composer-inner">
-      <div class="examples" id="examples">
-        <button class="example">What are my rights if the police arrest me without a warrant?</button>
-        <button class="example">How do I file an RTI, and what does it cost?</button>
-        <button class="example">My landlord won't return my deposit</button>
-        <button class="example">Police ne bina warrant arrest kar liya, kya yeh legal hai?</button>
-      </div>
       <div class="input-row">
         <label class="sr-only" for="input">Your question</label>
         <textarea id="input" rows="1" placeholder="Ask about your legal rights…" autocomplete="off"></textarea>

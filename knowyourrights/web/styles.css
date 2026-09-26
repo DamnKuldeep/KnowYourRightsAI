@@ -114,6 +114,68 @@ aside h2 {
 }
 aside .empty { color: var(--text-faint); font-size: 13px; line-height: 1.55; }
 
+/* ── welcome (the empty state) ──────────────────────────────────────────────────── */
+.welcome { padding: 18px 0 8px; }
+.welcome .eyebrow {
+  margin: 0 0 8px; font-size: 11.5px; font-weight: 650; letter-spacing: .06em;
+  text-transform: uppercase; color: var(--accent);
+}
+.welcome h2 {
+  margin: 0 0 10px; font-size: clamp(22px, 3.2vw, 28px); line-height: 1.25;
+  font-weight: 680; letter-spacing: -.015em; text-wrap: balance;
+}
+.welcome .lede { margin: 0 0 20px; color: var(--text-dim); max-width: 62ch; }
+
+.features {
+  list-style: none; margin: 26px 0 8px; padding: 0;
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px;
+}
+.features li {
+  display: grid; grid-template-columns: 30px 1fr; column-gap: 11px; align-items: start;
+  padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--surface);
+}
+.features .f-icon {
+  grid-row: span 2; width: 30px; height: 30px; border-radius: var(--radius-sm);
+  display: grid; place-items: center; font-weight: 650; font-size: 14px;
+  background: var(--accent-soft); color: var(--accent);
+}
+.features b { font-size: 13.5px; font-weight: 620; line-height: 1.35; }
+.features li > span:last-child { font-size: 12.5px; color: var(--text-dim); line-height: 1.45; }
+
+.suggest-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 10px; }
+.suggest-head h3 {
+  margin: 0; font-size: 11.5px; font-weight: 650; letter-spacing: .06em;
+  text-transform: uppercase; color: var(--text-faint);
+}
+.link-btn {
+  border: 0; background: none; padding: 2px 4px; cursor: pointer;
+  font-size: 12.5px; color: var(--accent); border-radius: 6px;
+}
+.link-btn:hover { text-decoration: underline; }
+
+.suggestions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.suggestion {
+  display: flex; flex-direction: column; gap: 3px; text-align: left;
+  padding: 11px 14px; cursor: pointer;
+  background: var(--surface-2); border: 1px solid transparent; border-radius: var(--radius);
+  transition: border-color .15s, background .15s, transform .15s;
+}
+.suggestion:hover { border-color: var(--accent); background: var(--surface); }
+.suggestion:active { transform: translateY(1px); }
+.s-topic { font-size: 11px; font-weight: 600; color: var(--text-faint); }
+.s-q { font-size: 14px; line-height: 1.4; color: var(--text); }
+
+/* Keyboard users get a visible focus ring on every control, not only the text box. */
+button:focus-visible, select:focus-visible, a:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+
+.cite-demo {
+  font-family: var(--mono); font-size: 10.5px; font-weight: 650; padding: 0 5px;
+  border-radius: 5px; background: var(--accent-soft); color: var(--accent);
+}
+
 /* ── messages ───────────────────────────────────────────────────────────────────── */
 .msg { margin-bottom: 26px; }
 .msg.user {
@@ -283,13 +345,6 @@ textarea::placeholder { color: var(--text-faint); }
 .send:disabled { opacity: .35; cursor: default; }
 .send.stop { background: var(--danger); }
 
-.examples { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
-.example {
-  background: var(--surface-2); border: 1px solid transparent; border-radius: 999px;
-  padding: 5px 12px; font-size: 12.5px; color: var(--text-dim); cursor: pointer;
-  transition: color .15s, border-color .15s;
-}
-.example:hover { color: var(--text); border-color: var(--border); }
 
 .footer {
   display: flex; align-items: center; gap: 12px; margin-top: 8px;
@@ -319,6 +374,18 @@ textarea::placeholder { color: var(--text-faint); }
   header { padding: 9px 12px; gap: 8px; }
   .thread { padding: 16px 12px 8px; }
   .composer { padding: 10px 12px; }
+  .welcome { padding-top: 4px; }
+  aside[data-empty] { display: none; }
+}
+@media (max-width: 560px) {
+  header { flex-wrap: wrap; row-gap: 8px; }
+  .brand { flex-basis: 100%; }
+  .controls { flex-basis: 100%; min-width: 0; flex-wrap: nowrap; gap: 6px; }
+  .controls select { flex: 1; min-width: 0; width: 0; }
+  .segmented button { padding: 5px 9px; }
+  .features, .suggestions { grid-template-columns: 1fr; }
+  .features li:nth-child(n+3) { display: none; }    /* two features are enough on a phone */
+  .footer .disclaimer { font-size: 11px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

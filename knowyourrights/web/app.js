@@ -12,10 +12,13 @@ const $ = (sel) => document.querySelector(sel);
 const thread = $('#thread');
 const threadInner = $('#threadInner');
 const sourcesPane = $('#sources');
+const aside = sourcesPane.closest('aside');
 const input = $('#input');
 const sendBtn = $('#send');
 const statEl = $('#stat');
 const quotaEl = $('#quota');
+const welcome = $('#welcome');
+const SOURCES_EMPTY = sourcesPane.innerHTML;
 
 const state = {
   sessionId: localStorage.getItem('kyr.session') || '',
@@ -91,6 +94,70 @@ function renderMarkdown(src) {
   return html;
 }
 
+/* ── suggestions ───────────────────────────────────────────────────────────────── */
+// Ideas for a first question, one per topic so a set never repeats a subject. Each is answerable
+// from the corpus; the state-law ones show how jurisdiction is handled.
+const SUGGESTIONS = {
+  'Police & arrest': [
+    'Can the police arrest me without a warrant?',
+    'Do I have to unlock my phone if the police ask me to?',
+    'Police ne FIR likhne se mana kar diya, ab kya karun?',
+  ],
+  'Work & pay': [
+    "My employer hasn't paid my salary for two months. What can I do?",
+    'How much maternity leave am I entitled to?',
+    'Do I get gratuity if I resign after five years?',
+  ],
+  'Renting': [
+    "My landlord won't return my security deposit",
+    'Can my landlord evict me without notice?',
+  ],
+  'Shopping & services': [
+    "An online seller won't refund a defective product",
+    'How do I file a consumer complaint, and what does it cost?',
+  ],
+  'Government': [
+    'How do I file an RTI, and what does it cost?',
+    'My RTI has not been answered in 30 days. What next?',
+  ],
+  'Online & money': [
+    'Someone cheated me online. Which law makes that a crime?',
+    'Someone is sharing my photos online without consent',
+    "A cheque I was given has bounced. What are my options?",
+  ],
+  'Family': [
+    "What are a daughter's rights in her father's property?",
+    'दहेज माँगना क्या अपराध है?',
+    'How is maintenance decided after a divorce?',
+  ],
+  'Constitution': [
+    'What does Article 21 of the Constitution protect?',
+    'Can I be punished twice for the same offence?',
+  ],
+};
+
+const pick = (list) => list[Math.floor(Math.random() * list.length)];
+
+function shuffled(list) {                 // Fisher–Yates; sort() with a random key is biased
+  const out = [...list];
+  for (let i = out.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+}
+
+function renderSuggestions(count = 6) {
+  const topics = shuffled(Object.keys(SUGGESTIONS)).slice(0, count);
+  $('#suggestions').replaceChildren(...topics.map((topic) => {
+    const card = el('button', 'suggestion');
+    card.type = 'button';
+    card.innerHTML = `<span class="s-topic">${esc(topic)}</span>`
+                   + `<span class="s-q">${esc(pick(SUGGESTIONS[topic]))}</span>`;
+    return card;
+  }));
+}
+
 /* ── DOM helpers ───────────────────────────────────────────────────────────────── */
 function el(tag, cls, html) {
   const node = document.createElement(tag);
@@ -110,6 +177,7 @@ function scrollDown(force) {
 let turn = null;
 
 function startTurn(question) {
+  welcome.remove();                 // the empty state has done its job
   state.sources.clear();
   state.answerText = '';
   state.timelineSteps.clear();
@@ -221,6 +289,7 @@ function addProcedure(data) {
 const TIER_ORDER = { statute: 0, official: 1, 'legal portal': 2, background: 3, web: 4 };
 
 function renderSources() {
+  aside.toggleAttribute('data-empty', !state.sources.size);   // hidden on phones while empty
   if (!state.sources.size) {
     sourcesPane.innerHTML = '<p class="empty">No strongly relevant source was found for this answer.</p>';
     return;
@@ -597,9 +666,9 @@ input.addEventListener('input', () => {
 document.addEventListener('click', (e) => {
   const chip = e.target.closest('.cite');
   if (chip) { flashSource(chip.dataset.cite); return; }
-  const example = e.target.closest('.example');
-  if (example && !state.busy && !state.locked) {
-    input.value = example.textContent.trim(); send();
+  const suggestion = e.target.closest('.suggestion');
+  if (suggestion && !state.busy && !state.locked) {
+    input.value = suggestion.querySelector('.s-q').textContent; send();
   }
 });
 
@@ -627,9 +696,11 @@ $('#reset').onclick = async () => {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ session_id: state.sessionId }),
   }).catch(() => {});
-  threadInner.innerHTML = '';
+  threadInner.replaceChildren(welcome);
+  renderSuggestions();
   state.sources.clear();
-  renderSources();
+  sourcesPane.innerHTML = SOURCES_EMPTY;
+  aside.toggleAttribute('data-empty', true);
   statEl.textContent = '';
   input.focus();
 };
@@ -659,6 +730,8 @@ $('#reset').onclick = async () => {
       signOut.querySelector('button').title = `Signed in as ${c.user}. Sign out`;
     }
   }).catch(() => {});
+  renderSuggestions();
+  $('#shuffle').addEventListener('click', () => renderSuggestions());
   checkHealth(10);
   refreshQuota();
 
